@@ -2,11 +2,14 @@ package keyauth
 
 import (
 	"errors"
-	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/extractors"
+	"github.com/gofiber/fiber/v3/internal/quotedstring"
+	"github.com/gofiber/fiber/v3/internal/redact"
+	"github.com/gofiber/fiber/v3/middleware/logger"
 	"github.com/gofiber/utils/v2"
 )
 
@@ -22,13 +25,21 @@ const (
 // ErrMissingOrMalformedAPIKey is returned when the API key is missing or invalid.
 var ErrMissingOrMalformedAPIKey = errors.New("missing or invalid API Key")
 
+var registerLogContextTagsOnce sync.Once
+
 // New creates a new middleware handler
 func New(config ...Config) fiber.Handler {
+	registerLogContextTagsOnce.Do(registerLogContextTags)
+
 	// Init config
 	cfg := configDefault(config...)
 
 	// Determine the auth schemes from the extractor chain.
 	authSchemes := getAuthSchemes(cfg.Extractor)
+
+	// Built once from config; bareChallenge leaves out the error parameters (RFC 6750 section 3).
+	challengeValue := buildChallenge(&cfg, authSchemes, bearerErrorParams(&cfg))
+	bareChallenge := buildChallenge(&cfg, authSchemes, "")
 
 	// Return middleware handler
 	return func(c fiber.Ctx) error {
@@ -38,7 +49,8 @@ func New(config ...Config) fiber.Handler {
 		}
 
 		// Extract and verify key
-		key, err := cfg.Extractor.Extract(c)
+		key, extractErr := cfg.Extractor.Extract(c)
+		err := extractErr
 		if errors.Is(err, extractors.ErrNotFound) {
 			// Replace shared extractor not found error with a keyauth specific error
 			err = ErrMissingOrMalformedAPIKey
@@ -48,7 +60,7 @@ func New(config ...Config) fiber.Handler {
 			var valid bool
 			valid, err = cfg.Validator(c, key)
 			if err == nil && valid {
-				c.Locals(tokenKey, key)
+				fiber.StoreInContext(c, tokenKey, key)
 				return cfg.SuccessHandler(c)
 			}
 		}
@@ -56,36 +68,23 @@ func New(config ...Config) fiber.Handler {
 		// Execute the error handler first
 		handlerErr := cfg.ErrorHandler(c, err)
 
-		status := c.Response().StatusCode()
+		status := c.Res().StatusCode()
+		// The ErrorHandler may return the error for the app to write; honor its status code too.
+		var fiberErr *fiber.Error
+		if errors.As(handlerErr, &fiberErr) && fiberErr != nil {
+			status = fiberErr.Code
+		}
 		if status == fiber.StatusUnauthorized || status == fiber.StatusProxyAuthRequired {
 			header := fiber.HeaderWWWAuthenticate
 			if status == fiber.StatusProxyAuthRequired {
 				header = fiber.HeaderProxyAuthenticate
 			}
-			if len(authSchemes) > 0 {
-				challenges := make([]string, 0, len(authSchemes))
-				for _, scheme := range authSchemes {
-					var b strings.Builder
-					fmt.Fprintf(&b, "%s realm=%q", scheme, cfg.Realm)
-					if utils.EqualFold(scheme, "Bearer") {
-						if cfg.Error != "" {
-							fmt.Fprintf(&b, ", error=%q", cfg.Error)
-							if cfg.ErrorDescription != "" {
-								fmt.Fprintf(&b, ", error_description=%q", cfg.ErrorDescription)
-							}
-							if cfg.ErrorURI != "" {
-								fmt.Fprintf(&b, ", error_uri=%q", cfg.ErrorURI)
-							}
-							if cfg.Error == ErrorInsufficientScope {
-								fmt.Fprintf(&b, ", scope=%q", cfg.Scope)
-							}
-						}
-					}
-					challenges = append(challenges, b.String())
-				}
-				c.Set(header, strings.Join(challenges, ", "))
-			} else if cfg.Challenge != "" {
-				c.Set(header, cfg.Challenge)
+			challenge := challengeValue
+			if omitsBearerErrors(c.Get(fiber.HeaderAuthorization), extractErr) {
+				challenge = bareChallenge
+			}
+			if challenge != "" {
+				c.Set(header, challenge)
 			}
 		}
 
@@ -93,26 +92,101 @@ func New(config ...Config) fiber.Handler {
 	}
 }
 
-// TokenFromContext returns the bearer token from the request context.
-// returns an empty string if the token does not exist
-func TokenFromContext(c fiber.Ctx) string {
-	token, ok := c.Locals(tokenKey).(string)
-	if !ok {
+// omitsBearerErrors reports whether a refused request made no Bearer attempt: it sent
+// no credentials, or ones in another Authorization scheme, well formed or not.
+func omitsBearerErrors(auth string, extractErr error) bool {
+	if usesBearerScheme(auth) {
+		return false
+	}
+	return errors.Is(extractErr, extractors.ErrNotFound) || (extractErr == nil && auth != "")
+}
+
+// usesBearerScheme reports whether an Authorization header value names the
+// Bearer scheme, whether or not the credential after it is well formed.
+func usesBearerScheme(header string) bool {
+	const scheme = "Bearer"
+	return len(header) >= len(scheme) && utils.EqualFold(header[:len(scheme)], scheme) &&
+		(len(header) == len(scheme) || header[len(scheme)] == ' ')
+}
+
+// bearerErrorParams formats the RFC 6750 error parameters configured for
+// Bearer challenges, starting with a separator, or "" when none is set.
+func bearerErrorParams(cfg *Config) string {
+	if cfg.Error == "" {
 		return ""
 	}
-	return token
+	b := make([]byte, 0, 64)
+	b = append(b, `, error="`...)
+	b = append(b, quotedstring.Escape(cfg.Error)...)
+	b = append(b, '"')
+	if cfg.ErrorDescription != "" {
+		b = append(b, `, error_description="`...)
+		b = append(b, quotedstring.Escape(cfg.ErrorDescription)...)
+		b = append(b, '"')
+	}
+	if cfg.ErrorURI != "" {
+		b = append(b, `, error_uri="`...)
+		b = append(b, quotedstring.Escape(cfg.ErrorURI)...)
+		b = append(b, '"')
+	}
+	if cfg.Error == ErrorInsufficientScope {
+		b = append(b, `, scope="`...)
+		b = append(b, quotedstring.Escape(cfg.Scope)...)
+		b = append(b, '"')
+	}
+	return string(b)
+}
+
+// buildChallenge formats the WWW-Authenticate value for the configured auth
+// schemes, appending errorParams to the Bearer challenge.
+func buildChallenge(cfg *Config, authSchemes []string, errorParams string) string {
+	if len(authSchemes) == 0 {
+		return cfg.Challenge
+	}
+	challenges := make([]string, 0, len(authSchemes))
+	for _, scheme := range authSchemes {
+		b := make([]byte, 0, len(scheme)+len(cfg.Realm)+len(errorParams)+16)
+		b = append(b, scheme...)
+		b = append(b, ` realm="`...)
+		b = append(b, quotedstring.Escape(cfg.Realm)...)
+		b = append(b, '"')
+		if utils.EqualFold(scheme, "Bearer") {
+			b = append(b, errorParams...)
+		}
+		challenges = append(challenges, string(b))
+	}
+	return strings.Join(challenges, ", ")
+}
+
+func registerLogContextTags() {
+	logger.RegisterContextTag("api-key", func(ctx any) string {
+		return redact.Prefix(TokenFromContext(ctx))
+	})
+}
+
+// TokenFromContext returns the bearer token from the request context.
+// It accepts fiber.CustomCtx, fiber.Ctx, *fasthttp.RequestCtx, and context.Context.
+// It returns an empty string if the token does not exist.
+func TokenFromContext(ctx any) string {
+	if token, ok := fiber.ValueFromContext[string](ctx, tokenKey); ok {
+		return token
+	}
+
+	return ""
 }
 
 // getAuthSchemes inspects an extractor and its chain to find all auth schemes
 // used by FromAuthHeader. It returns a slice of schemes, or an empty slice if
 // none are found.
 func getAuthSchemes(e extractors.Extractor) []string {
+	// Walked through the extractors package so the traversal, and its cycle
+	// guard, live in one place.
 	var schemes []string
-	if e.Source == extractors.SourceAuthHeader && e.AuthScheme != "" {
-		schemes = append(schemes, e.AuthScheme)
-	}
-	for _, ex := range e.Chain {
-		schemes = append(schemes, getAuthSchemes(ex)...)
-	}
+	e.Walk(func(candidate extractors.Extractor) bool {
+		if candidate.Source == extractors.SourceAuthHeader && candidate.AuthScheme != "" {
+			schemes = append(schemes, candidate.AuthScheme)
+		}
+		return true
+	})
 	return schemes
 }

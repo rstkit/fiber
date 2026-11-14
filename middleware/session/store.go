@@ -5,9 +5,14 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"hash/maphash"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/extractors"
+	"github.com/gofiber/fiber/v3/internal/ctxlocal"
 	"github.com/gofiber/fiber/v3/internal/storage/memory"
 	"github.com/gofiber/fiber/v3/log"
 )
@@ -25,7 +30,68 @@ type sessionIDKey int
 const (
 	// sessionIDContextKey is the key used to store the session ID in the context locals.
 	sessionIDContextKey sessionIDKey = iota
+	// sessionExtractorContextKey stores the extractor that provided the session ID.
+	sessionExtractorContextKey
 )
+
+// provenanceBox carries the resolved provenance through request locals behind a
+// pointer: storing the Result by value would box it onto the heap on every
+// request carrying a session ID. fasthttp hands it back through Close on
+// request reset, as it does the extractors package's chain state.
+type provenanceBox struct {
+	res extractors.Result
+}
+
+// A pointer so a test can swap in a pool of its own; nothing else reassigns it.
+var provenancePool = &sync.Pool{New: func() any { return new(provenanceBox) }}
+
+// storeProvenance records res in the request, reusing the box already there.
+// Overwriting the local with a fresh box would strand the old one outside the
+// pool: fasthttp only reclaims the box the local currently holds.
+func storeProvenance(c fiber.Ctx, res extractors.Result) {
+	if b, ok := c.Locals(sessionExtractorContextKey).(*provenanceBox); ok && b != nil {
+		b.res = res
+		return
+	}
+	b, ok := provenancePool.Get().(*provenanceBox)
+	if !ok || b == nil {
+		b = new(provenanceBox)
+	}
+	b.res = res
+	ctxlocal.Set(c, sessionExtractorContextKey, b)
+}
+
+// Close returns the box to the pool. fasthttp calls it on every request-local
+// io.Closer when it resets the request; callers should not.
+func (b *provenanceBox) Close() error {
+	b.res = extractors.Result{}
+	provenancePool.Put(b)
+	return nil
+}
+
+// storageKeyPrefix keeps sessions apart from other middleware sharing the Storage:
+// the ID comes from the request, so a bare one could name any of their entries.
+const storageKeyPrefix = "session:"
+
+// idLockShards is a power of two so the shard index is a mask. Shared by every
+// Store, since two stores on one Storage address the same entries.
+const idLockShards = 64
+
+// idLock keeps a request that loaded a session from writing it back after
+// another request deleted or changed it: fiber.Storage has no conditional write.
+type idLock struct {
+	mu  sync.RWMutex  // write-backs share it, a delete or a change holds it alone
+	gen atomic.Uint64 // bumped after every delete or change in the shard; a load reads it before the storage
+}
+
+var (
+	idLocks [idLockShards]idLock
+	idSeed  = maphash.MakeSeed()
+)
+
+func lockFor(key string) *idLock {
+	return &idLocks[maphash.String(idSeed, key)&(idLockShards-1)]
+}
 
 // Store manages session data using the configured storage backend.
 type Store struct {
@@ -123,30 +189,50 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 	var rawData []byte
 	var err error
 
+	var selectedExtractor extractors.Result
 	id, ok := c.Locals(sessionIDContextKey).(string)
 	if !ok {
-		id = s.getSessionID(c)
+		var resolveErr error
+		selectedExtractor, resolveErr = s.getSessionID(c)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		id = selectedExtractor.Value
+		if id != "" {
+			// Kept for a second getSession on the same request, which takes the
+			// cached-ID path above and would otherwise lose the provenance.
+			storeProvenance(c, selectedExtractor)
+		}
+	} else if stored, found := c.Locals(sessionExtractorContextKey).(*provenanceBox); found && stored != nil {
+		selectedExtractor = stored.res
 	}
 
-	fresh := false // Session is not fresh initially; only set to true if we generate a new ID
+	isFresh := false // Session is not fresh initially; only set to true if we generate a new ID
+	var loadGen uint64
+	var key string
 
 	// Attempt to fetch session data if an ID is provided
 	if id != "" {
-		rawData, err = s.Storage.GetWithContext(c, id)
+		key = storageKeyPrefix + id
+		loadGen = lockFor(key).gen.Load()
+		rawData, err = s.Storage.GetWithContext(c, key)
 		if err != nil {
 			return nil, err
 		}
 		if rawData == nil {
 			// Data not found, prepare to generate a new session
-			id = ""
+			id, key = "", ""
+		} else {
+			// Sliced off the key: the extracted ID points into the request buffer the next request reuses.
+			id = key[len(storageKeyPrefix):]
 		}
 	}
 
 	// Generate a new ID if needed
 	if id == "" {
-		fresh = true // The session is fresh if a new ID is generated
+		isFresh = true // The session is fresh if a new ID is generated
 		id = s.KeyGenerator()
-		c.Locals(sessionIDContextKey, id)
+		ctxlocal.Set(c, sessionIDContextKey, id)
 	}
 
 	// Create session object
@@ -157,23 +243,24 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 	sess.ctx = c
 	sess.config = s
 	sess.id = id
-	sess.fresh = fresh
+	sess.key = key
+	sess.isFresh = isFresh
+	sess.extractor = selectedExtractor
 
 	// Decode session data if found
 	if rawData != nil {
-		sess.data.Lock()
-		err := sess.decodeSessionData(rawData)
-		sess.data.Unlock()
-		if err != nil {
+		if err := sess.decodeSessionData(rawData); err != nil {
 			sess.mu.Unlock()
 			sess.Release()
 			return nil, fmt.Errorf("failed to decode session data: %w", err)
 		}
+		sess.loaded = true
+		sess.loadGen = loadGen
 	}
 
 	sess.mu.Unlock()
 
-	if fresh && s.AbsoluteTimeout > 0 {
+	if isFresh && s.AbsoluteTimeout > 0 {
 		sess.setAbsExpiration(time.Now().Add(s.AbsoluteTimeout))
 	} else if sess.isAbsExpired() {
 		if err := sess.Reset(); err != nil {
@@ -185,25 +272,43 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 	return sess, nil
 }
 
-// getSessionID returns the session ID using the configured extractor.
-// The extractor is provided by the shared extractors package.
+// getSessionID returns the session ID using the configured extractor, together
+// with the provenance of the extractor that supplied it.
 //
 // Parameters:
 //   - c: The Fiber context.
 //
 // Returns:
-//   - string: The session ID.
+//   - extractors.Result: the ID in Value with the provenance that supplied it,
+//     zero when nothing was extracted.
+//   - error: why extraction failed, nil when nothing was supplied at all.
 //
 // Usage:
 //
-//	id := store.getSessionID(c)
-func (s *Store) getSessionID(c fiber.Ctx) string {
-	sessionID, err := s.Extractor.Extract(c)
-	if err != nil {
-		// If extraction fails, return empty string to generate a new session
-		return ""
+//	from, err := store.getSessionID(c)
+func (s *Store) getSessionID(c fiber.Ctx) (extractors.Result, error) {
+	// Resolved through the extractors package rather than walked here: walking
+	// Extractor.Chain directly would skip a chain-level Extract, and Resolve
+	// also reports which extractor won, which setSession needs to write the ID
+	// back to the sink it came from.
+	//
+	// That Extract must be value-preserving — validate or refuse, do not
+	// rewrite. The ID is written back untransformed, so a decorator that
+	// rewrote it on read would never match its own stored session.
+	res, err := extractors.Resolve(s.Extractor, c)
+	switch {
+	case err == nil:
+		return res, nil
+	case errors.Is(err, extractors.ErrNotFound):
+		// The ordinary first-visit case, not a failure: an empty ID generates a
+		// fresh session.
+		return extractors.Result{}, nil
+	default:
+		// A validator refusing a forged ID, a cycle, or a custom extractor's own
+		// error. Reported rather than collapsed into "no ID present", which
+		// would be indistinguishable from a first-time visitor.
+		return extractors.Result{}, err
 	}
-	return sessionID
 }
 
 // Reset deletes all sessions from the storage.
@@ -218,6 +323,15 @@ func (s *Store) getSessionID(c fiber.Ctx) string {
 //	    // handle error
 //	}
 func (s *Store) Reset(ctx context.Context) error {
+	for i := range idLocks {
+		idLocks[i].mu.Lock()
+	}
+	defer func() {
+		for i := range idLocks {
+			idLocks[i].gen.Add(1)
+			idLocks[i].mu.Unlock()
+		}
+	}()
 	return s.Storage.ResetWithContext(ctx)
 }
 
@@ -239,7 +353,49 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return ErrEmptySessionID
 	}
-	return s.Storage.DeleteWithContext(ctx, id)
+	return s.deleteKey(ctx, storageKeyPrefix+id)
+}
+
+func (s *Store) deleteKey(ctx context.Context, key string) error {
+	l := lockFor(key)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	err := s.Storage.DeleteWithContext(ctx, key)
+	l.gen.Add(1) // after the delete, so a load that sees the new value cannot read the entry
+	return err
+}
+
+// deleteLoadedKey is deleteKey for a session read at loadGen. It returns what the key held
+// when another request had written the shard since, nil when none had, and reports whether
+// one had deleted the key.
+//
+//nolint:gocritic // returning explicit values keeps the signature concise while avoiding unnecessary named results
+func (s *Store) deleteLoadedKey(ctx context.Context, key string, loadGen uint64) ([]byte, bool, error) {
+	l := lockFor(key)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stored, moved, err := s.storedSince(ctx, key, loadGen)
+	if err != nil {
+		return nil, false, err
+	}
+	err = s.Storage.DeleteWithContext(ctx, key)
+	l.gen.Add(1)
+	return stored, moved && stored == nil, err
+}
+
+// storedSince returns what key holds when another request wrote its shard since loadGen and
+// reports that one did; nil and false when none did. The caller holds the shard's lock.
+//
+//nolint:gocritic // returning explicit values keeps the signature concise while avoiding unnecessary named results
+func (s *Store) storedSince(ctx context.Context, key string, loadGen uint64) ([]byte, bool, error) {
+	if lockFor(key).gen.Load() == loadGen {
+		return nil, false, nil
+	}
+	raw, err := s.Storage.GetWithContext(ctx, key)
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
 }
 
 // GetByID retrieves a session by its ID from the storage.
@@ -280,7 +436,9 @@ func (s *Store) GetByID(ctx context.Context, id string) (*Session, error) {
 		return nil, ErrEmptySessionID
 	}
 
-	rawData, err := s.Storage.GetWithContext(ctx, id)
+	key := storageKeyPrefix + id
+	loadGen := lockFor(key).gen.Load()
+	rawData, err := s.Storage.GetWithContext(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -293,12 +451,13 @@ func (s *Store) GetByID(ctx context.Context, id string) (*Session, error) {
 	sess.mu.Lock()
 
 	sess.config = s
-	sess.id = id
-	sess.fresh = false
+	sess.id = key[len(storageKeyPrefix):] // the caller may pass a view of the request, such as c.Cookies
+	sess.key = key
+	sess.isFresh = false
+	sess.loaded = true
+	sess.loadGen = loadGen
 
-	sess.data.Lock()
 	decodeErr := sess.decodeSessionData(rawData)
-	sess.data.Unlock()
 	sess.mu.Unlock()
 	if decodeErr != nil {
 		sess.Release()

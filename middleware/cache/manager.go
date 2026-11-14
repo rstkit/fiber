@@ -7,21 +7,26 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gofiber/fiber/v3/internal/redact"
+
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/internal/memory"
 )
 
 // msgp -file="manager.go" -o="manager_msgp.go" -tests=true -unexported
+// Default slice limits are sized for cache payloads, with tighter field caps below.
 //
 //go:generate msgp -o=manager_msgp.go -tests=true -unexported
+//nolint:revive // msgp requires tags on unexported fields for limit enforcement.
 type item struct {
-	headers         []cachedHeader
-	body            []byte
-	ctype           []byte
-	cencoding       []byte
-	cacheControl    []byte
-	expires         []byte
-	etag            []byte
+	headers         []cachedHeader `msg:",limit=1024"` // Typical HTTP header count stays well below this.
+	body            []byte         // Cache bodies are bounded by storage policy, not msgp limits.
+	ctype           []byte         `msg:",limit=256"`  // Content-Type values are short per RFCs.
+	cencoding       []byte         `msg:",limit=128"`  // Content-Encoding is typically a short token.
+	cacheControl    []byte         `msg:",limit=2048"` // Cache-Control directives are bounded.
+	expires         []byte         `msg:",limit=128"`  // Expires is a short HTTP-date string.
+	etag            []byte         `msg:",limit=256"`  // ETags are small tokens/quoted strings.
+	vary            []byte         `msg:",limit=2048"` // Vary lists field names, bounded like Cache-Control.
 	date            uint64
 	status          int
 	age             uint64
@@ -33,26 +38,68 @@ type item struct {
 	private         bool
 	// used for finding the item in an indexed heap
 	heapidx int
+	// distinguishes the item from a later entry reusing the same heap index
+	heapgen uint64
 }
 
+//nolint:revive // msgp requires tags on unexported fields for limit enforcement.
 type cachedHeader struct {
-	key   []byte
-	value []byte
+	key   []byte `msg:",limit=512"`   // Header names are small.
+	value []byte `msg:",limit=16384"` // Header values are bounded to reasonable sizes.
+}
+
+// The msgp limits above, which only the decoder enforces; each must match its
+// tag. maxVaryLen in vary.go is the one on vary.
+const (
+	maxStoredHeaders         = 1024
+	maxStoredHeaderKey       = 512
+	maxStoredHeaderValue     = 16384
+	maxStoredContentType     = 256
+	maxStoredContentEncoding = 128
+	maxStoredCacheControl    = 2048
+	maxStoredExpires         = 128
+	maxStoredETag            = 256
+)
+
+// decodable reports whether UnmarshalMsg accepts what MarshalMsg writes for e.
+func (e *item) decodable() bool {
+	if len(e.headers) > maxStoredHeaders ||
+		len(e.ctype) > maxStoredContentType ||
+		len(e.cencoding) > maxStoredContentEncoding ||
+		len(e.cacheControl) > maxStoredCacheControl ||
+		len(e.expires) > maxStoredExpires ||
+		len(e.etag) > maxStoredETag ||
+		len(e.vary) > maxVaryLen {
+		return false
+	}
+	for i := range e.headers {
+		if len(e.headers[i].key) > maxStoredHeaderKey || len(e.headers[i].value) > maxStoredHeaderValue {
+			return false
+		}
+	}
+	return true
+}
+
+// metaSize is what e stores besides its body and key.
+func (e *item) metaSize() uint {
+	n := len(e.ctype) + len(e.cencoding) + len(e.cacheControl) + len(e.expires) + len(e.etag) + len(e.vary)
+	for i := range e.headers {
+		n += len(e.headers[i].key) + len(e.headers[i].value)
+	}
+	return uint(n)
 }
 
 //msgp:ignore manager
 type manager struct {
-	pool       sync.Pool
-	memory     *memory.Storage
-	storage    fiber.Storage
-	redactKeys bool
+	pool             sync.Pool
+	memory           *memory.Storage
+	storage          fiber.Storage
+	shouldRedactKeys bool
 }
-
-const redactedKey = "[redacted]"
 
 var errCacheMiss = errors.New("cache: miss")
 
-func newManager(storage fiber.Storage, redactKeys bool) *manager {
+func newManager(storage fiber.Storage, shouldRedactKeys bool) *manager {
 	// Create new storage handler
 	manager := &manager{
 		pool: sync.Pool{
@@ -60,7 +107,7 @@ func newManager(storage fiber.Storage, redactKeys bool) *manager {
 				return new(item)
 			},
 		},
-		redactKeys: redactKeys,
+		shouldRedactKeys: shouldRedactKeys,
 	}
 	if storage != nil {
 		// Use provided storage if provided
@@ -74,6 +121,12 @@ func newManager(storage fiber.Storage, redactKeys bool) *manager {
 
 // acquire returns an *entry from the sync.Pool
 func (m *manager) acquire() *item {
+	// The in-memory store keeps the entry itself, so release never hands one
+	// back and the pool is empty every time. Going through it only pays for the
+	// lookup before landing on the same allocation.
+	if m.storage == nil {
+		return new(item)
+	}
 	return m.pool.Get().(*item) //nolint:forcetypeassert,errcheck // We store nothing else in the pool
 }
 
@@ -87,6 +140,7 @@ func (m *manager) release(e *item) {
 	e.cacheControl = nil
 	e.expires = nil
 	e.etag = nil
+	e.vary = nil
 	e.ctype = nil
 	e.cencoding = nil
 	e.date = 0
@@ -100,6 +154,7 @@ func (m *manager) release(e *item) {
 	e.shareable = false
 	e.private = false
 	e.heapidx = 0
+	e.heapgen = 0
 	m.pool.Put(e)
 }
 
@@ -205,8 +260,34 @@ func (m *manager) del(ctx context.Context, key string) error {
 }
 
 func (m *manager) logKey(key string) string {
-	if m.redactKeys {
-		return redactedKey
+	return redact.Value(key, m.shouldRedactKeys)
+}
+
+//msgp:ignore memoryDeletion
+
+// memoryDeletion distinguishes an absent entry from a concurrent replacement.
+type memoryDeletion uint8
+
+const (
+	memoryEntryAbsent memoryDeletion = iota
+	memoryEntryDeleted
+	memoryEntryReplaced
+)
+
+// delIf atomically checks and removes the expected in-memory entry. Recording
+// predicate execution distinguishes absence from replacement under one lock.
+func (m *manager) delIf(key string, expected *item) memoryDeletion {
+	present := false
+	deleted := m.memory.DeleteIf(key, func(current any) bool {
+		present = true
+		entry, ok := current.(*item)
+		return ok && entry == expected
+	})
+	if deleted {
+		return memoryEntryDeleted
 	}
-	return key
+	if present {
+		return memoryEntryReplaced
+	}
+	return memoryEntryAbsent
 }

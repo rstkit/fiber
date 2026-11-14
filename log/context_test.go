@@ -1,0 +1,378 @@
+package log
+
+import (
+	"context"
+	"errors"
+	"io"
+	"maps"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/gofiber/fiber/v3/internal/logtemplate"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/bytebufferpool"
+)
+
+var errContextTestWrite = errors.New("context test write failure")
+
+type failingContextBuffer struct{}
+
+func (failingContextBuffer) Len() int                            { return 0 }
+func (failingContextBuffer) ReadFrom(_ io.Reader) (int64, error) { return 0, errContextTestWrite }
+func (failingContextBuffer) WriteTo(_ io.Writer) (int64, error)  { return 0, errContextTestWrite }
+func (failingContextBuffer) Bytes() []byte                       { return nil }
+func (failingContextBuffer) Write(_ []byte) (int, error)         { return 0, errContextTestWrite }
+func (failingContextBuffer) WriteByte(byte) error                { return errContextTestWrite }
+func (failingContextBuffer) WriteString(string) (int, error)     { return 0, errContextTestWrite }
+func (failingContextBuffer) Set([]byte)                          {}
+func (failingContextBuffer) SetString(string)                    {}
+func (failingContextBuffer) String() string                      { return "" }
+
+// buildTestTemplate compiles a context template using the package-default tag
+// map merged with the supplied custom tags. It mirrors the production merge
+// performed by SetContextTemplate so test expectations stay aligned.
+func buildTestTemplate(t *testing.T, format string, custom map[string]ContextTagFunc) *logtemplate.Template[any, ContextData] {
+	t.Helper()
+	tags := defaultContextTagMap()
+	maps.Copy(tags, custom)
+	tags[TagContextValue] = defaultContextValueTag
+	tmpl, err := logtemplate.Build[any, ContextData](format, tags)
+	require.NoError(t, err)
+	return tmpl
+}
+
+// executeContextTemplate executes tmpl against ctx and returns what it wrote.
+func executeContextTemplate(t *testing.T, tmpl *logtemplate.Template[any, ContextData], ctx any) string {
+	t.Helper()
+
+	buf := bytebufferpool.Get()
+	defer bytebufferpool.Put(buf)
+
+	require.NoError(t, tmpl.Execute(buf, ctx, &ContextData{}))
+	return buf.String()
+}
+
+// stringTag returns a context tag that writes s.
+func stringTag(s string) ContextTagFunc {
+	return func(output Buffer, _ any, _ *ContextData, _ string) (int, error) { return output.WriteString(s) }
+}
+
+type testUserValueContext map[any]any
+
+func (c testUserValueContext) UserValue(key any) any {
+	return c[key]
+}
+
+func Test_ContextTemplate_ValueTag(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		ctx  any
+		name string
+	}{
+		{
+			name: "context value",
+			ctx:  context.WithValue(context.Background(), "request_id", "req-42"), //nolint:revive,staticcheck // ${value:key} intentionally reads string context keys.
+		},
+		{name: "user value context", ctx: testUserValueContext{"request_id": "req-42"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tmpl := buildTestTemplate(t, "[${value:request_id}]", nil)
+			require.Equal(t, "[req-42]", executeContextTemplate(t, tmpl, tt.ctx))
+		})
+	}
+}
+
+func Test_ContextTemplate_ValueTagSanitizesControlChars(t *testing.T) {
+	t.Parallel()
+	tmpl := buildTestTemplate(t, "${value:str}|${value:bytes}|${value:struct}", nil)
+
+	type composite struct{ A, B string }
+	ctx := testUserValueContext{
+		"str":    "good\r\nbad",
+		"bytes":  []byte{'a', 0x00, 'b', 0x1B, 'c', '\t', 'd'},
+		"struct": composite{A: "x\ny", B: "z"},
+	}
+
+	out := executeContextTemplate(t, tmpl, ctx)
+	require.NotContains(t, out, "\r")
+	require.NotContains(t, out, "\n")
+	require.NotContains(t, out, "\x00")
+	require.NotContains(t, out, "\x1b")
+	require.Contains(t, out, "\t", "tabs must pass through to preserve operator-friendly delimiters")
+}
+
+func Test_ContextTemplate_ValueTagWritesSupportedValues(t *testing.T) {
+	t.Parallel()
+	tmpl := buildTestTemplate(t, "${value:bytes}|${value:string}|${value:number}|${value:missing}", nil)
+
+	ctx := testUserValueContext{"bytes": []byte("raw"), "string": "text", "number": 42}
+	require.Equal(t, "raw|text|42|", executeContextTemplate(t, tmpl, ctx))
+}
+
+func Test_ContextTemplate_ValueTagWrapsWriteError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		ctx  any
+		key  string
+	}{
+		{name: "default fmt path (int)", ctx: testUserValueContext{"k": 42}, key: "k"},
+		{name: "string path", ctx: testUserValueContext{"k": "value"}, key: "k"},
+		{name: "byte slice path", ctx: testUserValueContext{"k": []byte("value")}, key: "k"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := defaultContextValueTag(failingContextBuffer{}, tt.ctx, &ContextData{}, tt.key)
+			require.ErrorIs(t, err, errContextTestWrite)
+		})
+	}
+}
+
+func Test_ContextTemplate_DefaultTagsRenderEmpty(t *testing.T) {
+	t.Parallel()
+	// Build the format from the same names that defaultContextTagMap stubs so a
+	// new default tag automatically extends coverage instead of silently
+	// drifting from the assertion.
+	defaults := defaultContextTagMap()
+	delete(defaults, TagContextValue)
+
+	parts := make([]string, 0, len(defaults))
+	for name := range defaults {
+		parts = append(parts, "${"+name+"}|")
+	}
+	format := strings.Join(parts, "")
+
+	tmpl, err := logtemplate.Build[any, ContextData](format, defaults)
+	require.NoError(t, err)
+
+	// Each stub renders empty, so the only bytes left are the "|" separators.
+	require.Len(t, executeContextTemplate(t, tmpl, context.Background()), len(defaults))
+}
+
+func Test_ContextTemplate_CustomTag(t *testing.T) {
+	t.Parallel()
+	tmpl := buildTestTemplate(t, "[${requestid}]", map[string]ContextTagFunc{"requestid": stringTag("req-42")})
+	require.Equal(t, "[req-42]", executeContextTemplate(t, tmpl, context.Background()))
+}
+
+// Test_SetContextTemplateRejectsReservedValueTag locks in M9 — overriding the
+// reserved TagContextValue via CustomTags must surface as an error, matching
+// RegisterContextTag's behavior.
+// conventions:ignore parallel: legacy, sequential before the rule; make it parallel and delete this line
+func Test_SetContextTemplateRejectsReservedValueTag(t *testing.T) {
+	t.Cleanup(func() { MustSetContextTemplate(ContextConfig{}) })
+
+	require.ErrorIs(t, SetContextTemplate(ContextConfig{
+		Format:     "[${value:request_id}]",
+		CustomTags: map[string]ContextTagFunc{TagContextValue: stringTag("override")},
+	}), ErrContextTagReserved)
+}
+
+// Test_SetContextTemplate_RegistersCustomTag runs serially because it mutates
+// the package-global context template registry.
+// conventions:ignore parallel: legacy, sequential before the rule; make it parallel and delete this line
+func Test_SetContextTemplate_RegistersCustomTag(t *testing.T) {
+	t.Cleanup(func() { MustSetContextTemplate(ContextConfig{}) })
+
+	require.NoError(t, SetContextTemplate(ContextConfig{
+		Format:     "[${tenant}]",
+		CustomTags: map[string]ContextTagFunc{"tenant": stringTag("acme")},
+	}))
+
+	tmpl := contextTemplate.Load()
+	require.NotNil(t, tmpl)
+
+	require.Equal(t, "[acme]", executeContextTemplate(t, tmpl, context.Background()))
+}
+
+// Test_RegisterContextTagThenSetFormat runs serially because it mutates the
+// package-global context tag registry.
+// conventions:ignore parallel: legacy, sequential before the rule; make it parallel and delete this line
+func Test_RegisterContextTagThenSetFormat(t *testing.T) {
+	t.Cleanup(func() { MustSetContextTemplate(ContextConfig{}) })
+
+	require.NoError(t, RegisterContextTag("tenant", stringTag("acme")))
+	// With no format active, the template stays nil even after registration.
+	require.Nil(t, contextTemplate.Load())
+
+	require.NoError(t, SetContextTemplate(ContextConfig{Format: "[${tenant}]"}))
+	tmpl := contextTemplate.Load()
+	require.NotNil(t, tmpl)
+
+	require.Equal(t, "[acme]", executeContextTemplate(t, tmpl, context.Background()))
+}
+
+// Test_DefaultFormatDisablesContextTemplate runs serially because it mutates
+// the package-global context template registry.
+// conventions:ignore parallel: legacy, sequential before the rule; make it parallel and delete this line
+func Test_DefaultFormatDisablesContextTemplate(t *testing.T) {
+	t.Cleanup(func() { MustSetContextTemplate(ContextConfig{}) })
+
+	MustSetContextTemplate(ContextConfig{
+		Format:     "[${requestid}] ",
+		CustomTags: map[string]ContextTagFunc{"requestid": stringTag("req-42")},
+	})
+	require.NotNil(t, contextTemplate.Load())
+
+	require.NoError(t, SetContextTemplate(ContextConfig{Format: DefaultFormat}))
+	require.Nil(t, contextTemplate.Load())
+}
+
+func Test_MustSetContextTemplate_PanicsOnBuildError(t *testing.T) {
+	t.Parallel()
+	require.PanicsWithError(t, `logtemplate: unknown tag: "missing:value"`, func() {
+		MustSetContextTemplate(ContextConfig{Format: "${missing:value}"})
+	})
+}
+
+func Test_SetContextTemplate_ReturnsBuildError(t *testing.T) {
+	t.Parallel()
+	err := SetContextTemplate(ContextConfig{Format: "${missing:value}"})
+	require.ErrorIs(t, err, logtemplate.ErrUnknownTag)
+
+	var typed *logtemplate.UnknownTagError
+	require.ErrorAs(t, err, &typed)
+	require.Equal(t, "missing:value", typed.Tag)
+	require.Equal(t, "value", typed.Param)
+}
+
+func Test_RegisterContextTagRejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+	require.ErrorIs(t, RegisterContextTag("", stringTag("")), ErrContextTagInvalid)
+	require.ErrorIs(t, RegisterContextTag("missing", nil), ErrContextTagInvalid)
+	require.ErrorIs(t, RegisterContextTag(TagContextValue, stringTag("")), ErrContextTagReserved)
+}
+
+func Test_MustRegisterContextTag_PanicsOnInvalidInput(t *testing.T) {
+	t.Parallel()
+	require.PanicsWithError(t, ErrContextTagInvalid.Error(), func() { MustRegisterContextTag("", stringTag("")) })
+}
+
+func Test_ContextValue(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		ctx  any
+		want any
+		name string
+	}{
+		{name: "nil"},
+		{name: "unsupported", ctx: "ctx"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, contextValue(tt.ctx, "key"))
+		})
+	}
+}
+
+// Test_ContextTemplate_ConcurrentRegistration exercises the lock split between
+// the atomic-pointer read path and the mutex-guarded rebuild path. It must be
+// run with -race to be meaningful.
+//
+// The test is order-independent: it registers its own "tenant" tag rather
+// than relying on a sibling test having already done so, which matters when
+// the test runner is invoked with -shuffle=on.
+// conventions:ignore parallel: legacy, sequential before the rule; make it parallel and delete this line
+func Test_ContextTemplate_ConcurrentRegistration(t *testing.T) {
+	t.Cleanup(func() { MustSetContextTemplate(ContextConfig{}) })
+
+	require.NoError(t, RegisterContextTag("tenant", stringTag("acme")))
+	require.NoError(t, SetContextTemplate(ContextConfig{Format: "[${tenant}]"}))
+
+	const goroutines = 8
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 3)
+
+	register := func(id int) {
+		defer wg.Done()
+		for range iterations {
+			//nolint:errcheck // race-stress test intentionally ignores transient errors
+			_ = RegisterContextTag("tenant", stringTag("acme"))
+			_ = id
+		}
+	}
+	reformat := func() {
+		defer wg.Done()
+		for range iterations {
+			//nolint:errcheck // race-stress test intentionally ignores transient errors
+			_ = SetContextTemplate(ContextConfig{Format: "[${tenant}]"})
+		}
+	}
+	emit := func() {
+		defer wg.Done()
+		for range iterations {
+			tmpl := contextTemplate.Load()
+			if tmpl == nil {
+				continue
+			}
+			buf := bytebufferpool.Get()
+			//nolint:errcheck // race-stress test intentionally ignores transient errors
+			_ = tmpl.Execute(buf, context.Background(), &ContextData{})
+			bytebufferpool.Put(buf)
+		}
+	}
+
+	for i := range goroutines {
+		go register(i)
+		go reformat()
+		go emit()
+	}
+
+	wg.Wait()
+}
+
+func Benchmark_ContextTemplate_Execute(b *testing.B) {
+	tags := map[string]ContextTagFunc{"requestid": stringTag("req-42")}
+	tmpl, err := logtemplate.Build[any, ContextData]("[${requestid}] ", tags)
+	require.NoError(b, err)
+
+	buf := bytebufferpool.Get()
+	defer bytebufferpool.Put(buf)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		buf.Reset()
+		if err := tmpl.Execute(buf, context.Background(), &ContextData{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func Benchmark_DefaultContextValueTag(b *testing.B) {
+	ctx := testUserValueContext{"request_id": "req-42"}
+
+	buf := bytebufferpool.Get()
+	defer bytebufferpool.Put(buf)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		buf.Reset()
+		if _, err := defaultContextValueTag(buf, ctx, &ContextData{}, "request_id"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func Benchmark_writeSanitizedString(b *testing.B) {
+	buf := &bytebufferpool.ByteBuffer{}
+	inputs := []string{
+		"GET /api/v1/users completed in 3ms", "user login ok request-id=6ba7b810-9dad-11d1-80b4-00c04fd430c8", "short",
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		for _, in := range inputs {
+			buf.Reset()
+			_, _ = writeSanitizedString(buf, in) //nolint:errcheck // benchmark
+		}
+	}
+}

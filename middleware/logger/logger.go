@@ -9,7 +9,22 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/logtemplate"
 )
+
+func loadTimestamp(value *atomic.Value) string {
+	if timestamp, ok := value.Load().(string); ok {
+		return timestamp
+	}
+
+	return ""
+}
+
+// defaultErrPadding is the initial column width used by the default access-log
+// formatter to align the request path against the optional error suffix. The
+// width grows on first request to fit the longest registered route, but a
+// non-zero default keeps short-lived test apps (with no routes) readable.
+const defaultErrPadding = 15
 
 // New creates a new middleware handler
 func New(config ...Config) fiber.Handler {
@@ -18,27 +33,28 @@ func New(config ...Config) fiber.Handler {
 
 	// Get timezone location
 	tz, err := time.LoadLocation(cfg.TimeZone)
-	if err != nil || tz == nil {
+	if err != nil {
 		cfg.timeZoneLocation = time.Local
 	} else {
 		cfg.timeZoneLocation = tz
 	}
 
 	// Check if format contains latency
-	cfg.enableLatency = strings.Contains(cfg.Format, "${"+TagLatency+"}")
+	cfg.isLatencyEnabled = strings.Contains(cfg.Format, "${"+TagLatency+"}")
 
-	var timestamp atomic.Value
-	// Create correct timeformat
-	timestamp.Store(time.Now().In(cfg.timeZoneLocation).Format(cfg.TimeFormat))
-
-	// Update date/time every 500 milliseconds in a separate go routine
-	if strings.Contains(cfg.Format, "${"+TagTime+"}") {
-		go func() {
-			for {
-				time.Sleep(cfg.TimeInterval)
-				timestamp.Store(time.Now().In(cfg.timeZoneLocation).Format(cfg.TimeFormat))
-			}
-		}()
+	timeEnabled := strings.Contains(cfg.Format, "${"+TagTime+"}")
+	var timestamp *atomic.Value
+	if timeEnabled {
+		if cfg.TimeDone != nil {
+			// Caller-managed lifecycle: dedicated updater so it can be stopped
+			// via TimeDone (useful for tests and short-lived apps).
+			timestamp = &atomic.Value{}
+			timestamp.Store(time.Now().In(cfg.timeZoneLocation).Format(cfg.TimeFormat))
+			startTimestampUpdater(timestamp, &cfg)
+		} else {
+			// Process-lifetime shared updater, deduplicated by format/zone/interval.
+			timestamp = sharedTimestamp(cfg.TimeFormat, cfg.timeZoneLocation, cfg.TimeInterval)
+		}
 	}
 	// Set PID once
 	pid := strconv.Itoa(os.Getpid())
@@ -51,8 +67,9 @@ func New(config ...Config) fiber.Handler {
 		dataPool = sync.Pool{New: func() any { return new(Data) }}
 	)
 
-	// Err padding
-	errPadding := 15
+	// Err padding starts at the documented default and grows once on first
+	// request to fit the longest registered route path.
+	errPadding := defaultErrPadding
 	errPaddingStr := strconv.Itoa(errPadding)
 
 	// Before handling func
@@ -61,10 +78,14 @@ func New(config ...Config) fiber.Handler {
 	// Logger data
 	// instead of analyzing the template inside(handler) each time, this is done once before
 	// and we create several slices of the same length with the functions to be executed and fixed parts.
-	templateChain, logFunChain, err := buildLogFuncChain(&cfg, createTagMap(&cfg))
+	template, err := logtemplate.Build[fiber.Ctx, Data](cfg.Format, createTagMap(&cfg))
 	if err != nil {
+		if translated := translateBuildError(err); translated != nil {
+			panic(translated)
+		}
 		panic(err)
 	}
+	templateChain, logFuncChain := template.Chains()
 
 	// Return new handler
 	return func(c fiber.Ctx) error {
@@ -94,14 +115,23 @@ func New(config ...Config) fiber.Handler {
 		// no need for a reset, as long as we always override everything
 		data.Pid = pid
 		data.ErrPaddingStr = errPaddingStr
-		data.Timestamp = timestamp
+		if timeEnabled {
+			data.Timestamp = loadTimestamp(timestamp)
+		} else {
+			data.Timestamp = ""
+		}
+		// These compiled chains are shared across requests, so a custom
+		// LoggerFunc must only read them — never append to or reorder them.
+		// Walk Data.TemplateChain and Data.LogFuncChain in step; the helper the
+		// default logger uses for this lives in internal/ and is not importable
+		// from outside the module.
 		data.TemplateChain = templateChain
-		data.LogFuncChain = logFunChain
+		data.LogFuncChain = logFuncChain
 		// put data back in the pool
 		defer dataPool.Put(data)
 
 		// Set latency start time
-		if cfg.enableLatency {
+		if cfg.isLatencyEnabled {
 			data.Start = time.Now()
 		}
 
@@ -109,19 +139,58 @@ func New(config ...Config) fiber.Handler {
 		chainErr := c.Next()
 
 		data.ChainErr = chainErr
+		data.timeoutResp = timeoutResponse(c)
 		// Manually call error handler
 		if chainErr != nil {
 			if err := errHandler(c, chainErr); err != nil {
-				_ = c.SendStatus(fiber.StatusInternalServerError) //nolint:errcheck // TODO: Explain why we ignore the error here
+				// The error handler failed, so fall back to a bare 500. SendStatus only
+				// sets the status and body on the response and does no I/O; if it fails,
+				// there is no further fallback left.
+				_ = c.SendStatus(fiber.StatusInternalServerError) //nolint:errcheck // no further fallback if this fails
 			}
 		}
 
 		// Set latency stop time
-		if cfg.enableLatency {
+		if cfg.isLatencyEnabled {
 			data.Stop = time.Now()
 		}
 
 		// Logger instance & update some logger data fields
-		return cfg.LoggerFunc(c, data, &cfg)
+		err := cfg.LoggerFunc(c, data, &cfg)
+		if err == nil && data.timeoutResp != nil {
+			// errHandler answered nothing, and the error keeps the middleware before us off the handler's response.
+			return chainErr
+		}
+		return err
 	}
+}
+
+// startTimestampUpdater refreshes the cached formatted timestamp until TimeDone
+// is closed.
+func startTimestampUpdater(timestamp *atomic.Value, cfg *Config) {
+	_ = startTimestampUpdaterWithStop(timestamp, cfg)
+}
+
+func startTimestampUpdaterWithStop(timestamp *atomic.Value, cfg *Config) <-chan struct{} {
+	stopped := make(chan struct{})
+	if !strings.Contains(cfg.Format, "${"+TagTime+"}") {
+		close(stopped)
+		return stopped
+	}
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(cfg.TimeInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				timestamp.Store(time.Now().In(cfg.timeZoneLocation).Format(cfg.TimeFormat))
+			case <-cfg.TimeDone:
+				return
+			}
+		}
+	}()
+	return stopped
 }

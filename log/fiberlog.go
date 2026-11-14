@@ -1,7 +1,6 @@
 package log
 
 import (
-	"context"
 	"io"
 )
 
@@ -70,7 +69,7 @@ func Tracef(format string, v ...any) {
 	logger.Tracef(format, v...)
 }
 
-// Panicf calls the default logger's Tracef method.
+// Panicf calls the default logger's Panicf method.
 func Panicf(format string, v ...any) {
 	logger.Panicf(format, v...)
 }
@@ -119,7 +118,7 @@ func Panicw(msg string, keysAndValues ...any) {
 
 // WithContext binds the default logger to the provided context and returns the
 // contextualized logger.
-func WithContext(ctx context.Context) CommonLogger {
+func WithContext(ctx any) CommonLogger {
 	return logger.WithContext(ctx)
 }
 

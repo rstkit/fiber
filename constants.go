@@ -1,5 +1,9 @@
 package fiber
 
+import (
+	internalcookie "github.com/gofiber/fiber/v3/internal/cookie"
+)
+
 // HTTP methods were copied from net/http.
 const (
 	MethodGet     = "GET"     // RFC 7231, 4.3.1
@@ -11,6 +15,7 @@ const (
 	MethodConnect = "CONNECT" // RFC 7231, 4.3.6
 	MethodOptions = "OPTIONS" // RFC 7231, 4.3.7
 	MethodTrace   = "TRACE"   // RFC 7231, 4.3.8
+	MethodQuery   = "QUERY"   // RFC 10008
 	methodUse     = "USE"
 )
 
@@ -21,6 +26,7 @@ const (
 	MIMETextPlain             = "text/plain"
 	MIMETextJavaScript        = "text/javascript"
 	MIMETextCSS               = "text/css"
+	MIMETextEventStream       = "text/event-stream"
 	MIMEApplicationXML        = "application/xml"
 	MIMEApplicationJSON       = "application/json"
 	MIMEApplicationJavaScript = "application/javascript"
@@ -195,6 +201,7 @@ const (
 	HeaderExpect                             = "Expect"
 	HeaderMaxForwards                        = "Max-Forwards"
 	HeaderSetCookie                          = "Set-Cookie"
+	HeaderSetCookie2                         = "Set-Cookie2"
 	HeaderAccessControlAllowCredentials      = "Access-Control-Allow-Credentials"
 	HeaderAccessControlAllowHeaders          = "Access-Control-Allow-Headers"
 	HeaderAccessControlAllowMethods          = "Access-Control-Allow-Methods"
@@ -310,10 +317,10 @@ const (
 // Cookie SameSite
 // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-03#section-4.1.2.7
 const (
-	CookieSameSiteDisabled   = "disabled" // not in RFC, just control "SameSite" attribute will not be set.
-	CookieSameSiteLaxMode    = "Lax"
-	CookieSameSiteStrictMode = "Strict"
-	CookieSameSiteNoneMode   = "None"
+	CookieSameSiteDisabled   = internalcookie.SameSiteDisabled // not in RFC, just control "SameSite" attribute will not be set.
+	CookieSameSiteLaxMode    = internalcookie.SameSiteLax
+	CookieSameSiteStrictMode = internalcookie.SameSiteStrict
+	CookieSameSiteNoneMode   = internalcookie.SameSiteNone
 )
 
 // Route Constraints
@@ -335,4 +342,9 @@ const (
 	ConstraintRange           = "range"
 	ConstraintDatetime        = "datetime"
 	ConstraintRegex           = "regex"
+)
+
+// OS identifiers
+const (
+	windowsOS = "windows"
 )

@@ -5,34 +5,55 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - "**/*.md"
+    paths:
+      - "**"
+      - "!**/*.md"
+      - "!.github/dependabot.yml"
+      - "!.github/workflows/**"
+      - ".github/workflows/test.yml"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
+    paths:
+      - "**"
+      - "!**/*.md"
+      - "!.github/dependabot.yml"
+      - "!.github/workflows/**"
+      - ".github/workflows/test.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   unit:
     strategy:
       matrix:
-        go-version: [1.25.x]
-        platform: [ubuntu-latest, windows-latest, macos-latest]
+        go-version: [1.26.x, 1.27.x]
+        platform: [blacksmith-4vcpu-ubuntu-2404, blacksmith-4vcpu-windows-2025, blacksmith-6vcpu-macos-latest]
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
     steps:
       - name: Fetch Repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go-version }}
+          check-latest: true
 
       - name: Test
-        run: go run gotest.tools/gotestsum@latest -f testname -- ./... -race -count=1 -coverprofile=coverage.txt -covermode=atomic -shuffle=on
+        uses: gofiber/.github/.github/actions/gotestsum@main
+        with:
+          packages: ./...
+          rerun-fails: '2'
+          args: -race -count=1 -coverprofile=coverage.txt -covermode=atomic -shuffle=on
 
       - name: Upload coverage reports to Codecov
-        if: ${{ matrix.platform == 'ubuntu-latest' && matrix.go-version == '1.25.x' }}
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
+        if: ${{ runner.os == 'Linux' && matrix.go-version == '1.26.x' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: unittests
@@ -40,15 +61,27 @@ jobs:
           verbose: true
 
   repeated:
-    runs-on: ubuntu-latest
+    # Still 15 runs in total, but spread over three jobs. -shuffle seeds once per
+    # process, so a single -count=15 replays one order fifteen times; three processes
+    # sample three orders and finish in a third of the time.
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3]
+    # 8 vCPU: 85 test packages feed `go test -p`, and the dominant root package is
+    # t.Parallel() throughout, so both parallelism axes scale with cores
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
       - name: Fetch Repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
 
       - name: Test
-        run: go run gotest.tools/gotestsum@latest -f testname -- ./... -race -count=15 -shuffle=on
+        uses: gofiber/.github/.github/actions/gotestsum@main
+        with:
+          args: ./... -race -count=5 -shuffle=on

@@ -5,20 +5,184 @@
 package fiber
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"math"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
 
+	"github.com/gofiber/fiber/v3/internal/apptest"
+	"github.com/gofiber/fiber/v3/internal/fieldname"
 	"github.com/gofiber/utils/v2"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
+
+func Benchmark_PeekJoinedRequestHeader(b *testing.B) {
+	for _, lines := range []int{1, 2, 3} {
+		b.Run(strconv.Itoa(lines), func(b *testing.B) {
+			var h fasthttp.RequestHeader
+			for range lines {
+				h.Add(HeaderAccept, "text/plain")
+			}
+			var joined []byte
+			b.ReportAllocs()
+			for b.Loop() {
+				joined = peekJoinedRequestHeader(&h, HeaderAccept)
+			}
+			require.NotEmpty(b, joined)
+		})
+	}
+}
+
+// Test_JoinedInReceivedOrder pins the read-only scan to the values fasthttp parses.
+func Test_JoinedInReceivedOrder(t *testing.T) {
+	t.Parallel()
+	const head = "GET / HTTP/1.1\r\nHost: example.com\r\n"
+	tests := []struct {
+		name     string
+		lines    string
+		combined string // empty: as stored
+		want     bool
+	}{
+		{name: "in order", lines: "X-Forwarded-For: 1.1.1.1\r\nAccept: */*\r\nX-Forwarded-For: 2.2.2.2\r\n", want: true},
+		{name: "OWS and spelling", lines: "x-forwarded-for:\t1.1.1.1 \r\nX-FORWARDED-FOR:2.2.2.2\t\r\n", want: true},
+		{name: "longer name", lines: "X-Forwarded-For-Extra: 9.9.9.9\r\nX-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: 2.2.2.2\r\n", want: true},
+		{name: "reordered", lines: "X-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: 2.2.2.2\r\n", combined: "2.2.2.2,1.1.1.1"},
+		{name: "added", lines: "X-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: 2.2.2.2\r\n", combined: "1.1.1.1,2.2.2.2,3.3.3.3"},
+		{name: "folded", lines: "X-Forwarded-For: 1.1.1.1,\r\n 3.3.3.3\r\nX-Forwarded-For: 2.2.2.2\r\n"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var req fasthttp.Request
+			require.NoError(t, req.Read(bufio.NewReader(strings.NewReader(head+tc.lines+"\r\n"))))
+			combined := []byte(tc.combined)
+			if tc.combined == "" {
+				combined = peekJoinedRequestHeader(&req.Header, HeaderXForwardedFor)
+			}
+			require.Equal(t, tc.want, fieldname.JoinedInReceivedOrder(req.Header.RawHeaders(), HeaderXForwardedFor, combined))
+		})
+	}
+}
+
+// mediaRangeCases shares wrapper contracts and benchmark inputs across behavior and allocation checks.
+var mediaRangeCases = []struct {
+	name      string
+	header    string
+	want      []string
+	benchmark bool
+}{
+	{name: "empty", benchmark: true},
+	{name: "spaces", header: "   ", want: []string{""}},
+	{name: "plain single", header: "text/plain", want: []string{"text/plain"}},
+	{name: "short list", header: "text/plain, application/json", want: []string{"text/plain", "application/json"}},
+	{name: "single", header: "application/json", want: []string{"application/json"}, benchmark: true},
+	{
+		name: "list", header: "text/plain, application/json, text/html",
+		want: []string{"text/plain", "application/json", "text/html"}, benchmark: true,
+	},
+	{
+		name: "browser", header: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		want: []string{"text/html", "application/xhtml+xml", "application/xml;q=0.9", "*/*;q=0.8"}, benchmark: true,
+	},
+	{name: "empty elements", header: ",,text/plain,,", want: []string{"", "", "text/plain", ""}},
+	{name: "trailing comma", header: "text/plain,", want: []string{"text/plain"}},
+	{name: "trailing spaces", header: "text/plain,   ", want: []string{"text/plain", ""}},
+	{name: "whitespace", header: " \ttext/plain\t , \v\f", want: []string{"\ttext/plain\t ", "\v\f"}},
+	{name: "quoted whitespace", header: "\t\"a\"\t , \v\f", want: []string{"\t\"a\"\t ", "\v\f"}},
+	{name: "raw bytes", header: "\x00\xff,é", want: []string{"\x00\xff", "é"}},
+	{
+		name: "quoted comma", header: `text/plain;p="a,b", text/html`,
+		want: []string{`text/plain;p="a,b"`, "text/html"}, benchmark: true,
+	},
+	{name: "late quote", header: `text/html, text/*;p="a,b"`, want: []string{"text/html", `text/*;p="a,b"`}},
+	{
+		name: "quote beyond probe", header: strings.Repeat("text/html, ", 8) + `text/*;p="a,b"`,
+		want: []string{
+			"text/html", "text/html", "text/html", "text/html", "text/html", "text/html", "text/html", "text/html",
+			`text/*;p="a,b"`,
+		},
+	},
+	{name: "quoted empties", header: `,"",,`, want: []string{"", `""`, ""}},
+	{name: "quoted trailing spaces", header: `"a",   `, want: []string{`"a"`, ""}},
+	{
+		name: "escaped quote", header: `text/plain;p="a\"b,c", text/html`,
+		want: []string{`text/plain;p="a\"b,c"`, "text/html"}, benchmark: true,
+	},
+	{
+		name: "escaped backslash", header: `text/plain;p="a\\", text/html`,
+		want: []string{`text/plain;p="a\\"`, "text/html"}, benchmark: true,
+	},
+	{name: "bare backslash", header: `\, a`, want: []string{`\`, "a"}},
+	{
+		name: "unterminated quote", header: `text/plain;p="a,b, text/html`,
+		want: []string{`text/plain;p="a,b, text/html`}, benchmark: true,
+	},
+	{name: "adjacent quotes", header: `"a,b""c,d",e`, want: []string{`"a,b""c,d"`, "e"}},
+}
+
+func Test_Utils_ForEachMediaRange(t *testing.T) {
+	t.Parallel()
+	for _, tt := range mediaRangeCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			header := []byte(tt.header)
+			var got []string
+			forEachMediaRange(header, func(mediaRange []byte) {
+				if len(mediaRange) > 0 {
+					off := cap(header) - cap(mediaRange)
+					require.GreaterOrEqual(t, off, 0)
+					require.LessOrEqual(t, off+len(mediaRange), len(header))
+					require.Same(t, &header[off], &mediaRange[0], "media range must alias the input header")
+				}
+				got = append(got, string(mediaRange))
+			})
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_Utils_ForEachMediaRange_NoAllocations(t *testing.T) {
+	// AllocsPerRun cannot run in a parallel test.
+	for _, tc := range mediaRangeCases {
+		header := []byte(tc.header)
+		totalLen := 0
+		allocs := testing.AllocsPerRun(100, func() {
+			forEachMediaRange(header, func(mediaRange []byte) { totalLen += len(mediaRange) })
+		})
+		runtime.KeepAlive(totalLen)
+		require.Zero(t, allocs, tc.name)
+	}
+}
+
+func Benchmark_Utils_ForEachMediaRange(b *testing.B) {
+	for _, tc := range mediaRangeCases {
+		if !tc.benchmark {
+			continue
+		}
+		b.Run(tc.name, func(b *testing.B) {
+			header := []byte(tc.header)
+			totalLen := 0
+			b.ReportAllocs()
+			for b.Loop() {
+				forEachMediaRange(header, func(mediaRange []byte) { totalLen += len(mediaRange) })
+			}
+			runtime.KeepAlive(totalLen)
+		})
+	}
+}
 
 func Test_Utils_GetOffer(t *testing.T) {
 	t.Parallel()
@@ -46,7 +210,17 @@ func Test_Utils_GetOffer(t *testing.T) {
 	require.Equal(t, "text/plain;b=2;a=1", getOffer([]byte("text/plain ;a=1;b=2"), acceptsOfferType, "text/plain;b=2;a=1"))
 	require.Equal(t, "text/plain;a=1", getOffer([]byte("text/plain;   a=1   "), acceptsOfferType, "text/plain;a=1"))
 	require.Equal(t, `text/plain;a="1;b=2\",text/plain"`, getOffer([]byte(`text/plain;a="1;b=2\",text/plain";q=0.9`), acceptsOfferType, `text/plain;a=1;b=2`, `text/plain;a="1;b=2\",text/plain"`))
+	// A quoted-pair escapes exactly one byte, so the string ends at the genuine
+	// closing quote and the later comma splits the ranges (RFC 9110 Section 5.6.4).
+	require.Equal(t, "text/plain", getOffer([]byte(`text/html;p="a\"b", text/plain`), acceptsOfferType, "text/plain"))
+	// A quoted comma must stay in its range so the following q=0 still rejects that offer.
+	require.Equal(t, "text/html", getOffer([]byte(`text/html;q=0.5, text/plain;p="a,b";q=0`), acceptsOfferType, `text/plain;p="a,b"`, "text/html"))
 	require.Equal(t, "text/plain;A=CAPS", getOffer([]byte(`text/plain;a="caPs"`), acceptsOfferType, "text/plain;A=CAPS"))
+
+	// The media type and subtype tokens are case-insensitive (RFC 9110 8.3.1)
+	require.Equal(t, "application/json", getOffer([]byte("Application/JSON"), acceptsOfferType, "application/json"))
+	require.Equal(t, "Application/JSON", getOffer([]byte("application/json"), acceptsOfferType, "Application/JSON"))
+	require.Equal(t, "text/plain;a=1", getOffer([]byte("Text/Plain;a=1"), acceptsOfferType, "text/plain;a=1"))
 
 	// Priority
 	require.Equal(t, "text/plain", getOffer([]byte("text/plain"), acceptsOfferType, "text/plain", "text/plain;a=1"))
@@ -79,49 +253,46 @@ func Test_Utils_GetOffer(t *testing.T) {
 	require.Empty(t, getOffer([]byte("gzip, deflate;q=0"), acceptsOffer, "deflate"))
 
 	// Accept-Language Basic Filtering
-	require.True(t, acceptsLanguageOfferBasic("en", "en-US", nil))
-	require.False(t, acceptsLanguageOfferBasic("en-US", "en", nil))
-	require.True(t, acceptsLanguageOfferBasic("EN", "en-us", nil))
-	require.False(t, acceptsLanguageOfferBasic("en", "en_US", nil))
+	require.Positive(t, acceptsLanguageOfferBasic("en", "en-US", nil))
+	require.Zero(t, acceptsLanguageOfferBasic("en-US", "en", nil))
+	require.Positive(t, acceptsLanguageOfferBasic("EN", "en-us", nil))
+	require.Zero(t, acceptsLanguageOfferBasic("en", "en_US", nil))
 	require.Equal(t, "en-US", getOffer([]byte("fr-CA;q=0.8, en-US"), acceptsLanguageOfferBasic, "en-US", "fr-CA"))
 	require.Empty(t, getOffer([]byte("xx"), acceptsLanguageOfferBasic, "en"))
-	require.False(t, acceptsLanguageOfferBasic("en-*", "en-US", nil))
-	require.True(t, acceptsLanguageOfferBasic("*", "en-US", nil))
+	require.Zero(t, acceptsLanguageOfferBasic("en-*", "en-US", nil))
+	require.Positive(t, acceptsLanguageOfferBasic("*", "en-US", nil))
 
 	// Accept-Language Extended Filtering
-	require.True(t, acceptsLanguageOfferExtended("en", "en-US", nil))
-	require.True(t, acceptsLanguageOfferExtended("en", "en-Latn-US", nil))
-	require.True(t, acceptsLanguageOfferExtended("en-*", "en-US", nil))
-	require.True(t, acceptsLanguageOfferExtended("*-US", "en-US", nil))
-	require.True(t, acceptsLanguageOfferExtended("en-US-*", "en-US", nil))
-	require.True(t, acceptsLanguageOfferExtended("en-*", "en-US-CA", nil))
-	require.False(t, acceptsLanguageOfferExtended("en-US", "en-GB", nil))
-	require.False(t, acceptsLanguageOfferExtended("fr", "en-US", nil))
-	require.False(t, acceptsLanguageOfferExtended("", "en-US", nil))
-	require.False(t, acceptsLanguageOfferExtended("en", "", nil))
-	require.True(t, acceptsLanguageOfferExtended("*", "en-US", nil))
-	require.True(t, acceptsLanguageOfferExtended("en-*", "en", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("en", "en-US", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("en", "en-Latn-US", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("en-*", "en-US", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("*-US", "en-US", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("en-US-*", "en-US", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("en-*", "en-US-CA", nil))
+	require.Zero(t, acceptsLanguageOfferExtended("en-US", "en-GB", nil))
+	require.Zero(t, acceptsLanguageOfferExtended("fr", "en-US", nil))
+	require.Zero(t, acceptsLanguageOfferExtended("", "en-US", nil))
+	require.Zero(t, acceptsLanguageOfferExtended("en", "", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("*", "en-US", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("en-*", "en", nil))
 	require.Equal(t, "en-US", getOffer([]byte("fr-CA;q=0.8, en-*"), acceptsLanguageOfferExtended, "en-US", "fr-CA"))
 
 	// Sliding and singleton barriers
-	require.True(t, acceptsLanguageOfferExtended("de-*-DE", "de-DE", nil))
-	require.True(t, acceptsLanguageOfferExtended("de-*-DE", "de-DE-x-goethe", nil))
-	require.True(t, acceptsLanguageOfferExtended("de-*-DE", "de-Latn-DE-1996", nil))
-	require.False(t, acceptsLanguageOfferExtended("de-*-DE", "de", nil))
-	require.False(t, acceptsLanguageOfferExtended("de-*-DE", "de-x-DE", nil))
-	require.True(t, acceptsLanguageOfferExtended("*-CH", "de-CH", nil))
-	require.True(t, acceptsLanguageOfferExtended("*-CH", "de-Latn-CH", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("de-*-DE", "de-DE", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("de-*-DE", "de-DE-x-goethe", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("de-*-DE", "de-Latn-DE-1996", nil))
+	require.Zero(t, acceptsLanguageOfferExtended("de-*-DE", "de", nil))
+	require.Zero(t, acceptsLanguageOfferExtended("de-*-DE", "de-x-DE", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("*-CH", "de-CH", nil))
+	require.Positive(t, acceptsLanguageOfferExtended("*-CH", "de-Latn-CH", nil))
 }
 
 func Test_ReadContentReturnsBytes(t *testing.T) {
 	t.Parallel()
-
 	content := []byte("fiber read content test")
 	tempFile, err := os.CreateTemp("", "fiber-read-content-*.txt")
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, os.Remove(tempFile.Name()))
-	})
+	t.Cleanup(func() { require.NoError(t, os.Remove(tempFile.Name())) })
 
 	_, err = tempFile.Write(content)
 	require.NoError(t, err)
@@ -156,71 +327,84 @@ func (ln *configMethodListener) Config() *tls.Config {
 	return ln.cfg
 }
 
+type nonStructListener int
+
+func (nonStructListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (nonStructListener) Close() error              { return nil }
+func (nonStructListener) Addr() net.Addr            { return &net.TCPAddr{} }
+
 func Test_GetTLSConfig(t *testing.T) {
 	t.Parallel()
+	tests := []struct {
+		// wrap builds the listener under test on top of base. Closing it must
+		// close base, so the subtest cleans up through it.
+		wrap       func(base net.Listener, cfg *tls.Config) net.Listener
+		name       string
+		msg        string
+		minVersion uint16
+		wantConfig bool // false: no TLS config must be reported
+	}{
+		{
+			name:       "tls listener",
+			wrap:       tls.NewListener,
+			minVersion: tls.VersionTLS12,
+			wantConfig: true,
+			msg:        "*tls.Listener should expose its TLS config",
+		},
+		{
+			name: "wrapped tls listener",
+			wrap: func(base net.Listener, cfg *tls.Config) net.Listener {
+				return &wrappedListener{Listener: tls.NewListener(base, cfg)}
+			},
+			minVersion: tls.VersionTLS13,
+			msg:        "wrapping without Config()-like methods should return nil",
+		},
+		{
+			name: "listener with tls config method",
+			wrap: func(base net.Listener, cfg *tls.Config) net.Listener {
+				return &tlsConfigMethodListener{Listener: base, cfg: cfg}
+			},
+			minVersion: tls.VersionTLS13,
+			wantConfig: true,
+			msg:        "TLSConfig() should be preferred for TLS discovery",
+		},
+		{
+			name: "listener with config method",
+			wrap: func(base net.Listener, cfg *tls.Config) net.Listener {
+				return &configMethodListener{Listener: base, cfg: cfg}
+			},
+			minVersion: tls.VersionTLS12,
+			wantConfig: true,
+			msg:        "Config() should be preferred for TLS discovery",
+		},
+		{
+			name: "non tls listener",
+			wrap: func(base net.Listener, _ *tls.Config) net.Listener { return base },
+			msg:  "plain listeners should not report TLS config",
+		},
+	}
 
-	t.Run("tls listener", func(t *testing.T) {
-		t.Parallel()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &tls.Config{MinVersion: tc.minVersion}
+			ln := tc.wrap(newLocalListener(t), cfg)
+			t.Cleanup(func() { require.NoError(t, ln.Close()) })
 
-		base := newLocalListener(t)
-		cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-		tlsListener := tls.NewListener(base, cfg)
-		t.Cleanup(func() {
-			require.NoError(t, tlsListener.Close())
+			if tc.wantConfig {
+				require.Same(t, cfg, getTLSConfig(ln), tc.msg)
+			} else {
+				require.Nil(t, getTLSConfig(ln), tc.msg)
+			}
 		})
+	}
 
-		require.Same(t, cfg, getTLSConfig(tlsListener), "*tls.Listener should expose its TLS config")
-	})
-
-	t.Run("wrapped tls listener", func(t *testing.T) {
+	t.Run("non-struct listener", func(t *testing.T) {
 		t.Parallel()
-
-		base := newLocalListener(t)
-		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
-		tlsListener := tls.NewListener(base, cfg)
-		wrapped := &wrappedListener{Listener: tlsListener}
-		t.Cleanup(func() {
-			require.NoError(t, wrapped.Close())
+		ln := nonStructListener(7)
+		require.NotPanics(t, func() {
+			require.Nil(t, getTLSConfig(ln), "non-struct listeners should not panic and should not report TLS config")
 		})
-
-		require.Nil(t, getTLSConfig(wrapped), "wrapping without Config()-like methods should return nil")
-	})
-
-	t.Run("listener with tls config method", func(t *testing.T) {
-		t.Parallel()
-
-		base := newLocalListener(t)
-		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
-		listener := &tlsConfigMethodListener{Listener: base, cfg: cfg}
-		t.Cleanup(func() {
-			require.NoError(t, listener.Close())
-		})
-
-		require.Same(t, cfg, getTLSConfig(listener), "TLSConfig() should be preferred for TLS discovery")
-	})
-
-	t.Run("listener with config method", func(t *testing.T) {
-		t.Parallel()
-
-		base := newLocalListener(t)
-		cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-		listener := &configMethodListener{Listener: base, cfg: cfg}
-		t.Cleanup(func() {
-			require.NoError(t, listener.Close())
-		})
-
-		require.Same(t, cfg, getTLSConfig(listener), "Config() should be preferred for TLS discovery")
-	})
-
-	t.Run("non tls listener", func(t *testing.T) {
-		t.Parallel()
-
-		base := newLocalListener(t)
-		t.Cleanup(func() {
-			require.NoError(t, base.Close())
-		})
-
-		require.Nil(t, getTLSConfig(base), "plain listeners should not report TLS config")
 	})
 }
 
@@ -233,17 +417,88 @@ func newLocalListener(t *testing.T) net.Listener {
 	return ln
 }
 
-// go test -v -run=^$ -bench=Benchmark_Utils_GetOffer -benchmem -count=4
+// Per RFC 9110 §12.5.1 the most specific matching media range decides an
+// offer's acceptability, so a broader range with a higher quality must not
+// override a more specific q=0 rejection. Before the fix, getOffer dropped
+// q=0 ranges up front and returned an offer the client had explicitly refused.
+func Test_Utils_GetOffer_QualityZeroRejection(t *testing.T) {
+	t.Parallel()
+	// A more specific q=0 range rejects the offer even though a broader
+	// range (text/*, */*) with quality > 0 also matches it.
+	require.Empty(t, getOffer([]byte("text/*, text/html;q=0"), acceptsOfferType, "text/html"))
+	require.Empty(t, getOffer([]byte("*/*, application/json;q=0"), acceptsOfferType, "application/json"))
+
+	// The broader range still selects offers that the q=0 range does not reject.
+	require.Equal(t, "text/plain", getOffer([]byte("text/*, text/html;q=0"), acceptsOfferType, "text/plain"))
+
+	// Accept-Encoding: the client accepts anything except gzip, so a server
+	// offering gzip or deflate must pick deflate, not the refused gzip.
+	require.Equal(t, "deflate", getOffer([]byte("*, gzip;q=0"), acceptsOffer, "gzip", "deflate"))
+	require.Empty(t, getOffer([]byte("*, gzip;q=0"), acceptsOffer, "gzip"))
+
+	// Accept-Language: "*" accepts any tag, but "en;q=0" rejects English.
+	require.Empty(t, getOffer([]byte("*, en;q=0"), acceptsLanguageOfferBasic, "en"))
+	require.Equal(t, "fr", getOffer([]byte("*, en;q=0"), acceptsLanguageOfferBasic, "en", "fr"))
+
+	// Same coarse specificity class: a positive match and a q=0 refusal can share
+	// the parsed specificity bucket, so the effective match specificity decides.
+
+	// Media-type parameters (RFC 9110 §12.5.1): "text/html;level=1;q=0" is more
+	// specific than "text/html", so an offer carrying that parameter is rejected.
+	require.Empty(t, getOffer([]byte("text/html, text/html;level=1;q=0"), acceptsOfferType, "text/html;level=1"))
+	// A less specific "text/html;q=0" must not override the more specific positive
+	// "text/html;level=1" match.
+	require.Equal(t, "text/html;level=1", getOffer([]byte("text/html;level=1, text/html;q=0"), acceptsOfferType, "text/html;level=1"))
+	// An offer without the refused parameter is still accepted.
+	require.Equal(t, "text/html", getOffer([]byte("text/html, text/html;level=1;q=0"), acceptsOfferType, "text/html"))
+
+	// Accept-Language basic filtering buckets "en" and "en-US" the same, but an
+	// exact "en-US;q=0" must override the prefix "en" match.
+	require.Empty(t, getOffer([]byte("en, en-US;q=0"), acceptsLanguageOfferBasic, "en-US"))
+	require.Equal(t, "en-GB", getOffer([]byte("en, en-US;q=0"), acceptsLanguageOfferBasic, "en-US", "en-GB"))
+	// A broader "en;q=0" does not override the exact positive "en-US".
+	require.Equal(t, "en-US", getOffer([]byte("en-US, en;q=0"), acceptsLanguageOfferBasic, "en-US"))
+	// Extended filtering: a deeper refused range wins over a shorter positive one.
+	require.Empty(t, getOffer([]byte("en, en-US;q=0"), acceptsLanguageOfferExtended, "en-US"))
+
+	// Accept-Charset: an exact "utf-8;q=0" refusal overrides an earlier exact
+	// "utf-8" of the same specificity, and a wildcard positive too.
+	require.Empty(t, getOffer([]byte("utf-8, utf-8;q=0"), acceptsOffer, "utf-8"))
+	require.Empty(t, getOffer([]byte("*, utf-8;q=0"), acceptsOffer, "utf-8"))
+	require.Equal(t, "iso-8859-1", getOffer([]byte("*, utf-8;q=0"), acceptsOffer, "utf-8", "iso-8859-1"))
+
+	// Optional whitespace may precede the list separator (RFC 9110 §5.6.1.2),
+	// so the weight is still the last thing in the element and must be honored.
+	require.Empty(t, getOffer([]byte("text/html;q=0 , text/plain"), acceptsOfferType, "text/html"))
+	require.Equal(t, "text/plain", getOffer([]byte("text/html;q=0 , text/plain"), acceptsOfferType, "text/html", "text/plain"))
+	require.Empty(t, getOffer([]byte("text/html;q=0\t, text/plain"), acceptsOfferType, "text/html"))
+	require.Equal(t, "deflate", getOffer([]byte("gzip;q=0 , deflate"), acceptsOffer, "gzip", "deflate"))
+	require.Empty(t, getOffer([]byte("en;q=0 , fr"), acceptsLanguageOfferBasic, "en"))
+	// The same whitespace must not distort ordering between positive weights.
+	require.Equal(t, "application/json", getOffer([]byte("text/plain;q=0.1 , application/json;q=0.9"), acceptsOfferType, "text/plain", "application/json"))
+
+	// An empty offer is skipped on the resolve-by-specificity path too: the first
+	// match (text/plain, demoted to 0.3 by its own range) loses to text/html.
+	require.Equal(t, "text/html", getOffer([]byte("text/*;q=0.8, text/plain;q=0.3"), acceptsOfferType, "", "text/plain", "text/html"))
+	require.Equal(t, "text/plain", getOffer([]byte("text/*;q=0.8, text/plain;q=0.3"), acceptsOfferType, "", "text/plain"))
+}
+
 func Benchmark_Utils_GetOffer(b *testing.B) {
 	testCases := []struct {
 		description string
 		accept      string
 		offers      []string
 	}{
+		{description: "simple", accept: "application/json", offers: []string{"application/json"}},
 		{
-			description: "simple",
-			accept:      "application/json",
-			offers:      []string{"application/json"},
+			description: "quoted comma",
+			accept:      `text/plain;p="a,b", text/html;q=0.5`,
+			offers:      []string{`text/plain;p="a,b"`, "text/html"},
+		},
+		{
+			description: "quoted pair",
+			accept:      `text/plain;p="a\"b,c", text/html;q=0.5`,
+			offers:      []string{`text/plain;p="a\"b,c"`, "text/html"},
 		},
 		{
 			description: "6 offers",
@@ -282,26 +537,10 @@ func Benchmark_Utils_GetOffer(b *testing.B) {
 				"text/plain; format=flowed",
 			},
 		},
-		{
-			description: "mime extension",
-			accept:      "utf-8, iso-8859-1;q=0.5",
-			offers:      []string{"utf-8"},
-		},
-		{
-			description: "mime extension",
-			accept:      "utf-8, iso-8859-1;q=0.5",
-			offers:      []string{"iso-8859-1"},
-		},
-		{
-			description: "mime extension",
-			accept:      "utf-8, iso-8859-1;q=0.5",
-			offers:      []string{"iso-8859-1", "utf-8"},
-		},
-		{
-			description: "mime extension",
-			accept:      "gzip, deflate",
-			offers:      []string{"deflate"},
-		},
+		{description: "mime extension", accept: "utf-8, iso-8859-1;q=0.5", offers: []string{"utf-8"}},
+		{description: "mime extension", accept: "utf-8, iso-8859-1;q=0.5", offers: []string{"iso-8859-1"}},
+		{description: "mime extension", accept: "utf-8, iso-8859-1;q=0.5", offers: []string{"iso-8859-1", "utf-8"}},
+		{description: "mime extension", accept: "gzip, deflate", offers: []string{"deflate"}},
 		{
 			description: "web browser",
 			accept:      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -320,6 +559,7 @@ func Benchmark_Utils_GetOffer(b *testing.B) {
 	}
 }
 
+// conventions:ignore parallel: legacy, sequential before the rule; make it parallel and delete this line
 func Test_Utils_ParamsMatch(t *testing.T) {
 	testCases := []struct {
 		description string
@@ -327,42 +567,12 @@ func Test_Utils_ParamsMatch(t *testing.T) {
 		offer       string
 		match       bool
 	}{
-		{
-			description: "empty accept and offer",
-			accept:      nil,
-			offer:       "",
-			match:       true,
-		},
-		{
-			description: "accept is empty, offer has params",
-			accept:      make(headerParams),
-			offer:       ";foo=bar",
-			match:       true,
-		},
-		{
-			description: "offer is empty, accept has params",
-			accept:      headerParams{"foo": []byte("bar")},
-			offer:       "",
-			match:       false,
-		},
-		{
-			description: "accept has extra parameters",
-			accept:      headerParams{"foo": []byte("bar"), "a": []byte("1")},
-			offer:       ";foo=bar",
-			match:       false,
-		},
-		{
-			description: "matches regardless of order",
-			accept:      headerParams{"b": []byte("2"), "a": []byte("1")},
-			offer:       ";b=2;a=1",
-			match:       true,
-		},
-		{
-			description: "case-insensitive",
-			accept:      headerParams{"ParaM": []byte("FoO")},
-			offer:       ";pAram=foO",
-			match:       true,
-		},
+		{description: "empty accept and offer", accept: nil, offer: "", match: true},
+		{description: "accept is empty, offer has params", accept: make(headerParams), offer: ";foo=bar", match: true},
+		{description: "offer is empty, accept has params", accept: headerParams{"foo": []byte("bar")}, offer: "", match: false},
+		{description: "accept has extra parameters", accept: headerParams{"foo": []byte("bar"), "a": []byte("1")}, offer: ";foo=bar", match: false},
+		{description: "matches regardless of order", accept: headerParams{"b": []byte("2"), "a": []byte("1")}, offer: ";b=2;a=1", match: true},
+		{description: "case-insensitive", accept: headerParams{"ParaM": []byte("FoO")}, offer: ";pAram=foO", match: true},
 	}
 
 	for _, tc := range testCases {
@@ -373,10 +583,7 @@ func Test_Utils_ParamsMatch(t *testing.T) {
 func Benchmark_Utils_ParamsMatch(b *testing.B) {
 	var match bool
 
-	specParams := headerParams{
-		"appLe": []byte("orange"),
-		"param": []byte("foo"),
-	}
+	specParams := headerParams{"appLe": []byte("orange"), "param": []byte("foo")}
 	b.ReportAllocs()
 	for b.Loop() {
 		match = paramsMatch(specParams, `;param=foo; apple=orange`)
@@ -393,24 +600,9 @@ func Test_Utils_AcceptsOfferType(t *testing.T) {
 		offerType   string
 		accepts     bool
 	}{
-		{
-			description: "no params, matching",
-			spec:        "application/json",
-			offerType:   "application/json",
-			accepts:     true,
-		},
-		{
-			description: "no params, mismatch",
-			spec:        "application/json",
-			offerType:   "application/xml",
-			accepts:     false,
-		},
-		{
-			description: "mismatch with subtype prefix",
-			spec:        "application/json",
-			offerType:   "application/json+xml",
-			accepts:     false,
-		},
+		{description: "no params, matching", spec: "application/json", offerType: "application/json", accepts: true},
+		{description: "no params, mismatch", spec: "application/json", offerType: "application/xml", accepts: false},
+		{description: "mismatch with subtype prefix", spec: "application/json", offerType: "application/json+xml", accepts: false},
 		{
 			description: "params match",
 			spec:        "application/json",
@@ -425,12 +617,7 @@ func Test_Utils_AcceptsOfferType(t *testing.T) {
 			offerType:   "text/html",
 			accepts:     false,
 		},
-		{
-			description: "offer has extra params",
-			spec:        "text/html",
-			offerType:   "text/html;charset=utf-8",
-			accepts:     true,
-		},
+		{description: "offer has extra params", spec: "text/html", offerType: "text/html;charset=utf-8", accepts: true},
 		{
 			description: "ignores optional whitespace",
 			spec:        "application/json",
@@ -447,90 +634,9 @@ func Test_Utils_AcceptsOfferType(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		accepts := acceptsOfferType(tc.spec, tc.offerType, tc.specParams)
+		accepts := acceptsOfferType(tc.spec, tc.offerType, tc.specParams) > 0
 		require.Equal(t, tc.accepts, accepts, tc.description)
 	}
-}
-
-func Test_Utils_GetSplicedStrList(t *testing.T) {
-	t.Parallel()
-	testCases := []struct {
-		description  string
-		headerValue  string
-		expectedList []string
-	}{
-		{
-			description:  "normal case",
-			headerValue:  "gzip, deflate,br",
-			expectedList: []string{"gzip", "deflate", "br"},
-		},
-		{
-			description:  "no matter the value",
-			headerValue:  "   gzip,deflate, br, zip",
-			expectedList: []string{"gzip", "deflate", "br", "zip"},
-		},
-		{
-			description:  "comma with trailing spaces around values",
-			headerValue:  "gzip , br",
-			expectedList: []string{"gzip", "br"},
-		},
-		{
-			description:  "comma with tabbed whitespace",
-			headerValue:  "gzip\t,br",
-			expectedList: []string{"gzip", "br"},
-		},
-		{
-			description:  "headerValue is empty",
-			headerValue:  "",
-			expectedList: nil,
-		},
-		{
-			description:  "has a comma without element",
-			headerValue:  "gzip,",
-			expectedList: []string{"gzip", ""},
-		},
-		{
-			description:  "has a space between words",
-			headerValue:  "  foo bar, hello  world",
-			expectedList: []string{"foo bar", "hello  world"},
-		},
-		{
-			description:  "single comma",
-			headerValue:  ",",
-			expectedList: []string{"", ""},
-		},
-		{
-			description:  "multiple comma",
-			headerValue:  ",,",
-			expectedList: []string{"", "", ""},
-		},
-		{
-			description:  "comma with space",
-			headerValue:  ",  ,",
-			expectedList: []string{"", "", ""},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.description, func(t *testing.T) {
-			tc := tc // create a new 'tc' variable for the goroutine
-			t.Parallel()
-			dst := make([]string, 10)
-			result := getSplicedStrList(tc.headerValue, dst)
-			require.Equal(t, tc.expectedList, result)
-		})
-	}
-}
-
-func Benchmark_Utils_GetSplicedStrList(b *testing.B) {
-	destination := make([]string, 5)
-	result := destination
-	const input = `deflate, gzip,br,brotli,zstd`
-	b.ReportAllocs()
-	for b.Loop() {
-		result = getSplicedStrList(input, destination)
-	}
-	require.Equal(b, []string{"deflate", "gzip", "br", "brotli", "zstd"}, result)
 }
 
 func Test_Utils_SortAcceptedTypes(t *testing.T) {
@@ -566,7 +672,77 @@ func Test_Utils_SortAcceptedTypes(t *testing.T) {
 	}, acceptedTypes)
 }
 
-// go test -v -run=^$ -bench=Benchmark_Utils_SortAcceptedTypes_Sorted -benchmem -count=4
+// Every element ranks above all the ones before it: one swap per pair for an insertion sort.
+func Test_Utils_SortAcceptedTypes_NotQuadratic(t *testing.T) {
+	t.Parallel()
+	const n = 1 << 17
+	acceptedTypes := make([]acceptedType, n)
+	for i := range acceptedTypes {
+		acceptedTypes[i] = acceptedType{quality: float64(i), specificity: 4, order: i}
+	}
+
+	start := time.Now()
+	sortAcceptedTypes(acceptedTypes)
+	// Quadratic takes tens of seconds here, n log n a few milliseconds.
+	require.Less(t, time.Since(start), 5*time.Second)
+
+	for i := range acceptedTypes {
+		require.Equal(t, n-1-i, acceptedTypes[i].order)
+	}
+}
+
+func Test_Utils_SortAcceptedTypes_LongMatchesShort(t *testing.T) {
+	t.Parallel()
+	pattern := []acceptedType{
+		{quality: 0.5, specificity: 3},
+		{quality: 1, specificity: 1},
+		{quality: 1, specificity: 3},
+		{quality: 1, specificity: 3, params: headerParams{"a": []byte("1")}},
+		{quality: 0, specificity: 4},
+	}
+	long := make([]acceptedType, 0, 4*maxInsertionSortedTypes)
+	for i := range cap(long) {
+		element := pattern[i%len(pattern)]
+		element.order = i
+		long = append(long, element)
+	}
+	sortAcceptedTypes(long)
+
+	for i := 1; i < len(long); i++ {
+		pair := []acceptedType{long[i], long[i-1]}
+		sortAcceptedTypes(pair)
+		require.Equal(t, long[i-1].order, pair[0].order)
+	}
+}
+
+func Test_Utils_GetOffer_ManyRanges(t *testing.T) {
+	t.Parallel()
+	// 1500 wildcards, then 2000 empty members that sort in front of every one of them.
+	header := []byte(strings.Repeat("*/*,", 1500) + strings.Repeat(",", 2000))
+
+	require.Equal(t, "text/html", getOffer(header, acceptsOfferType, "text/html"))
+	require.Equal(t, "application/json", getOffer(header, acceptsOfferType, "application/json", "text/html"))
+}
+
+func Benchmark_Utils_SortAcceptedTypes_Long(b *testing.B) {
+	const n = 6000
+	acceptedTypes := make([]acceptedType, n)
+	b.ReportAllocs()
+	for b.Loop() {
+		// 2000 wildcards, then 4000 more specific members.
+		for i := range acceptedTypes {
+			specificity := 4
+			if i < n/3 {
+				specificity = 1
+			}
+			acceptedTypes[i] = acceptedType{quality: 1, specificity: specificity, order: i}
+		}
+		sortAcceptedTypes(acceptedTypes)
+	}
+	require.Equal(b, n/3, acceptedTypes[0].order)
+	require.Equal(b, 0, acceptedTypes[n-n/3].order)
+}
+
 func Benchmark_Utils_SortAcceptedTypes_Sorted(b *testing.B) {
 	acceptedTypes := make([]acceptedType, 3)
 	b.ReportAllocs()
@@ -581,7 +757,6 @@ func Benchmark_Utils_SortAcceptedTypes_Sorted(b *testing.B) {
 	require.Equal(b, "*/*", acceptedTypes[2].spec)
 }
 
-// go test -v -run=^$ -bench=Benchmark_Utils_SortAcceptedTypes_Unsorted -benchmem -count=4
 func Benchmark_Utils_SortAcceptedTypes_Unsorted(b *testing.B) {
 	acceptedTypes := make([]acceptedType, 11)
 	b.ReportAllocs()
@@ -614,56 +789,27 @@ func Benchmark_Utils_SortAcceptedTypes_Unsorted(b *testing.B) {
 	}, acceptedTypes)
 }
 
-func Test_Utils_UniqueRouteStack(t *testing.T) {
-	t.Parallel()
-	route1 := &Route{}
-	route2 := &Route{}
-	route3 := &Route{}
-	require.Equal(
-		t,
-		[]*Route{
-			route1,
-			route2,
-			route3,
-		},
-		uniqueRouteStack([]*Route{
-			route1,
-			route1,
-			route1,
-			route2,
-			route2,
-			route2,
-			route3,
-			route3,
-			route3,
-			route1,
-			route2,
-			route3,
-		}))
-}
-
 func Test_Utils_getGroupPath(t *testing.T) {
 	t.Parallel()
-	res := getGroupPath("/v1", "/")
-	require.Equal(t, "/v1/", res)
+	testCases := []struct {
+		name, prefix, path, want string
+	}{
+		{name: "root path after prefix", prefix: "/v1", path: "/", want: "/v1/"},
+		{name: "prefix with trailing slash", prefix: "/v1/", path: "/", want: "/v1/"},
+		{name: "root prefix and root path", prefix: "/", path: "/", want: "/"},
+		{name: "nested prefix with trailing slash", prefix: "/v1/api/", path: "/", want: "/v1/api/"},
+		{name: "relative path", prefix: "/v1/api", path: "group", want: "/v1/api/group"},
+		{name: "empty path", prefix: "/v1/api", path: "", want: "/v1/api"},
+	}
 
-	res = getGroupPath("/v1/", "/")
-	require.Equal(t, "/v1/", res)
-
-	res = getGroupPath("/", "/")
-	require.Equal(t, "/", res)
-
-	res = getGroupPath("/v1/api/", "/")
-	require.Equal(t, "/v1/api/", res)
-
-	res = getGroupPath("/v1/api", "group")
-	require.Equal(t, "/v1/api/group", res)
-
-	res = getGroupPath("/v1/api", "")
-	require.Equal(t, "/v1/api", res)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, getGroupPath(tc.prefix, tc.path))
+		})
+	}
 }
 
-// go test -v -run=^$ -bench=Benchmark_Utils_ -benchmem -count=3
 func Benchmark_Utils_getGroupPath(b *testing.B) {
 	var res string
 	b.ReportAllocs()
@@ -690,34 +836,6 @@ func Benchmark_Utils_Unescape(b *testing.B) {
 	require.Equal(b, "/créer", unescaped)
 }
 
-func Test_Utils_Parse_Address(t *testing.T) {
-	t.Parallel()
-
-	testCases := []struct {
-		addr, host, port string
-	}{
-		{addr: "[::1]:3000", host: "[::1]", port: "3000"},
-		{addr: "127.0.0.1:3000", host: "127.0.0.1", port: "3000"},
-		{addr: "[::1]", host: "[::1]", port: ""},
-		{addr: "2001:db8::1", host: "2001:db8::1", port: ""},
-		{addr: "/path/to/unix/socket", host: "/path/to/unix/socket", port: ""},
-		{addr: "127.0.0.1", host: "127.0.0.1", port: ""},
-		{addr: "localhost:8080", host: "localhost", port: "8080"},
-		{addr: "example.com", host: "example.com", port: ""},
-		{addr: "[fe80::1%lo0]:1234", host: "[fe80::1%lo0]", port: "1234"},
-		{addr: "[fe80::1%lo0]", host: "[fe80::1%lo0]", port: ""},
-		{addr: ":9090", host: "", port: "9090"},
-		{addr: " 127.0.0.1:8080 ", host: "127.0.0.1", port: "8080"},
-		{addr: "", host: "", port: ""},
-	}
-
-	for _, c := range testCases {
-		host, port := parseAddr(c.addr)
-		require.Equal(t, c.host, host, "addr host: %q", c.addr)
-		require.Equal(t, c.port, port, "addr port: %q", c.addr)
-	}
-}
-
 func Test_Utils_TestConn_Deadline(t *testing.T) {
 	t.Parallel()
 	conn := &testConn{}
@@ -730,7 +848,6 @@ func Test_Utils_TestConn_ReadWrite(t *testing.T) {
 	t.Parallel()
 	conn := &testConn{}
 
-	// Verify read of request
 	_, err := conn.r.Write([]byte("Request"))
 	require.NoError(t, err)
 
@@ -739,7 +856,6 @@ func Test_Utils_TestConn_ReadWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("Request"), req)
 
-	// Verify write of response
 	_, err = conn.Write([]byte("Response"))
 	require.NoError(t, err)
 
@@ -753,7 +869,6 @@ func Test_Utils_TestConn_Closed_Write(t *testing.T) {
 	t.Parallel()
 	conn := &testConn{}
 
-	// Verify write of response
 	_, err := conn.Write([]byte("Response 1\n"))
 	require.NoError(t, err)
 
@@ -799,7 +914,6 @@ func Test_Utils_IsNoCache(t *testing.T) {
 	}
 }
 
-// go test -v -run=^$ -bench=Benchmark_Utils_IsNoCache -benchmem -count=4
 func Benchmark_Utils_IsNoCache(b *testing.B) {
 	var ok bool
 	b.ReportAllocs()
@@ -814,252 +928,114 @@ func Benchmark_Utils_IsNoCache(b *testing.B) {
 	require.True(b, ok)
 }
 
-// go test -run Test_HeaderContainsValue
-func Test_HeaderContainsValue(t *testing.T) {
-	t.Parallel()
-	testCases := []struct {
-		header   string
-		value    string
-		expected bool
-	}{
-		// Exact match
-		{header: "gzip", value: "gzip", expected: true},
-		{header: "gzip", value: "deflate", expected: false},
-		// Prefix match (value at start with comma)
-		{header: "gzip, deflate", value: "gzip", expected: true},
-		{header: "gzip,deflate", value: "gzip", expected: true},
-		// Suffix match (value at end)
-		{header: "deflate, gzip", value: "gzip", expected: true},
-		{header: "deflate,gzip", value: "gzip", expected: true}, // No space - OWS is optional per RFC 9110
-		{header: "br, gzip", value: "gzip", expected: true},
-		// Middle match (value in middle)
-		{header: "deflate, gzip, br", value: "gzip", expected: true},
-		{header: "deflate,gzip,br", value: "gzip", expected: true}, // No spaces - OWS is optional per RFC 9110
-		// No match - similar but not equal
-		{header: "gzip2", value: "gzip", expected: false},
-		{header: "2gzip", value: "gzip", expected: false},
-		{header: "gzip2, deflate", value: "gzip", expected: false},
-		// Whitespace handling (OWS per RFC 9110)
-		{header: "  gzip  ,  deflate  ", value: "gzip", expected: true},
-		{header: "deflate,  gzip  ", value: "gzip", expected: true},
-		// Empty cases
-		{header: "", value: "gzip", expected: false},
-		{header: "gzip", value: "", expected: false},
-		{header: "", value: "", expected: false}, // Both empty - should return false
-	}
-
-	for _, tc := range testCases {
-		result := headerContainsValue(tc.header, tc.value)
-		require.Equal(t, tc.expected, result,
-			"headerContainsValue(%q, %q) = %v, want %v",
-			tc.header, tc.value, result, tc.expected)
-	}
-}
-
-// go test -v -run=^$ -bench=Benchmark_HeaderContainsValue -benchmem -count=4
-func Benchmark_HeaderContainsValue(b *testing.B) {
-	var ok bool
-	b.ReportAllocs()
-	for b.Loop() {
-		_ = headerContainsValue("gzip", "gzip")
-		_ = headerContainsValue("gzip, deflate, br", "deflate")
-		_ = headerContainsValue("deflate, gzip", "gzip")
-		ok = headerContainsValue("deflate, gzip, br", "gzip")
-	}
-	require.True(b, ok)
-}
-
-type testGenericParseTypeIntCase struct {
-	value int64
+// miscParseIntCase is a case of the integer parsing tests and benchmarks: value
+// needs an integer of at least bits width.
+type miscParseIntCase[N int64 | uint64] struct {
+	value N
 	bits  int
 }
 
-// go test -run Test_GenericParseTypeInts
-func Test_GenericParseTypeInts(t *testing.T) {
-	t.Parallel()
-	ints := []testGenericParseTypeIntCase{
-		{
-			value: 0,
-			bits:  8,
-		},
-		{
-			value: 1,
-			bits:  8,
-		},
-		{
-			value: 2,
-			bits:  8,
-		},
-		{
-			value: 3,
-			bits:  8,
-		},
-		{
-			value: 4,
-			bits:  8,
-		},
-		{
-			value: -1,
-			bits:  8,
-		},
-		{
-			value: math.MaxInt8,
-			bits:  8,
-		},
-		{
-			value: math.MinInt8,
-			bits:  8,
-		},
-		{
-			value: math.MaxInt16,
-			bits:  16,
-		},
-		{
-			value: math.MinInt16,
-			bits:  16,
-		},
-		{
-			value: math.MaxInt32,
-			bits:  32,
-		},
-		{
-			value: math.MinInt32,
-			bits:  32,
-		},
-		{
-			value: math.MaxInt64,
-			bits:  64,
-		},
-		{
-			value: math.MinInt64,
-			bits:  64,
-		},
+// miscParseInts, miscParseUints, miscParseFloats, miscParseBytes and
+// miscParseBools are what the genericParseType tests parse, and its benchmarks
+// would time.
+var (
+	miscParseInts = []miscParseIntCase[int64]{
+		{value: 0, bits: 8},
+		{value: 1, bits: 8},
+		{value: 2, bits: 8},
+		{value: 3, bits: 8},
+		{value: 4, bits: 8},
+		{value: -1, bits: 8},
+		{value: math.MaxInt8, bits: 8},
+		{value: math.MinInt8, bits: 8},
+		{value: math.MaxInt16, bits: 16},
+		{value: math.MinInt16, bits: 16},
+		{value: math.MaxInt32, bits: 32},
+		{value: math.MinInt32, bits: 32},
+		{value: math.MaxInt64, bits: 64},
+		{value: math.MinInt64, bits: 64},
 	}
-
-	testGenericTypeInt[int8](t, "test_genericParseTypeInt8s", ints)
-	testGenericTypeInt[int16](t, "test_genericParseTypeInt16s", ints)
-	testGenericTypeInt[int32](t, "test_genericParseTypeInt32s", ints)
-	testGenericTypeInt[int64](t, "test_genericParseTypeInt64s", ints)
-	testGenericTypeInt[int](t, "test_genericParseTypeInts", ints)
-}
-
-func testGenericTypeInt[V GenericTypeInteger](t *testing.T, name string, cases []testGenericParseTypeIntCase) {
-	t.Helper()
-	t.Run(name, func(t *testing.T) {
-		t.Parallel()
-		for _, test := range cases {
-			v, err := genericParseType[V](strconv.FormatInt(test.value, 10))
-			if test.bits <= int(unsafe.Sizeof(V(0)))*8 {
-				require.NoError(t, err)
-				require.Equal(t, V(test.value), v)
-			} else {
-				require.ErrorIs(t, err, strconv.ErrRange)
-			}
-		}
-		testGenericParseError[V](t)
-	})
-}
-
-type testGenericParseTypeUintCase struct {
-	value uint64
-	bits  int
-}
-
-// go test -run Test_GenericParseTypeUints
-func Test_GenericParseTypeUints(t *testing.T) {
-	t.Parallel()
-	uints := []testGenericParseTypeUintCase{
-		{
-			value: 0,
-			bits:  8,
-		},
-		{
-			value: 1,
-			bits:  8,
-		},
-		{
-			value: 2,
-			bits:  8,
-		},
-		{
-			value: 3,
-			bits:  8,
-		},
-		{
-			value: 4,
-			bits:  8,
-		},
-		{
-			value: math.MaxUint8,
-			bits:  8,
-		},
-		{
-			value: math.MaxUint16,
-			bits:  16,
-		},
-		{
-			value: math.MaxUint32,
-			bits:  32,
-		},
-		{
-			value: math.MaxUint64,
-			bits:  64,
-		},
+	miscParseUints = []miscParseIntCase[uint64]{
+		{value: 0, bits: 8},
+		{value: 1, bits: 8},
+		{value: 2, bits: 8},
+		{value: 3, bits: 8},
+		{value: 4, bits: 8},
+		{value: math.MaxUint8, bits: 8},
+		{value: math.MaxUint16, bits: 16},
+		{value: math.MaxUint16, bits: 16},
+		{value: math.MaxUint32, bits: 32},
+		{value: math.MaxUint64, bits: 64},
 	}
-
-	testGenericTypeUint[uint8](t, "test_genericParseTypeUint8s", uints)
-	testGenericTypeUint[uint16](t, "test_genericParseTypeUint16s", uints)
-	testGenericTypeUint[uint32](t, "test_genericParseTypeUint32s", uints)
-	testGenericTypeUint[uint64](t, "test_genericParseTypeUint64s", uints)
-	testGenericTypeUint[uint](t, "test_genericParseTypeUints", uints)
-}
-
-func testGenericTypeUint[V GenericTypeInteger](t *testing.T, name string, cases []testGenericParseTypeUintCase) {
-	t.Helper()
-	t.Run(name, func(t *testing.T) {
-		t.Parallel()
-		for _, test := range cases {
-			v, err := genericParseType[V](strconv.FormatUint(test.value, 10))
-			if test.bits <= int(unsafe.Sizeof(V(0)))*8 {
-				require.NoError(t, err)
-				require.Equal(t, V(test.value), v)
-			} else {
-				require.ErrorIs(t, err, strconv.ErrRange)
-			}
-		}
-		testGenericParseError[V](t)
-	})
-}
-
-// go test -run Test_GenericParseTypeFloats
-func Test_GenericParseTypeFloats(t *testing.T) {
-	t.Parallel()
-
-	floats := []struct {
+	miscParseFloats = []struct {
 		str   string
 		value float64
+	}{{value: 3.1415, str: "3.1415"}, {value: 1.234, str: "1.234"}, {value: 2, str: "2"}, {value: 3, str: "3"}}
+	miscParseBytes = []struct {
+		str   string
+		err   error
+		value []byte
 	}{
-		{
-			value: 3.1415,
-			str:   "3.1415",
-		},
-		{
-			value: 1.234,
-			str:   "1.234",
-		},
-		{
-			value: 2,
-			str:   "2",
-		},
-		{
-			value: 3,
-			str:   "3",
-		},
+		{value: []byte("alex"), str: "alex"},
+		{value: []byte("32.23"), str: "32.23"},
+		{value: []byte("john"), str: "john"},
+		{value: []byte(nil), str: "", err: errParsedEmptyBytes},
 	}
+	miscParseBools = []struct {
+		str   string
+		value bool
+	}{
+		{str: "True", value: true},
+		{str: "False", value: false},
+		{str: "true", value: true},
+		{str: "false", value: false},
+	}
+)
 
+func Test_GenericParseTypeInts(t *testing.T) {
+	t.Parallel()
+	testGenericTypeInteger[int8](t, "test_genericParseTypeInt8s", miscParseInts)
+	testGenericTypeInteger[int16](t, "test_genericParseTypeInt16s", miscParseInts)
+	testGenericTypeInteger[int32](t, "test_genericParseTypeInt32s", miscParseInts)
+	testGenericTypeInteger[int64](t, "test_genericParseTypeInt64s", miscParseInts)
+	testGenericTypeInteger[int](t, "test_genericParseTypeInts", miscParseInts)
+}
+
+// testGenericTypeInteger parses the decimal form of every value in cases as V:
+// a value that fits in V must parse to itself, any other one must be rejected.
+func testGenericTypeInteger[V GenericTypeInteger, N int64 | uint64](
+	t *testing.T, name string, cases []miscParseIntCase[N],
+) {
+	t.Helper()
+	t.Run(name, func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range cases {
+			v, err := genericParseType[V](fmt.Sprint(tc.value))
+			if tc.bits <= int(unsafe.Sizeof(V(0)))*8 {
+				require.NoError(t, err, "value %d", tc.value)
+				require.Equal(t, V(tc.value), v, "value %d", tc.value)
+			} else {
+				require.ErrorIs(t, err, errParseValue, "value %d", tc.value)
+			}
+		}
+		testGenericParseError[V](t)
+	})
+}
+
+func Test_GenericParseTypeUints(t *testing.T) {
+	t.Parallel()
+	testGenericTypeInteger[uint8](t, "test_genericParseTypeUint8s", miscParseUints)
+	testGenericTypeInteger[uint16](t, "test_genericParseTypeUint16s", miscParseUints)
+	testGenericTypeInteger[uint32](t, "test_genericParseTypeUint32s", miscParseUints)
+	testGenericTypeInteger[uint64](t, "test_genericParseTypeUint64s", miscParseUints)
+	testGenericTypeInteger[uint](t, "test_genericParseTypeUints", miscParseUints)
+}
+
+func Test_GenericParseTypeFloats(t *testing.T) {
+	t.Parallel()
 	t.Run("test_genericParseTypeFloat32s", func(t *testing.T) {
 		t.Parallel()
-		for _, test := range floats {
+		for _, test := range miscParseFloats {
 			v, err := genericParseType[float32](test.str)
 			require.NoError(t, err)
 			require.InEpsilon(t, float32(test.value), v, epsilon)
@@ -1069,7 +1045,7 @@ func Test_GenericParseTypeFloats(t *testing.T) {
 
 	t.Run("test_genericParseTypeFloat64s", func(t *testing.T) {
 		t.Parallel()
-		for _, test := range floats {
+		for _, test := range miscParseFloats {
 			v, err := genericParseType[float64](test.str)
 			require.NoError(t, err)
 			require.InEpsilon(t, test.value, v, epsilon)
@@ -1078,37 +1054,11 @@ func Test_GenericParseTypeFloats(t *testing.T) {
 	})
 }
 
-// go test -run Test_GenericParseTypeBytes
 func Test_GenericParseTypeBytes(t *testing.T) {
 	t.Parallel()
-
-	cases := []struct {
-		str   string
-		err   error
-		value []byte
-	}{
-		{
-			value: []byte("alex"),
-			str:   "alex",
-		},
-		{
-			value: []byte("32.23"),
-			str:   "32.23",
-		},
-		{
-			value: []byte("john"),
-			str:   "john",
-		},
-		{
-			value: []byte(nil),
-			str:   "",
-			err:   errParsedEmptyBytes,
-		},
-	}
-
 	t.Run("test_genericParseTypeBytes", func(t *testing.T) {
 		t.Parallel()
-		for _, test := range cases {
+		for _, test := range miscParseBytes {
 			v, err := genericParseType[[]byte](test.str)
 			if test.err == nil {
 				require.NoError(t, err)
@@ -1120,10 +1070,8 @@ func Test_GenericParseTypeBytes(t *testing.T) {
 	})
 }
 
-// go test -run Test_GenericParseTypeString
 func Test_GenericParseTypeString(t *testing.T) {
 	t.Parallel()
-
 	tests := []string{"john", "doe", "hello", "fiber"}
 
 	for _, test := range tests {
@@ -1136,35 +1084,11 @@ func Test_GenericParseTypeString(t *testing.T) {
 	}
 }
 
-// go test -run Test_GenericParseTypeBoolean
 func Test_GenericParseTypeBoolean(t *testing.T) {
 	t.Parallel()
-
-	bools := []struct {
-		str   string
-		value bool
-	}{
-		{
-			str:   "True",
-			value: true,
-		},
-		{
-			str:   "False",
-			value: false,
-		},
-		{
-			str:   "true",
-			value: true,
-		},
-		{
-			str:   "false",
-			value: false,
-		},
-	}
-
 	t.Run("test_genericParseTypeBoolean", func(t *testing.T) {
 		t.Parallel()
-		for _, test := range bools {
+		for _, test := range miscParseBools {
 			v, err := genericParseType[bool](test.str)
 			require.NoError(t, err)
 			if test.value {
@@ -1185,68 +1109,56 @@ func testGenericParseError[V GenericType](t *testing.T) {
 	require.Equal(t, expected, v)
 }
 
-// go test -v -run=^$ -bench=Benchmark_GenericParseTypeInts -benchmem -count=4
+func Test_GenericParseType_Empty(t *testing.T) {
+	t.Parallel()
+	testGenericParseEmpty[int](t, int(7), errParseValue)
+	testGenericParseEmpty[int8](t, int8(7), errParseValue)
+	testGenericParseEmpty[int16](t, int16(7), errParseValue)
+	testGenericParseEmpty[int32](t, int32(7), errParseValue)
+	testGenericParseEmpty[int64](t, int64(7), errParseValue)
+	testGenericParseEmpty[uint](t, uint(7), errParseValue)
+	testGenericParseEmpty[uint8](t, uint8(7), errParseValue)
+	testGenericParseEmpty[uint16](t, uint16(7), errParseValue)
+	testGenericParseEmpty[uint32](t, uint32(7), errParseValue)
+	testGenericParseEmpty[uint64](t, uint64(7), errParseValue)
+	testGenericParseEmpty[float32](t, float32(7), errParseValue)
+	testGenericParseEmpty[float64](t, float64(7), errParseValue)
+	testGenericParseEmpty[bool](t, true, errParseValue)
+	testGenericParseEmpty[string](t, "fallback", errParsedEmptyString)
+	testGenericParseEmpty[[]byte](t, []byte("fallback"), errParsedEmptyBytes)
+}
+
+// testGenericParseEmpty checks the exact error, zero value and caller fallbacks for V.
+func testGenericParseEmpty[V GenericType](t *testing.T, fallback V, wantErr error) {
+	t.Helper()
+	var zero V
+	t.Run(fmt.Sprintf("%T", zero), func(t *testing.T) {
+		t.Parallel()
+		v, err := genericParseType[V]("")
+		require.Same(t, wantErr, err)
+		require.Equal(t, zero, v)
+
+		c := apptest.CtxAs[*DefaultCtx](t, New())
+		c.Request().URI().SetQueryString("empty=")
+		c.Request().Header.Set("Empty", "")
+		c.route = &Route{Params: []string{"empty"}}
+		for _, key := range []string{"empty", "missing"} {
+			require.Equal(t, zero, Query[V](c, key))
+			require.Equal(t, fallback, Query(c, key, fallback))
+			require.Equal(t, fallback, Query(c, key, fallback, zero))
+			require.Equal(t, zero, Params[V](c, key))
+			require.Equal(t, fallback, Params(c, key, fallback))
+			require.Equal(t, fallback, Params(c, key, fallback, zero))
+			require.Equal(t, zero, GetReqHeader[V](c, key))
+			require.Equal(t, fallback, GetReqHeader(c, key, fallback))
+			require.Equal(t, fallback, GetReqHeader(c, key, fallback, zero))
+		}
+	})
+}
+
 func Benchmark_GenericParseTypeInts(b *testing.B) {
 	b.Skip("Skipped: too fast to compare reliably (results in sub-ns range are unstable)")
-	ints := []testGenericParseTypeIntCase{
-		{
-			value: 0,
-			bits:  8,
-		},
-		{
-			value: 1,
-			bits:  8,
-		},
-		{
-			value: 2,
-			bits:  8,
-		},
-		{
-			value: 3,
-			bits:  8,
-		},
-		{
-			value: 4,
-			bits:  8,
-		},
-		{
-			value: -1,
-			bits:  8,
-		},
-		{
-			value: math.MaxInt8,
-			bits:  8,
-		},
-		{
-			value: math.MinInt8,
-			bits:  8,
-		},
-		{
-			value: math.MaxInt16,
-			bits:  16,
-		},
-		{
-			value: math.MinInt16,
-			bits:  16,
-		},
-		{
-			value: math.MaxInt32,
-			bits:  32,
-		},
-		{
-			value: math.MinInt32,
-			bits:  32,
-		},
-		{
-			value: math.MaxInt64,
-			bits:  64,
-		},
-		{
-			value: math.MinInt64,
-			bits:  64,
-		},
-	}
-	for _, test := range ints {
+	for _, test := range miscParseInts {
 		benchGenericParseTypeInt[int8](b, "bench_genericParseTypeInt8s", test)
 		benchGenericParseTypeInt[int16](b, "bench_genericParseTypeInt16s", test)
 		benchGenericParseTypeInt[int32](b, "bench_genericParseTypeInt32s", test)
@@ -1255,7 +1167,8 @@ func Benchmark_GenericParseTypeInts(b *testing.B) {
 	}
 }
 
-func benchGenericParseTypeInt[V GenericTypeInteger](b *testing.B, name string, test testGenericParseTypeIntCase) {
+// conventions:ignore bench-loop: helper inherited from main; new benchmarks keep their loop
+func benchGenericParseTypeInt[V GenericTypeInteger](b *testing.B, name string, test miscParseIntCase[int64]) {
 	b.Helper()
 	b.Run(name, func(t *testing.B) {
 		var v V
@@ -1271,61 +1184,14 @@ func benchGenericParseTypeInt[V GenericTypeInteger](b *testing.B, name string, t
 			require.NoError(t, err)
 			require.Equal(t, V(test.value), v)
 		} else {
-			require.ErrorIs(t, err, strconv.ErrRange)
+			require.ErrorIs(t, err, errParseValue)
 		}
 	})
 }
 
-// go test -v -run=^$ -bench=Benchmark_GenericParseTypeUints -benchmem -count=4
 func Benchmark_GenericParseTypeUints(b *testing.B) {
 	b.Skip("Skipped: too fast to compare reliably (results in sub-ns range are unstable)")
-	uints := []struct {
-		value uint64
-		bits  int
-	}{
-		{
-			value: 0,
-			bits:  8,
-		},
-		{
-			value: 1,
-			bits:  8,
-		},
-		{
-			value: 2,
-			bits:  8,
-		},
-		{
-			value: 3,
-			bits:  8,
-		},
-		{
-			value: 4,
-			bits:  8,
-		},
-		{
-			value: math.MaxUint8,
-			bits:  8,
-		},
-		{
-			value: math.MaxUint16,
-			bits:  16,
-		},
-		{
-			value: math.MaxUint16,
-			bits:  16,
-		},
-		{
-			value: math.MaxUint32,
-			bits:  32,
-		},
-		{
-			value: math.MaxUint64,
-			bits:  64,
-		},
-	}
-
-	for _, test := range uints {
+	for _, test := range miscParseUints {
 		benchGenericParseTypeUInt[uint8](b, "benchmark_genericParseTypeUint8s", test)
 		benchGenericParseTypeUInt[uint16](b, "benchmark_genericParseTypeUint16s", test)
 		benchGenericParseTypeUInt[uint32](b, "benchmark_genericParseTypeUint32s", test)
@@ -1334,7 +1200,8 @@ func Benchmark_GenericParseTypeUints(b *testing.B) {
 	}
 }
 
-func benchGenericParseTypeUInt[V GenericTypeInteger](b *testing.B, name string, test testGenericParseTypeUintCase) {
+// conventions:ignore bench-loop: helper inherited from main; new benchmarks keep their loop
+func benchGenericParseTypeUInt[V GenericTypeInteger](b *testing.B, name string, test miscParseIntCase[uint64]) {
 	b.Helper()
 	b.Run(name, func(t *testing.B) {
 		var v V
@@ -1350,38 +1217,15 @@ func benchGenericParseTypeUInt[V GenericTypeInteger](b *testing.B, name string, 
 			require.NoError(t, err)
 			require.Equal(t, V(test.value), v)
 		} else {
-			require.ErrorIs(t, err, strconv.ErrRange)
+			require.ErrorIs(t, err, errParseValue)
 		}
 	})
 }
 
-// go test -v -run=^$ -bench=Benchmark_GenericParseTypeFloats -benchmem -count=4
 func Benchmark_GenericParseTypeFloats(b *testing.B) {
 	b.Skip("Skipped: too fast to compare reliably (results in sub-ns range are unstable)")
-	floats := []struct {
-		str   string
-		value float64
-	}{
-		{
-			value: 3.1415,
-			str:   "3.1415",
-		},
-		{
-			value: 1.234,
-			str:   "1.234",
-		},
-		{
-			value: 2,
-			str:   "2",
-		},
-		{
-			value: 3,
-			str:   "3",
-		},
-	}
-
-	for _, test := range floats {
-		b.Run("benchmark_genericParseTypeFloat32s", func(t *testing.B) {
+	for _, test := range miscParseFloats {
+		b.Run("benchmark_genericParseTypeFloat32s", func(b *testing.B) {
 			var v float32
 			var err error
 			b.ReportAllocs()
@@ -1391,13 +1235,13 @@ func Benchmark_GenericParseTypeFloats(b *testing.B) {
 					v, err = genericParseType[float32](test.str)
 				}
 			})
-			require.NoError(t, err)
-			require.InEpsilon(t, float32(test.value), v, epsilon)
+			require.NoError(b, err)
+			require.InEpsilon(b, float32(test.value), v, epsilon)
 		})
 	}
 
-	for _, test := range floats {
-		b.Run("benchmark_genericParseTypeFloat64s", func(t *testing.B) {
+	for _, test := range miscParseFloats {
+		b.Run("benchmark_genericParseTypeFloat64s", func(b *testing.B) {
 			var v float64
 			var err error
 			b.ReportAllocs()
@@ -1407,40 +1251,15 @@ func Benchmark_GenericParseTypeFloats(b *testing.B) {
 					v, err = genericParseType[float64](test.str)
 				}
 			})
-			require.NoError(t, err)
-			require.InEpsilon(t, test.value, v, epsilon)
+			require.NoError(b, err)
+			require.InEpsilon(b, test.value, v, epsilon)
 		})
 	}
 }
 
-// go test -v -run=^$ -bench=Benchmark_GenericParseTypeBytes -benchmem -count=4
 func Benchmark_GenericParseTypeBytes(b *testing.B) {
 	b.Skip("Skipped: too fast to compare reliably (results in sub-ns range are unstable)")
-	cases := []struct {
-		str   string
-		err   error
-		value []byte
-	}{
-		{
-			value: []byte("alex"),
-			str:   "alex",
-		},
-		{
-			value: []byte("32.23"),
-			str:   "32.23",
-		},
-		{
-			value: []byte("john"),
-			str:   "john",
-		},
-		{
-			value: []byte(nil),
-			str:   "",
-			err:   errParsedEmptyBytes,
-		},
-	}
-
-	for _, test := range cases {
+	for _, test := range miscParseBytes {
 		b.Run("benchmark_genericParseTypeBytes", func(b *testing.B) {
 			var v []byte
 			var err error
@@ -1461,7 +1280,6 @@ func Benchmark_GenericParseTypeBytes(b *testing.B) {
 	}
 }
 
-// go test -v -run=^$ -bench=Benchmark_GenericParseTypeString -benchmem -count=4
 func Benchmark_GenericParseTypeString(b *testing.B) {
 	b.Skip("Skipped: too fast to compare reliably (results in sub-ns range are unstable)")
 	tests := []string{"john", "doe", "hello", "fiber"}
@@ -1483,32 +1301,9 @@ func Benchmark_GenericParseTypeString(b *testing.B) {
 	}
 }
 
-// go test -v -run=^$ -bench=Benchmark_GenericParseTypeBoolean -benchmem -count=4
 func Benchmark_GenericParseTypeBoolean(b *testing.B) {
 	b.Skip("Skipped: too fast to compare reliably (results in sub-ns range are unstable)")
-	bools := []struct {
-		str   string
-		value bool
-	}{
-		{
-			str:   "True",
-			value: true,
-		},
-		{
-			str:   "False",
-			value: false,
-		},
-		{
-			str:   "true",
-			value: true,
-		},
-		{
-			str:   "false",
-			value: false,
-		},
-	}
-
-	for _, test := range bools {
+	for _, test := range miscParseBools {
 		b.Run("benchmark_genericParseTypeBoolean", func(b *testing.B) {
 			var v bool
 			var err error
@@ -1529,62 +1324,267 @@ func Benchmark_GenericParseTypeBoolean(b *testing.B) {
 	}
 }
 
-func Test_UnescapeHeaderValue(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		in  string
-		out []byte
-		ok  bool
-	}{
-		{in: "abc", out: []byte("abc"), ok: true},
-		{in: "a\\\"b", out: []byte("a\"b"), ok: true},
-		{in: "c\\\\d", out: []byte("c\\d"), ok: true},
-		{in: "bad\\", ok: false},
+type genericParseInput struct {
+	wantErr error
+	name    string
+	input   string
+}
+
+// genericParseInputs supplies empty, valid and, for numeric/bool types, invalid inputs.
+// invalid allocates the parser error and swings ~2x between CI runs, hence the threshold markers.
+func genericParseInputs(valid string, emptyErr error) []genericParseInput {
+	inputs := []genericParseInput{
+		{name: "empty", input: "", wantErr: emptyErr},
+		{name: "valid", input: valid},
 	}
-	for _, tc := range cases {
-		out, err := unescapeHeaderValue([]byte(tc.in))
-		if tc.ok {
-			require.NoError(t, err, tc.in)
-			require.Equal(t, tc.out, out, tc.in)
-		} else {
-			require.Error(t, err, tc.in)
-		}
+	if errors.Is(emptyErr, errParseValue) {
+		inputs = append(inputs, genericParseInput{name: "invalid", input: "invalid", wantErr: errParseValue})
+	}
+	return inputs
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputInt(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v int
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[int](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
 	}
 }
 
-func Test_JoinHeaderValues(t *testing.T) {
-	t.Parallel()
-	require.Nil(t, joinHeaderValues(nil))
-	require.Equal(t, []byte("a"), joinHeaderValues([][]byte{[]byte("a")}))
-	require.Equal(t, []byte("a,b"), joinHeaderValues([][]byte{[]byte("a"), []byte("b")}))
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputInt8(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v int8
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[int8](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputInt16(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v int16
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[int16](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputInt32(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v int32
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[int32](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputInt64(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v int64
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[int64](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputUint(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v uint
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[uint](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputUint8(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v uint8
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[uint8](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputUint16(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v uint16
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[uint16](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputUint32(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v uint32
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[uint32](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputUint64(b *testing.B) {
+	for _, tc := range genericParseInputs("42", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v uint64
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[uint64](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputFloat32(b *testing.B) {
+	for _, tc := range genericParseInputs("3.25", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v float32
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[float32](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputFloat64(b *testing.B) {
+	for _, tc := range genericParseInputs("3.25", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v float64
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[float64](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+// benchmark:threshold 300% ^invalid$
+func Benchmark_GenericParseTypeInputBool(b *testing.B) {
+	for _, tc := range genericParseInputs("true", errParseValue) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v bool
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[bool](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+func Benchmark_GenericParseTypeInputString(b *testing.B) {
+	for _, tc := range genericParseInputs("john", errParsedEmptyString) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v string
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[string](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
+}
+
+func Benchmark_GenericParseTypeInputBytes(b *testing.B) {
+	for _, tc := range genericParseInputs("john", errParsedEmptyBytes) {
+		b.Run(tc.name, func(b *testing.B) {
+			var v []byte
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				v, err = genericParseType[[]byte](tc.input)
+			}
+			require.Equal(b, tc.wantErr, err)
+			runtime.KeepAlive(v)
+		})
+	}
 }
 
 func Test_ParamsMatch_InvalidEscape(t *testing.T) {
 	t.Parallel()
 	match := paramsMatch(headerParams{"foo": []byte("bar")}, `;foo="bar\\`)
 	require.False(t, match)
-}
-
-func Test_MatchEtag(t *testing.T) {
-	t.Parallel()
-
-	require.True(t, matchEtag(`"a"`, `"a"`))
-	require.True(t, matchEtag(`W/"a"`, `"a"`))
-	require.True(t, matchEtag(`"a"`, `W/"a"`))
-	require.False(t, matchEtag(`"a"`, `"b"`))
-	require.False(t, matchEtag(`a`, `"a"`))
-	require.False(t, matchEtag(`"a"`, `b`))
-}
-
-func Test_MatchEtagStrong(t *testing.T) {
-	t.Parallel()
-
-	require.True(t, matchEtagStrong(`"a"`, `"a"`))
-	require.False(t, matchEtagStrong(`W/"a"`, `"a"`))
-	require.False(t, matchEtagStrong(`"a"`, `W/"a"`))
-	require.False(t, matchEtagStrong(`"a"`, `"b"`))
-	require.False(t, matchEtagStrong(`a`, `"a"`))
-	require.False(t, matchEtagStrong(`"a"`, `b`))
 }
 
 func Test_IsEtagStale(t *testing.T) {
@@ -1621,31 +1621,445 @@ func Test_IsEtagStale(t *testing.T) {
 
 	// Weak vs. weak
 	require.False(t, app.isEtagStale(`W/"a"`, []byte(`W/"a"`)))
+
+	// etagc permits "," inside the opaque-tag (RFC 9110 §8.8.3): a quoted
+	// comma is part of the tag, not a list separator.
+	require.False(t, app.isEtagStale(`"v1,v2"`, []byte(`"v1,v2"`)))
+	require.False(t, app.isEtagStale(`"v1,v2"`, []byte(`"a", "v1,v2", "b"`)))
+	require.False(t, app.isEtagStale(`W/"v1,v2"`, []byte(`"v1,v2"`)))
+	require.True(t, app.isEtagStale(`"v1"`, []byte(`"v1,v2"`)))
+	require.True(t, app.isEtagStale(`"v2"`, []byte(`"v1,v2"`)))
 }
 
-func Test_App_quoteRawString(t *testing.T) {
+func TestStoreInContext(t *testing.T) {
 	t.Parallel()
+	app := New(Config{PassLocalsToContext: true})
+	raw := &fasthttp.RequestCtx{}
+	c := apptest.CtxFor(t, app, raw)
 
+	StoreInContext(c, "key", "value")
+
+	localValue, ok := c.Locals("key").(string)
+	require.True(t, ok)
+	require.Equal(t, "value", localValue)
+
+	contextValue, ok := c.Context().Value("key").(string)
+	require.True(t, ok)
+	require.Equal(t, "value", contextValue)
+}
+
+func TestValueFromContext(t *testing.T) {
+	t.Parallel()
+	// The lookups behave the same for the default and for a custom context.
+	for _, tc := range []struct {
+		newApp func() *App
+		name   string
+	}{
+		{name: "fiber.Ctx", newApp: func() *App { return New() }},
+		{name: "fiber.CustomCtx", newApp: func() *App {
+			return NewWithCustomCtx(func(app *App) CustomCtx { return &customCtx{DefaultCtx: *NewDefaultCtx(app)} })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := tc.newApp()
+			raw := &fasthttp.RequestCtx{}
+			c := apptest.CtxFor(t, app, raw)
+
+			c.Locals("key", "value")
+
+			value, ok := ValueFromContext[string](c, "key")
+			require.True(t, ok)
+			require.Equal(t, "value", value)
+		})
+
+		t.Run("released "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := tc.newApp()
+			raw := &fasthttp.RequestCtx{}
+			c := app.AcquireCtx(raw)
+
+			c.Locals("key", "value")
+
+			valueBeforeRelease, okBeforeRelease := ValueFromContext[string](c, "key")
+			require.True(t, okBeforeRelease)
+			require.Equal(t, "value", valueBeforeRelease)
+
+			app.ReleaseCtx(c)
+
+			require.NotPanics(t, func() {
+				valueAfterRelease, okAfterRelease := ValueFromContext[string](c, "key")
+				require.False(t, okAfterRelease)
+				require.Empty(t, valueAfterRelease)
+			})
+		})
+	}
+
+	t.Run("fasthttp request ctx", func(t *testing.T) {
+		t.Parallel()
+		raw := &fasthttp.RequestCtx{}
+		raw.SetUserValue("key", "value")
+
+		value, ok := ValueFromContext[string](raw, "key")
+		require.True(t, ok)
+		require.Equal(t, "value", value)
+	})
+
+	t.Run("context.Context", func(t *testing.T) {
+		t.Parallel()
+		type testContextKey struct{}
+
+		ctx := context.WithValue(context.Background(), testContextKey{}, "value")
+
+		value, ok := ValueFromContext[string](ctx, testContextKey{})
+		require.True(t, ok)
+		require.Equal(t, "value", value)
+	})
+
+	t.Run("unsupported ctx", func(t *testing.T) {
+		t.Parallel()
+		value, ok := ValueFromContext[string](42, "key")
+		require.False(t, ok)
+		require.Empty(t, value)
+	})
+}
+
+func Test_IsMethodSafe_Idempotent(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		is       func(string) bool
+		name     string
+		yes, not []string
+	}{
+		{
+			name: "IsMethodSafe", is: IsMethodSafe,
+			yes: []string{MethodGet, MethodHead, MethodOptions, MethodTrace, MethodQuery},
+			not: []string{MethodPost, MethodPut, MethodPatch, MethodDelete, MethodConnect},
+		},
+		{
+			name: "IsMethodIdempotent", is: IsMethodIdempotent,
+			yes: []string{MethodGet, MethodHead, MethodOptions, MethodTrace, MethodQuery, MethodPut, MethodDelete},
+			not: []string{MethodPost, MethodPatch, MethodConnect},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, m := range tc.yes {
+				require.True(t, tc.is(m), "%s should be accepted", m)
+			}
+			for _, m := range tc.not {
+				require.False(t, tc.is(m), "%s should not be accepted", m)
+			}
+		})
+	}
+}
+
+// localsRecordingCtx is a custom context whose Locals is observable, so the
+// interface fallback in setLocal can be told apart from the concrete fast path.
+type localsRecordingCtx struct {
+	DefaultCtx
+	calls int
+}
+
+// Locals counts each call before forwarding it, so a test can tell whether
+// the override ran or the concrete fast path bypassed it.
+func (c *localsRecordingCtx) Locals(key any, value ...any) any {
+	c.calls++
+	return c.DefaultCtx.Locals(key, value...)
+}
+
+// Test_setLocal_UsesCustomCtxLocals pins the fallback in setLocal. The concrete
+// *DefaultCtx path exists only to keep the variadic slice off the heap; it must
+// never take precedence over a custom context's own Locals, which a type
+// embedding DefaultCtx is entitled to override.
+func Test_setLocal_UsesCustomCtxLocals(t *testing.T) {
+	t.Parallel()
+	c := apptest.Ctx(t, NewWithCustomCtx(func(app *App) CustomCtx {
+		return &localsRecordingCtx{DefaultCtx: *NewDefaultCtx(app)}
+	}))
+
+	custom, ok := c.(*localsRecordingCtx)
+	require.True(t, ok, "the app must hand out the custom context")
+
+	require.Equal(t, "v", setLocal(c, "k", "v"), "setLocal returns what Locals returned")
+	require.Equal(t, 1, custom.calls, "the overridden Locals must be the one that ran")
+	require.Equal(t, "v", c.Locals("k"), "and the value must actually be stored")
+}
+
+// Test_setLocal_UsesDefaultCtxDirectly is the other half: the default context
+// takes the concrete path, and the value is stored and returned unchanged.
+func Test_setLocal_UsesDefaultCtxDirectly(t *testing.T) {
+	t.Parallel()
+	c := apptest.Ctx(t, New())
+
+	_, isDefault := c.(*DefaultCtx)
+	require.True(t, isDefault, "the default app must hand out *DefaultCtx")
+
+	require.Equal(t, 42, setLocal(c, "n", 42))
+	require.Equal(t, 42, c.Locals("n"))
+}
+
+// Test_appendCopyLowerASCII pins appendCopyLowerASCII against the copy, the
+// fold and the slash count it fuses, at every length across the SWAR word
+// boundaries, on fresh and on reused destinations.
+func Test_appendCopyLowerASCII(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"", "/", "A", "/abc", "/AbC", "/ABCDEFG", "/ABCDEFGH/XYZ",
+		"/API/V1/UsersAndGroups", "/a1-B2_c3{~}", "/CAF\xC3\xA9/\xC3\x89",
+		"/repos/GoFiber/Fiber/issues/4662/comments", "////////", "/////////",
+	}
+	// Every length across the word boundaries, so the main loop, the
+	// overlapping tail word and the byte-wise path are all covered, with the
+	// slashes at every offset of the tail word.
+	for n := range 40 {
+		cases = append(cases, strings.Repeat("aB/", n), "/"+strings.Repeat("aB/", n), "/x"+strings.Repeat("aB/", n))
+	}
+
+	for _, in := range cases {
+		t.Run(strconv.Itoa(len(in)), func(t *testing.T) {
+			t.Parallel()
+			// It must agree with the two operations it replaces.
+			wantPath := append([]byte(nil), in...)
+			wantLower := appendLowerASCII(nil, wantPath)
+
+			// Fresh destinations (forces growth) and reused oversized ones
+			// (exercises the cap(dst) >= n path).
+			wantSlashes := strings.Count(in, "/")
+			gotPath, gotLower, gotSlashes := appendCopyLowerASCII(nil, nil, in)
+			require.Equal(t, string(wantPath), string(gotPath))
+			require.Equal(t, string(wantLower), string(gotLower))
+			require.Equal(t, wantSlashes, gotSlashes)
+
+			reusedPath := make([]byte, 0, 128)
+			reusedLower := make([]byte, 0, 128)
+			gotPath, gotLower, gotSlashes = appendCopyLowerASCII(reusedPath, reusedLower, in)
+			require.Equal(t, string(wantPath), string(gotPath))
+			require.Equal(t, string(wantLower), string(gotLower))
+			require.Equal(t, wantSlashes, gotSlashes)
+			if in != "" {
+				require.Equal(t, 128, cap(gotPath), "reused buffer must not be reallocated")
+				require.Equal(t, 128, cap(gotLower), "reused buffer must not be reallocated")
+			}
+		})
+	}
+}
+
+func Test_appendCopyLowerASCII_AliasedSubstring(t *testing.T) {
+	t.Parallel()
+	path := []byte("/api/bar/fooX")
+	src := utils.UnsafeString(path[4:])
+	gotPath, gotLower, gotSlashes := appendCopyLowerASCII(path[:0], nil, src)
+
+	require.Equal(t, "/bar/fooX", string(gotPath))
+	require.Equal(t, "/bar/foox", string(gotLower))
+	require.Equal(t, 2, gotSlashes)
+}
+
+func Test_appendLowerASCII(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   string
 		out  string
 	}{
 		{"empty", "", ""},
-		{"simple", "simple", "simple"},
-		{"backslash", "A\\B", "A\\\\B"},
-		{"quote", `He said "Yo"`, `He said \"Yo\"`},
-		{"newline", "Hello\n", "Hello\\n"},
-		{"carriage", "Hello\r", "Hello\\r"},
-		{"controls", string([]byte{0, 31, 127}), "%00%1F%7F"},
-		{"mixed", "test \"A\n\r" + string([]byte{1}) + "\\", `test \"A\n\r%01\\`},
+		{"short lower", "/abc", "/abc"},
+		{"short mixed", "/AbC", "/abc"},
+		{"exactly one word", "/ABCDEFG", "/abcdefg"},
+		{"multi word", "/API/V1/UsersAndGroups", "/api/v1/usersandgroups"},
+		{"word plus tail", "/ABCDEFGH/XYZ", "/abcdefgh/xyz"},
+		{"non-letters unchanged", "/a1-B2_c3{~}", "/a1-b2_c3{~}"},
+		{"non-ascii passthrough", "/CAFé\xC3\xA9/É", "/caf\xC3\xA9\xC3\xA9/\xC3\x89"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			app := New()
-			require.Equal(t, tc.out, app.quoteRawString(tc.in))
+			// Fresh destination (forces growth) and reused oversized
+			// destination (exercises the cap(dst) >= n path).
+			require.Equal(t, tc.out, string(appendLowerASCII(nil, []byte(tc.in))))
+			reused := make([]byte, 0, 128)
+			got := appendLowerASCII(reused, []byte(tc.in))
+			require.Equal(t, tc.out, string(got))
+			if tc.in != "" {
+				require.Equal(t, 128, cap(got), "reused buffer must not be reallocated")
+			}
+		})
+	}
+}
+
+// Test_bindMediaType pins the media type Bind dispatches on: the canonical
+// spellings answer directly, every other spelling is folded, vendor suffixes
+// resolve, and parameters are dropped, with and without the fast path.
+func Test_bindMediaType(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		ct, want string
+	}{
+		{ct: "application/json", want: MIMEApplicationJSON},
+		{ct: "application/json; charset=utf-8", want: MIMEApplicationJSON},
+		{ct: "application/json;charset=utf-8", want: MIMEApplicationJSON},
+		{ct: "application/json ", want: MIMEApplicationJSON},
+		{ct: "Application/JSON", want: MIMEApplicationJSON},
+		{ct: "APPLICATION/JSON; CHARSET=UTF-8", want: MIMEApplicationJSON},
+		{ct: "application/vnd.api+json", want: MIMEApplicationJSON},
+		{ct: "application/jsonx", want: "application/jsonx"},
+		{ct: "application/x-www-form-urlencoded", want: MIMEApplicationForm},
+		{ct: "application/x-www-form-urlencoded; charset=UTF-8", want: MIMEApplicationForm},
+		{ct: "Application/X-WWW-Form-Urlencoded", want: MIMEApplicationForm},
+		{ct: "multipart/form-data; boundary=X", want: MIMEMultipartForm},
+		{ct: "text/xml", want: MIMETextXML},
+		{ct: "", want: ""},
+	} {
+		h := &fasthttp.RequestHeader{}
+		h.SetContentType(tc.ct)
+		require.Equal(t, tc.want, bindMediaType(h), "content type %q", tc.ct)
+	}
+
+	// A parameterized form type still takes the folding walk, which lowercases
+	// the parameter names in place for fasthttp's own parser.
+	h := &fasthttp.RequestHeader{}
+	h.SetContentType("application/x-www-form-urlencoded; Charset=UTF-8")
+	require.Equal(t, MIMEApplicationForm, bindMediaType(h))
+	require.Equal(t, "application/x-www-form-urlencoded; charset=UTF-8", string(h.ContentType()))
+}
+
+func Benchmark_bindMediaType(b *testing.B) {
+	for _, ct := range []string{
+		"application/json", "application/json; charset=utf-8", "Application/JSON", "application/x-www-form-urlencoded",
+	} {
+		b.Run(ct, func(b *testing.B) {
+			h := &fasthttp.RequestHeader{}
+			h.SetContentType(ct)
+			b.ReportAllocs()
+			var got string
+			for b.Loop() {
+				got = bindMediaType(h)
+			}
+			require.NotEmpty(b, got)
+		})
+	}
+}
+
+func Test_sameFunc(t *testing.T) {
+	t.Parallel()
+	newCallback := func(limit int) func(*fasthttp.RequestHeader) fasthttp.RequestConfig {
+		return func(*fasthttp.RequestHeader) fasthttp.RequestConfig {
+			return fasthttp.RequestConfig{MaxRequestBodySize: limit}
+		}
+	}
+	a, b := newCallback(1), newCallback(1)
+
+	require.True(t, sameFunc(a, a))
+	require.False(t, sameFunc(a, b), "closures of one literal are different values")
+	require.False(t, sameFunc(a, nil))
+	require.False(t, sameFunc(nil, a))
+	require.False(t, sameFunc(nil, nil))
+}
+
+func Test_hasHeaderField(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		raw   string
+		field string // HeaderContentLength when empty
+		want  bool
+	}{
+		{name: "empty", raw: "", want: false},
+		{name: "no fields", raw: "\r\n", want: false},
+		{name: "only field", raw: "Content-Length: 4\r\n\r\n", want: true},
+		{name: "among others", raw: "Host: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n", want: true},
+		{name: "last field", raw: "Host: x\r\nContent-Length: 4", want: true},
+		{name: "lower case", raw: "Host: x\r\ncontent-length: 4\r\n\r\n", want: true},
+		{name: "upper case", raw: "Host: x\r\nCONTENT-LENGTH: 4\r\n\r\n", want: true},
+		{name: "bare LF line ends", raw: "Host: x\nContent-Length: 4\n\n", want: true},
+		{name: "no space after the colon", raw: "Host: x\r\nContent-Length:4\r\n\r\n", want: true},
+		{name: "empty value", raw: "Host: x\r\nContent-Length:\r\n\r\n", want: true},
+		{name: "longer name", raw: "Host: x\r\nContent-Length-Extra: 4\r\n\r\n", want: false},
+		{name: "longer name ending in it", raw: "Host: x\r\nX-Content-Length: 4\r\n\r\n", want: false},
+		{name: "shorter name", raw: "Host: x\r\nContent-Len: 4\r\n\r\n", want: false},
+		{name: "name inside a value", raw: "Host: x\r\nX-Note: Content-Length: 4\r\n\r\n", want: false},
+		{name: "folded continuation line", raw: "Host: x\r\nX-Note: a\r\n Content-Length: 4\r\n\r\n", want: false},
+		{name: "name without a colon", raw: "Host: x\r\nContent-Length\r\n\r\n", want: false},
+		{name: "name only", raw: "Content-Length", want: false},
+		{name: "Transfer-Encoding", raw: "Host: x\r\nTransfer-Encoding: identity\r\n\r\n", field: HeaderTransferEncoding, want: true},
+		{name: "Transfer-Encoding lower case", raw: "Host: x\r\ntransfer-encoding: identity\r\n\r\n", field: HeaderTransferEncoding, want: true},
+		{name: "Transfer-Encoding absent", raw: "Host: x\r\nContent-Length: 4\r\n\r\n", field: HeaderTransferEncoding, want: false},
+		{name: "Transfer-Encoding longer name", raw: "Host: x\r\nX-Transfer-Encoding: chunked\r\n\r\n", field: HeaderTransferEncoding, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			field := tc.field
+			if field == "" {
+				field = HeaderContentLength
+			}
+			require.Equal(t, tc.want, hasHeaderField([]byte(tc.raw), field))
+		})
+	}
+}
+
+// fasthttp reports -1 for a chunked request, the Content-Length value for one it
+// frames by Content-Length ("identity" included) and -2 for neither; the field
+// that is not reflected in that is looked up in the header block.
+func Test_bothFramingFields(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "neither", raw: "GET / HTTP/1.1\r\nHost: x\r\n\r\n", want: false},
+		{name: "Content-Length only", raw: "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nabcd", want: false},
+		{name: "chunked only", raw: "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", want: false},
+		{name: "identity only", raw: "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n", want: false},
+		{name: "chunked after Content-Length", raw: "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", want: true},
+		{name: "chunked before Content-Length", raw: "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n", want: true},
+		{name: "identity after Content-Length", raw: "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: identity\r\n\r\nabcd", want: true},
+		{name: "identity before Content-Length", raw: "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\nContent-Length: 4\r\n\r\nabcd", want: true},
+		{name: "identity with an empty body", raw: "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTransfer-Encoding: identity\r\n\r\n", want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var h fasthttp.RequestHeader
+			require.NoError(t, h.Read(bufio.NewReader(strings.NewReader(tc.raw))))
+			require.Equal(t, tc.want, bothFramingFields(&h))
+		})
+	}
+}
+
+func Benchmark_hasHeaderField(b *testing.B) {
+	raw := []byte("Host: example.com\r\nUser-Agent: Go-http-client/1.1\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n")
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if !hasHeaderField(raw, HeaderContentLength) {
+			b.Fatal("Content-Length field not found")
+		}
+	}
+}
+
+func Benchmark_bothFramingFields(b *testing.B) {
+	const fields = "Host: example.com\r\nUser-Agent: Go-http-client/1.1\r\nAccept: */*\r\nAccept-Encoding: gzip\r\n"
+	for _, tc := range []struct{ name, raw string }{
+		{"no body length", "GET / HTTP/1.1\r\n" + fields + "\r\n"},
+		{"Content-Length", "POST / HTTP/1.1\r\n" + fields + "Content-Length: 4\r\n\r\nabcd"},
+		{"chunked", "POST / HTTP/1.1\r\n" + fields + "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			var h fasthttp.RequestHeader
+			require.NoError(b, h.Read(bufio.NewReader(strings.NewReader(tc.raw))))
+
+			b.ReportAllocs()
+			for b.Loop() {
+				if bothFramingFields(&h) {
+					b.Fatal("a single framing field was taken for both")
+				}
+			}
 		})
 	}
 }

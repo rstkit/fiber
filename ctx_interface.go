@@ -36,15 +36,18 @@ type CustomCtx interface {
 	getMethodInt() int
 	getIndexRoute() int
 	getTreePathHash() int
+	pathSlashCount(app *App) int
 	getDetectionPath() string
 	getPathOriginal() string
 	getValues() *[maxParams]string
 	getMatched() bool
 	getSkipNonUseRoutes() bool
+	getFirstMatchIndex() int
 	setIndexHandler(handler int)
 	setIndexRoute(route int)
 	setMatched(matched bool)
 	setSkipNonUseRoutes(skip bool)
+	setFirstMatchIndex(index int)
 	setRoute(route *Route)
 }
 
@@ -70,15 +73,50 @@ func (app *App) AcquireCtx(fctx *fasthttp.RequestCtx) CustomCtx {
 		panic(errCustomCtxTypeAssertion)
 	}
 
-	if app.hasCustomCtx {
-		if setter, ok := ctx.(interface{ setHandlerCtx(CustomCtx) }); ok {
-			setter.setHandlerCtx(ctx)
-		}
-	}
+	app.setHandlerCtxIfNeeded(ctx)
 
 	ctx.Reset(fctx)
 
 	return ctx
+}
+
+func (app *App) setHandlerCtxIfNeeded(ctx CustomCtx) {
+	if app.hasCustomCtx || isCustomCtx(ctx) {
+		ctx.setHandlerCtx(ctx)
+	}
+}
+
+func isCustomCtx(ctx CustomCtx) bool {
+	if ctx == nil {
+		return false
+	}
+	_, ok := ctx.(*DefaultCtx)
+	return !ok
+}
+
+func (app *App) acquireDefaultCtx(fctx *fasthttp.RequestCtx) (*DefaultCtx, bool) {
+	rawCtx := app.pool.Get()
+	ctx, ok := app.prepareDefaultCtx(rawCtx, fctx)
+	if !ok {
+		app.pool.Put(rawCtx)
+		return nil, false
+	}
+
+	return ctx, true
+}
+
+func (*App) prepareDefaultCtx(rawCtx any, fctx *fasthttp.RequestCtx) (*DefaultCtx, bool) {
+	ctx, ok := rawCtx.(*DefaultCtx)
+	if !ok {
+		if _, ok := rawCtx.(CustomCtx); ok {
+			return nil, false
+		}
+		panic(errDefaultCtxTypeAssertion)
+	}
+
+	ctx.Reset(fctx)
+
+	return ctx, true
 }
 
 // ReleaseCtx releases the ctx back into the pool.
@@ -88,6 +126,23 @@ func (app *App) AcquireCtx(fctx *fasthttp.RequestCtx) CustomCtx {
 // middleware intentionally leaves abandoned contexts unreleased to avoid races.
 func (app *App) ReleaseCtx(c CustomCtx) {
 	if c.IsAbandoned() {
+		// If reclamation was armed (see ScheduleReclaim), signal that the request
+		// handler is done so the reclaimer can return the ctx to the pool. The ctx
+		// is still not pooled here; the reclaimer does that once the handler also
+		// finishes. Otherwise (e.g. SSE) leave it unreleased as before.
+		if dc, ok := c.(*DefaultCtx); ok {
+			dc.signalReleased()
+		}
+		return
+	}
+	c.release()
+	app.pool.Put(c)
+}
+
+func (app *App) releaseDefaultCtx(c *DefaultCtx) {
+	if c.IsAbandoned() {
+		// See ReleaseCtx: signal armed reclamation, but never pool here.
+		c.signalReleased()
 		return
 	}
 	c.release()

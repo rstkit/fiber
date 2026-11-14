@@ -54,7 +54,7 @@ Fiber’s request processing is designed for performance and minimal overhead. W
 ```mermaid
 flowchart LR
     R["HTTP Request (fasthttp)"]
-    A["App.RequestHandler<br/>(default or custom)"]
+    A["App.Handler()<br/>(default or custom request handler)"]
     C["Acquire Context<br/>(from Pool)"]
     X["Reset Context<br/>(DefaultCtx.Reset())"]
     N["Route Matching<br/>(next() \/ nextCustom())"]
@@ -113,17 +113,19 @@ flowchart TD
 
 When a request is processed, Fiber uses its pre‑computed route tree (the treeStack) to efficiently match the incoming URL against registered routes.
 
-1. Normalization: The URL is normalized (converted to lowercase, trailing slashes trimmed) to create a “detection path.”
+1. Normalization: The request path is normalized as [RFC 3986 Section 6.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-6.2.2) describes (percent-encoded unreserved characters are decoded and dot segments are removed). The “detection path” that routes are matched against is that path in lowercase unless `CaseSensitive` is set, with trailing slashes trimmed unless `StrictRouting` is set.
 2. Tree Traversal: The route tree, grouped by common prefixes, is traversed based on the HTTP method.
-3. Matching: Constant segments are compared exactly, while parameter segments extract dynamic values.
-4. Constraint Validation: Extracted parameter values are validated against any defined constraints.
+3. Candidate Filtering: Before a route's segments are walked, cheap precomputed checks discard most candidates: the leading bytes of the path are compared against the route's first constant, the number of `/` bytes in the path is checked against the bounds the pattern allows, and for parametric routes the first constant segment that follows a parameter is compared at the `/` it has to start at.
+4. Matching: Constant segments are compared exactly, while parameter segments extract dynamic values.
+5. Constraint Validation: Extracted parameter values are validated against any defined constraints.
 
 ```mermaid
 flowchart TD
     A["Incoming Request URL<br/>(e.g., '/api/john')"]
-    B["Normalize URL<br/>(lowercase, trim trailing slashes)"]
+    B["Normalize Path<br/>(RFC 3986, case fold, trim trailing slashes)"]
     C["Detection Path"]
     D["Traverse Route Tree<br/>(treeStack based on method)"]
+    D2["Filter Candidates<br/>(leading bytes, slash count, probe constant)"]
     E["Match Constant Segments"]
     F["Identify Parameter Segments<br/>(e.g., ':userId')"]
     G["Extract Parameter Values"]
@@ -133,7 +135,8 @@ flowchart TD
     A --> B
     B --> C
     C --> D
-    D --> E
+    D --> D2
+    D2 --> E
     E --> F
     F --> G
     G --> H
@@ -211,7 +214,7 @@ Fiber builds a route tree (the treeStack) to optimize route matching. This invol
 1. Iterating Over the Router Stack: Each registered route is examined.
 2. Computing the Tree Key: A key is computed from the route’s normalized path (e.g. the first 3 characters).
 3. Grouping Routes: Routes are added to the appropriate branch of the tree.
-4. Sorting: Within each group, routes are sorted based on their registration order (or position) to ensure the correct match is found.
+4. Ordering: Within each group, routes keep their registration order (routes without a prefix key are added to every group at their original position), so the first registered route that matches wins.
 
 ```mermaid
 flowchart TD
@@ -219,7 +222,7 @@ flowchart TD
     B["Compute Tree Key<br/>(e.g. first 3 characters)"]
     C["Group Routes by Key<br/>(treeStack)"]
     D["Merge Global Routes<br/>(key \'\' for global matches)"]
-    E[Sort Routes within Groups]
+    E[Keep Registration Order within Groups]
     F[Optimized Route Tree]
 
     A --> B
@@ -265,7 +268,7 @@ Reusing Context objects significantly reduces garbage collection overhead, ensur
 
 ## Preforking Mechanism
 
-To take full advantage of multi‑core systems, Fiber offers a prefork mode. In this mode, the master process spawns several child processes that listen on the same port using OS features such as SO_REUSEPORT (or fall back to SO_REUSEADDR).
+To take full advantage of multi‑core systems, Fiber offers a prefork mode. In this mode, the master process spawns several child processes that listen on the same port. On Linux, this is typically done with `SO_REUSEPORT`; on Windows, Fiber falls back to a `SO_REUSEADDR`-based behavior that does not provide identical kernel-level load-distribution semantics.
 
 ```mermaid
 flowchart LR
@@ -293,7 +296,9 @@ Fiber’s prefork mode uses OS‑level mechanisms to allow multiple processes to
 
 1. Master Process Spawning: The master process detects the number of CPU cores and spawns that many child processes.
 2. Child Process Initialization: Each child process sets GOMAXPROCS(1) so that it runs on a single core.
-3. Binding to Port: Child processes use packages like reuseport to bind to the same address and port.
+3. Binding to Port:
+   - Linux: child processes use `SO_REUSEPORT` (for example through reuseport helpers) so multiple workers can bind the same address/port with kernel-level distribution.
+   - Windows: Fiber uses a `SO_REUSEADDR` fallback path; behavior is platform-dependent and should not be treated as equivalent to Linux `SO_REUSEPORT`.
 4. Parent Monitoring: Each child runs a watchdog function (watchMaster()) to monitor the master process; if the master terminates, children exit.
 5. Request Handling: Each child independently handles incoming HTTP requests.
 
@@ -318,8 +323,17 @@ flowchart TD
 #### Explanation
 
 - Preforking improves performance by allowing multiple processes to handle requests concurrently.
-- Using reuseport (or a fallback) ensures that all child processes can listen on the same port without conflicts.
+- Linux `SO_REUSEPORT` and Windows fallback behavior are functionally different; do not assume identical security or scheduling characteristics across operating systems.
 - The watchdog routine in each child ensures that they exit if the master process is no longer running, maintaining process integrity.
+
+### Security Considerations
+
+Prefork intentionally relaxes strict single-owner assumptions on a listening socket. In multi-tenant or shared-host environments, a local co-resident attacker with sufficient local privileges may attempt to bind to the same address/port and compete for or observe traffic, depending on OS behavior, account boundaries, and deployment configuration.
+
+- **Privilege and user-boundary assumptions:** Prefork is safest when all participating workers run under the same dedicated service identity and within an isolated trust boundary.
+- **Linux vs Windows behavior:** Linux `SO_REUSEPORT` provides explicit multi-listener semantics; Windows fallback behavior differs and should be evaluated carefully before enabling prefork in sensitive environments.
+- **Strict ownership requirement:** If you require strict single-owner port semantics, run Fiber **without** prefork.
+- **Hardening guidance:** Prefer a dedicated service user, strong container/VM isolation, and avoid shared host namespaces between unrelated workloads.
 
 ## Redirection & Flash Messages
 
@@ -352,9 +366,9 @@ flowchart LR
 When performing redirections, Fiber can send flash messages or preserve old input data. This process involves:
 
 1. Collecting Flash Data: When a redirect is initiated, developers can add flash messages via Redirect.With() or old input data via Redirect.WithInput().
-2. Serialization: The flash messages and input data are serialized (using a fast marshalling method) into a byte sequence.
-3. Setting a Cookie: The serialized data is stored in a special cookie (named fiber_flash) that will be sent to the client.
-4. Retrieval & Clearing: On the subsequent request, the flash data is read from the cookie, deserialized, and then cleared.
+2. Serialization: The flash messages and input data are serialized (using a fast marshaling method) into a byte sequence.
+3. Setting a Cookie: The serialized data is stored in a special cookie (named fiber_flash) that will be sent to the client. The cookie is set `HttpOnly`, so the payload stays out of `document.cookie`. It is `Secure` only when the request that produced it arrived over TLS: a redirect that starts on plain HTTP sets a cookie without that attribute, which the browser will send over HTTP as well. It is hex-encoded rather than encrypted or signed, so treat everything in it as visible to the client.
+4. Retrieval & Clearing: On the subsequent request, the flash data is read from the cookie, deserialized, and then cleared. The cookie is expired on every read, including when the stored value fails to decode, so a malformed payload is not re-parsed on later requests.
 
 ```mermaid
 flowchart TD
@@ -389,8 +403,12 @@ Fiber provides a comprehensive hook system that allows you to run custom functio
 - OnRoute: Called when a route is registered.
 - OnName: Invoked when a route is assigned a name.
 - OnGroup: Triggered when a group is created.
+- OnGroupName: Invoked when a group is assigned a name.
 - OnListen: Runs when the server starts listening.
-- OnShutdown: Called during graceful shutdown.
+- OnPreStartupMessage: Runs before the startup message is printed and can customize it.
+- OnPostStartupMessage: Runs after the startup message is printed or skipped.
+- OnPreShutdown: Runs before the application shuts down.
+- OnPostShutdown: Runs after shutdown and receives the shutdown result.
 - OnFork: Invoked when a child process is forked.
 - OnMount: Used when a sub‑application is mounted.
 
@@ -400,16 +418,24 @@ flowchart TD
     OR[OnRoute]
     ON[OnName]
     OG[OnGroup]
+    OGN[OnGroupName]
     OL[OnListen]
-    OS[OnShutdown]
+    PreStartup[OnPreStartupMessage]
+    PostStartup[OnPostStartupMessage]
+    OPRS[OnPreShutdown]
+    OPOS[OnPostShutdown]
     OF[OnFork]
     OM[OnMount]
 
     H --> OR
     H --> ON
     H --> OG
+    H --> OGN
     H --> OL
-    H --> OS
+    H --> PreStartup
+    H --> PostStartup
+    H --> OPRS
+    H --> OPOS
     H --> OF
     H --> OM
 ```
@@ -425,7 +451,7 @@ Fiber’s DefaultCtx (or CustomCtx) represents the per‑request context. The li
 
 - Acquire: A Context is obtained from the pool at the beginning of a request.
 - Processing: The context is passed along to the route handlers and middleware.
-- Error Handling: If an error occurs (e.g., route not found, method not allowed, or a panic in the handler), Fiber calls the registered error handler. Errors such as ErrMethodNotAllowed or StatusNotFound are generated as needed.
+- Error Handling: If an error occurs (e.g., route not found, method not allowed, or a panic that the [Recover](../middleware/recover.md) middleware turned into an error), Fiber calls the registered error handler. Errors such as ErrMethodNotAllowed or ErrNotFound are generated as needed.
 - Release: Once the request is processed, the Context is released back into the pool for reuse.
 
 ```mermaid
@@ -444,3 +470,32 @@ flowchart LR
 
 - This lifecycle ensures that Fiber minimizes allocations by reusing Context objects.
 - Errors are propagated and handled consistently, and the context is properly reset after every request.
+
+## Control Characters
+
+Control-character handling depends on the value being processed. These policies
+are intentionally different; a byte accepted in one context can be rejected or
+encoded in another. C0 means U+0000 through U+001F, DEL is U+007F, and C1 means
+U+0080 through U+009F.
+
+| Value | Control-character policy | Tabs and non-ASCII text |
+| --- | --- | --- |
+| BasicAuth Authorization header | Reject bytes outside visible ASCII and HTAB before parsing credentials. | HTAB is allowed by this scan; the credential parser still enforces its whitespace rules. Non-ASCII header bytes are rejected. |
+| BasicAuth decoded username and password | Reject Unicode C0, DEL and C1 controls before calling the authorizer. | HTAB is rejected. Valid non-control Unicode is accepted after UTF-8 validation and NFC normalization. |
+| Request ID | Accept only a non-empty string of visible ASCII bytes; invalid IDs use the configured generator or the secure fallback. | HTAB and non-ASCII bytes are rejected. Spaces are allowed. |
+| Proxy redirect Location | Reject ASCII C0 and DEL before resolving the URL. | HTAB is rejected. Non-ASCII bytes are left to URL parsing and validation. |
+| User-controlled log fields | Replace ASCII C0 except HTAB, and DEL, with spaces through `internal/logtemplate`. | HTAB and non-ASCII bytes are preserved. |
+| Content-Disposition filename | Delete Unicode C0, DEL and C1 controls, then trim surrounding whitespace. | HTAB is deleted. Non-control Unicode is preserved. |
+| HTTP quoted-string contents | Escape quotes and backslashes with a backslash; encode CR and LF as `\r` and `\n`, and other C0 bytes and DEL as uppercase percent escapes. | HTAB is encoded as `%09` even though HTTP permits it. Non-ASCII bytes are preserved. This serializer does not validate its input. |
+| SSE event ID and event name | Reject CR and LF, then trim surrounding ASCII spaces. | HTAB and other bytes are preserved by the field sanitizer. SSE data and comments have separate newline handling. |
+
+`internal/bytepolicy` defines the byte sets of the BasicAuth, request ID and
+quoted-string checks as word masks and byte predicates; each check keeps its own
+eight-byte scan. BasicAuth hands the credentials to the Unicode control check at
+the first word that holds a non-ASCII byte. Proxy redirect checks and log
+scanning use `utils.IndexControl` and `utils.IndexControlExceptTab`.
+
+These checks also apply to values supplied by application code. In particular,
+fasthttp filters CR and LF on exported header writes, but does not reject every
+other control byte. Fiber's validation, log scrubbing and serialization policies
+are therefore still needed.

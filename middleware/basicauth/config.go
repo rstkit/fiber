@@ -8,15 +8,41 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strconv"
+	"sort"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/quotedstring"
 	"github.com/gofiber/utils/v2"
 	"golang.org/x/crypto/bcrypt"
 )
 
-var ErrInvalidSHA256PasswordLength = errors.New("decode SHA256 password: invalid length")
+var (
+	ErrInvalidSHA256PasswordLength = errors.New("decode SHA256 password: invalid length")
+	ErrInvalidSHA512PasswordLength = errors.New("decode SHA512 password: invalid length")
+)
+
+// fallbackDummySHA512 is SHA-512("fiber-basicauth-dummy"), used as a
+// constant-time comparison target when no users are configured.
+var fallbackDummySHA512 = [sha512.Size]byte{
+	0x85, 0xc7, 0xd4, 0xbc, 0xec, 0x5f, 0xdf, 0xef, 0xe0, 0x4d, 0xd4, 0x3e, 0xd3, 0xac, 0x45, 0x7c,
+	0x5e, 0x48, 0x60, 0x74, 0x12, 0x8e, 0xf8, 0xc0, 0xde, 0x39, 0x89, 0xf9, 0x84, 0x0c, 0x50, 0x24,
+	0x1e, 0xa6, 0x1f, 0x2a, 0x11, 0x97, 0xb1, 0xb9, 0x67, 0xa9, 0xf7, 0x3b, 0x82, 0x8f, 0x95, 0xf5,
+	0x58, 0xed, 0x3c, 0xab, 0x43, 0x22, 0xf6, 0xfa, 0x84, 0x1d, 0xbc, 0xeb, 0x87, 0xc4, 0x1c, 0x5a,
+}
+
+type passwordVerifier func(string) bool
+
+type userVerifiers map[string]passwordVerifier
+
+// Verifier strengths are ordered by expected verification work:
+// bcrypt is strongest because it is adaptive and cost-based, SHA-512 follows
+// as the larger fixed-cost digest, and SHA-256 is the lightest fixed-cost hash.
+const (
+	verifierStrengthSHA256 = iota + 1
+	verifierStrengthSHA512
+	verifierStrengthBcrypt
+)
 
 // Config defines the config for middleware.
 type Config struct {
@@ -46,7 +72,8 @@ type Config struct {
 	// Optional. Default: nil
 	Unauthorized fiber.Handler
 
-	// BadRequest defines the response body for malformed Authorization headers.
+	// BadRequest defines the response body for malformed Authorization headers,
+	// a request carrying the field on more than one line included.
 	// By default it will return with a 400 Bad Request without the WWW-Authenticate header.
 	//
 	// Optional. Default: nil
@@ -89,13 +116,13 @@ var ConfigDefault = Config{
 
 // Helper function to set default values
 func configDefault(config ...Config) Config {
-	// Return default config if nothing provided
-	if len(config) < 1 {
-		return ConfigDefault
+	// Start from the default config, and override it when one is provided. The
+	// default has to go through the defaulting below as well: it leaves
+	// Authorizer, Unauthorized and BadRequest nil, which are built from the rest.
+	cfg := ConfigDefault
+	if len(config) > 0 {
+		cfg = config[0]
 	}
-
-	// Override default config
-	cfg := config[0]
 
 	// Set default values
 	if cfg.Next == nil {
@@ -124,29 +151,30 @@ func configDefault(config ...Config) Config {
 	}
 
 	if cfg.Authorizer == nil {
-		verifiers := make(map[string]func(string) bool, len(cfg.Users))
-		for u, hpw := range cfg.Users {
-			v, err := parseHashedPassword(hpw)
-			if err != nil {
-				panic(err)
-			}
-			verifiers[u] = v
+		verifiers, dummyVerify, err := buildVerifiers(cfg.Users)
+		if err != nil {
+			panic(err)
 		}
 		cfg.Authorizer = func(user, pass string, _ fiber.Ctx) bool {
 			verify, ok := verifiers[user]
-			return ok && verify(pass)
+			if !ok {
+				verify = dummyVerify
+			}
+			res := verify(pass)
+			return ok && res
 		}
 	}
 
 	if cfg.Unauthorized == nil {
 		cfg.Unauthorized = func(c fiber.Ctx) error {
-			header := "Basic realm=" + strconv.Quote(cfg.Realm)
+			header := `Basic realm="` + quotedstring.Escape(cfg.Realm) + `"`
 			if cfg.Charset != "" {
-				header += ", charset=" + strconv.Quote(cfg.Charset)
+				header += `, charset="` + quotedstring.Escape(cfg.Charset) + `"`
 			}
 			c.Set(fiber.HeaderWWWAuthenticate, header)
 			c.Set(fiber.HeaderCacheControl, "no-store")
-			c.Set(fiber.HeaderVary, fiber.HeaderAuthorization)
+			// Added to the Vary an earlier middleware may have set, not replacing it.
+			c.Vary(fiber.HeaderAuthorization)
 			return c.SendStatus(fiber.StatusUnauthorized)
 		}
 	}
@@ -159,7 +187,97 @@ func configDefault(config ...Config) Config {
 	return cfg
 }
 
-func parseHashedPassword(h string) (func(string) bool, error) {
+type verifierStrength struct {
+	algorithm int
+	cost      int
+}
+
+// buildVerifiers returns the verifier per user and the dummy for unknown users. Each runs
+// one check per hash tier (algorithm and bcrypt cost), so every attempt costs the same.
+func buildVerifiers(users map[string]string) (userVerifiers, passwordVerifier, error) {
+	keys := make([]string, 0, len(users))
+	for user := range users {
+		keys = append(keys, user)
+	}
+	sort.Strings(keys)
+
+	own := make(userVerifiers, len(users))
+	userTier := make(map[string]int, len(users))
+	tierIndex := make(map[verifierStrength]int)
+	var tiers []passwordVerifier // one stand-in per tier, in first-seen order
+	for _, user := range keys {
+		hashedPassword := users[user]
+		verify, err := parseHashedPassword(hashedPassword)
+		if err != nil {
+			return nil, nil, err
+		}
+		own[user] = verify
+
+		strength := verifierStrengthForHash(hashedPassword)
+		i, ok := tierIndex[strength]
+		if !ok {
+			i = len(tiers)
+			tierIndex[strength] = i
+			tiers = append(tiers, verify)
+		}
+		userTier[user] = i
+	}
+	if len(tiers) == 0 {
+		return own, fallbackDummyVerify, nil
+	}
+
+	verifiers := make(userVerifiers, len(own))
+	for user, verify := range own {
+		tier := userTier[user]
+		verifiers[user] = func(pass string) bool {
+			return verifyEveryTier(tiers, tier, verify, pass)
+		}
+	}
+	dummyVerify := func(pass string) bool {
+		verifyEveryTier(tiers, -1, nil, pass)
+		return false
+	}
+	return verifiers, dummyVerify, nil
+}
+
+// verifyEveryTier runs own in tier ownTier and the stand-in in every other, reporting own's result.
+func verifyEveryTier(tiers []passwordVerifier, ownTier int, own passwordVerifier, pass string) bool {
+	ok := false
+	for i, verify := range tiers {
+		if i == ownTier {
+			ok = own(pass)
+		} else {
+			verify(pass)
+		}
+	}
+	return ok
+}
+
+// fallbackDummyVerify provides fixed verification work when no users are
+// configured so missing-user requests still perform a constant-time hash check.
+func fallbackDummyVerify(pass string) bool {
+	sum := sha512.Sum512([]byte(pass))
+	return subtle.ConstantTimeCompare(sum[:], fallbackDummySHA512[:]) == 1
+}
+
+// verifierStrengthForHash returns the tier of a configured password hash: its
+// algorithm family and bcrypt cost, which set how long one check takes.
+func verifierStrengthForHash(h string) verifierStrength {
+	switch {
+	case strings.HasPrefix(h, "$2"):
+		cost, err := bcrypt.Cost([]byte(h))
+		if err != nil {
+			return verifierStrength{algorithm: verifierStrengthBcrypt}
+		}
+		return verifierStrength{algorithm: verifierStrengthBcrypt, cost: cost}
+	case strings.HasPrefix(h, "{SHA512}"):
+		return verifierStrength{algorithm: verifierStrengthSHA512}
+	default:
+		return verifierStrength{algorithm: verifierStrengthSHA256}
+	}
+}
+
+func parseHashedPassword(h string) (passwordVerifier, error) {
 	switch {
 	case strings.HasPrefix(h, "$2"):
 		hash := []byte(h)
@@ -171,6 +289,12 @@ func parseHashedPassword(h string) (func(string) bool, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode SHA512 password: %w", err)
 		}
+		// A digest of the wrong size can never equal a SHA-512 sum, so
+		// accepting it would silently reject every password for this user.
+		// Report it instead, which surfaces as a panic at startup.
+		if len(b) != sha512.Size {
+			return nil, ErrInvalidSHA512PasswordLength
+		}
 		return func(p string) bool {
 			sum := sha512.Sum512([]byte(p))
 			return subtle.ConstantTimeCompare(sum[:], b) == 1
@@ -179,6 +303,9 @@ func parseHashedPassword(h string) (func(string) bool, error) {
 		b, err := base64.StdEncoding.DecodeString(h[len("{SHA256}"):])
 		if err != nil {
 			return nil, fmt.Errorf("decode SHA256 password: %w", err)
+		}
+		if len(b) != sha256.Size {
+			return nil, ErrInvalidSHA256PasswordLength
 		}
 		return func(p string) bool {
 			sum := sha256.Sum256([]byte(p))

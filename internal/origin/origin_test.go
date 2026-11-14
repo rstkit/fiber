@@ -1,0 +1,385 @@
+package origin
+
+import (
+	"net/url"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func Test_Normalize_AnyScheme(t *testing.T) {
+	t.Parallel()
+	testCases := []struct {
+		origin         string
+		expectedOrigin string
+		expectedValid  bool
+	}{
+		{origin: "http://example.com", expectedValid: true, expectedOrigin: "http://example.com"},                       // Simple case should work.
+		{origin: "http://example.com/", expectedValid: true, expectedOrigin: "http://example.com"},                      // Trailing slash should be removed.
+		{origin: "http://example.com:3000", expectedValid: true, expectedOrigin: "http://example.com:3000"},             // Port should be preserved.
+		{origin: "http://example.com:3000/", expectedValid: true, expectedOrigin: "http://example.com:3000"},            // Trailing slash should be removed.
+		{origin: "app://example.com/", expectedValid: true, expectedOrigin: "app://example.com"},                        // App scheme should be accepted.
+		{origin: "http://", expectedValid: false, expectedOrigin: ""},                                                   // Invalid origin should not be accepted.
+		{origin: "file:///etc/passwd", expectedValid: false, expectedOrigin: ""},                                        // File scheme should not be accepted.
+		{origin: "https://*example.com", expectedValid: false, expectedOrigin: ""},                                      // Wildcard domain should not be accepted.
+		{origin: "http://*.example.com", expectedValid: false, expectedOrigin: ""},                                      // Wildcard subdomain should not be accepted.
+		{origin: "http://example.com/path", expectedValid: false, expectedOrigin: ""},                                   // Path should not be accepted.
+		{origin: "http://example.com?query=123", expectedValid: false, expectedOrigin: ""},                              // Query should not be accepted.
+		{origin: "http://example.com#fragment", expectedValid: false, expectedOrigin: ""},                               // Fragment should not be accepted.
+		{origin: "http://user:pass@example.com", expectedValid: false, expectedOrigin: ""},                              // Userinfo should not be accepted.
+		{origin: "http://localhost", expectedValid: true, expectedOrigin: "http://localhost"},                           // Localhost should be accepted.
+		{origin: "http://127.0.0.1", expectedValid: true, expectedOrigin: "http://127.0.0.1"},                           // IPv4 address should be accepted.
+		{origin: "http://[::1]", expectedValid: true, expectedOrigin: "http://[::1]"},                                   // IPv6 address should be accepted.
+		{origin: "http://[::1]:8080", expectedValid: true, expectedOrigin: "http://[::1]:8080"},                         // IPv6 address with port should be accepted.
+		{origin: "http://[::1]:8080/", expectedValid: true, expectedOrigin: "http://[::1]:8080"},                        // IPv6 address with port and trailing slash should be accepted.
+		{origin: "http://[::1]:8080/path", expectedValid: false, expectedOrigin: ""},                                    // IPv6 address with port and path should not be accepted.
+		{origin: "http://[::1]:8080?query=123", expectedValid: false, expectedOrigin: ""},                               // IPv6 address with port and query should not be accepted.
+		{origin: "http://[::1]:8080#fragment", expectedValid: false, expectedOrigin: ""},                                // IPv6 address with port and fragment should not be accepted.
+		{origin: "http://[::1]:8080/path?query=123#fragment", expectedValid: false, expectedOrigin: ""},                 // IPv6 address with port, path, query, and fragment should not be accepted.
+		{origin: "http://[::1]:8080/path?query=123#fragment/", expectedValid: false, expectedOrigin: ""},                // IPv6 address with port, path, query, fragment, and trailing slash should not be accepted.
+		{origin: "http://[::1]:8080/path?query=123#fragment/invalid", expectedValid: false, expectedOrigin: ""},         // IPv6 address with port, path, query, fragment, trailing slash, and invalid segment should not be accepted.
+		{origin: "http://[::1]:8080/path?query=123#fragment/invalid/", expectedValid: false, expectedOrigin: ""},        // IPv6 address with port, path, query, fragment, trailing slash, and invalid segment with trailing slash should not be accepted.
+		{origin: "http://[::1]:8080/path?query=123#fragment/invalid/segment", expectedValid: false, expectedOrigin: ""}, // IPv6 address with port, path, query, fragment, trailing slash, and invalid segment with additional segment should not be accepted.
+	}
+
+	for _, tc := range testCases {
+		got, ok := Normalize(tc.origin, AnyScheme)
+		assert.Equal(t, tc.expectedValid, ok, "Normalize(%q, AnyScheme) validity", tc.origin)
+		assert.Equal(t, tc.expectedOrigin, got, "Normalize(%q, AnyScheme) value", tc.origin)
+	}
+}
+
+// benchSubdomains builds n identical wildcard patterns for the worst-case
+// (no-match) scan benchmarks below.
+func benchSubdomains(n int) []Subdomain {
+	subs := make([]Subdomain, n)
+	for i := range subs {
+		subs[i] = Subdomain{Prefix: "https://", Suffix: "example.com"}
+	}
+	return subs
+}
+
+// Benchmark_SubdomainMatch_PerPatternNormalize reproduces the pre-PR loop,
+// which ran normalizeOrigin (one url.Parse) for every pattern. allocs/op scale
+// with the pattern count.
+func Benchmark_SubdomainMatch_PerPatternNormalize(b *testing.B) {
+	subdomains := benchSubdomains(16)
+	origin := "https://api.service.example.org" // matches none -> full scan
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		for _, sub := range subdomains {
+			normalized, isValid := Normalize(origin, AnyScheme)
+			if isValid && normalized == origin && sub.MatchNormalized(origin) {
+				break
+			}
+		}
+	}
+}
+
+// Benchmark_MatchSubdomainOrigin normalizes once regardless of pattern
+// count; allocs/op stay flat as the slice grows. Compare against
+// Benchmark_SubdomainMatch_PerPatternNormalize on the same input.
+func Benchmark_MatchSubdomainOrigin(b *testing.B) {
+	subdomains := benchSubdomains(16)
+	origin := "https://api.service.example.org" // matches none -> full scan
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		MatchAny(subdomains, origin, AnyScheme)
+	}
+}
+
+func Test_SubdomainMatch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		prefix string // of the one pattern, whose suffix is "example.com"
+		origin string
+		want   bool
+	}{
+		{"match with different scheme", "http://api.", "https://api.service.example.com", false},
+		{"match with different scheme", "https://", "http://api.service.example.com", false},
+		{"match with valid subdomain", "https://", "https://api.service.example.com", true},
+		{"match with valid nested subdomain", "https://", "https://1.2.api.service.example.com", true},
+		{"no match with invalid prefix", "https://abc.", "https://service.example.com", false},
+		{"no match with invalid suffix", "https://", "https://api.example.org", false},
+		{"no match with empty origin", "https://", "", false},
+		{"no match with malformed subdomain", "https://", "https://evil.comexample.com", false},
+		{"partial match not considered a match", "https://service.", "https://api.example.com", false},
+		{"no match with empty host label", "https://", "https://.example.com", false},
+		{"no match with malformed host label", "https://", "https://..example.com", false},
+		{"no match with malformed origin port before suffix", "https://", "https://evil.com:any.example.com", false},
+		{"no match with empty label before suffix", "https://", "https://foo..example.com", false},
+		{"no match with userinfo in origin", "https://", "https://user@api.example.com", false},
+		{"no match with non-normalized origin", "https://", "https://API.example.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := MatchAny([]Subdomain{{Prefix: tt.prefix, Suffix: "example.com"}}, tt.origin, AnyScheme)
+			assert.Equal(t, tt.want, got, "MatchAny()")
+		})
+	}
+}
+
+func Test_MatchSubdomainOrigin(t *testing.T) {
+	t.Parallel()
+	defaultSubs := []Subdomain{
+		{Prefix: "https://", Suffix: "example.net"},
+		{Prefix: "https://", Suffix: "example.org"},
+		{Prefix: "https://", Suffix: "example.com"},
+	}
+
+	tests := []struct {
+		name   string
+		origin string
+		subs   []Subdomain
+		want   bool
+	}{
+		{name: "matches first pattern", subs: defaultSubs, origin: "https://api.service.example.net", want: true},
+		{name: "matches later pattern", subs: defaultSubs, origin: "https://api.service.example.com", want: true},
+		{name: "rejects invalid origin once", subs: defaultSubs, origin: "https://user@api.example.com"},
+		{name: "rejects non-normalized origin", subs: defaultSubs, origin: "https://API.service.example.com"},
+		{name: "rejects unmatched origin", subs: defaultSubs, origin: "https://api.service.example.dev"},
+		{name: "empty slice never matches", subs: []Subdomain{}, origin: "https://api.service.example.com"},
+		{name: "nil slice never matches", subs: nil, origin: "https://api.service.example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := MatchAny(tt.subs, tt.origin, AnyScheme)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// Test_Normalize_WebSchemesOnly runs the same expectations as the AnyScheme
+// table for the cases both policies agree on, which is every case that turns on
+// something other than the scheme.
+func Test_Normalize_WebSchemesOnly(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		origin string
+		want   string
+		ok     bool
+	}{
+		{"http://example.com", "http://example.com", true},
+		{"HTTP://EXAMPLE.COM", "http://example.com", true},
+		{"https://example.com/", "https://example.com", true},
+		{"http://example.com:3000/", "http://example.com:3000", true},
+		{"http://[::1]:8080/", "http://[::1]:8080", true},
+		{"http://", "", false},
+		{"file:///etc/passwd", "", false},
+		{"https://*example.com", "", false},
+		{"http://example.com/path", "", false},
+		{"http://example.com?query=123", "", false},
+		{"http://example.com#fragment", "", false},
+		{"http://user:pass@example.com", "", false},
+	}
+	for _, tc := range tests {
+		got, ok := Normalize(tc.origin, WebSchemesOnly)
+		assert.Equal(t, tc.ok, ok, "Normalize(%q, WebSchemesOnly) validity", tc.origin)
+		assert.Equal(t, tc.want, got, "Normalize(%q, WebSchemesOnly) value", tc.origin)
+	}
+}
+
+// Test_Normalize_PolicyDelta pins the one behavior the two callers do not
+// share, so that changing it has to be deliberate rather than incidental.
+func Test_Normalize_PolicyDelta(t *testing.T) {
+	t.Parallel()
+	const appOrigin = "app://example.com"
+
+	got, ok := Normalize(appOrigin, AnyScheme)
+	assert.True(t, ok, "CORS echoes origins for schemes beyond http(s)")
+	assert.Equal(t, appOrigin, got)
+
+	got, ok = Normalize(appOrigin, WebSchemesOnly)
+	assert.False(t, ok, "CSRF authorizes state change, so only http(s) qualifies")
+	assert.Empty(t, got)
+}
+
+func Test_ParsePattern(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		pattern string
+		want    Pattern
+		policy  SchemePolicy
+		ok      bool
+	}{
+		{"plain origin", "https://example.com", Pattern{Origin: "https://example.com"}, AnyScheme, true},
+		{"plain origin normalizes", "HTTPS://Example.COM/", Pattern{Origin: "https://example.com"}, AnyScheme, true},
+		{"wildcard", "https://*.example.com", Pattern{Subdomain: Subdomain{Prefix: "https://", Suffix: "example.com"}, Wildcard: true}, AnyScheme, true},
+		{"wildcard keeps port", "https://*.example.com:8443", Pattern{Subdomain: Subdomain{Prefix: "https://", Suffix: "example.com:8443"}, Wildcard: true}, AnyScheme, true},
+		{"wildcard under a label", "https://*.api.example.com", Pattern{Subdomain: Subdomain{Prefix: "https://", Suffix: "api.example.com"}, Wildcard: true}, AnyScheme, true},
+		{"non-web scheme allowed", "app://example.com", Pattern{Origin: "app://example.com"}, AnyScheme, true},
+		{"non-web scheme rejected", "app://example.com", Pattern{}, WebSchemesOnly, false},
+		{"non-web wildcard rejected", "app://*.example.com", Pattern{Wildcard: true}, WebSchemesOnly, false},
+		{"invalid plain", "http://", Pattern{}, AnyScheme, false},
+		{"wildcard with path", "https://*.example.com/p", Pattern{Wildcard: true}, AnyScheme, false},
+		// "://*." never appears here, because the userinfo sits between, so this
+		// is read as a plain origin and rejected for the "*" in its host.
+		{"userinfo before wildcard is not a wildcard", "https://u@*.example.com", Pattern{}, AnyScheme, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := ParsePattern(tc.pattern, tc.policy)
+			assert.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// Test_MatchAny_PolicyIsApplied shows the policy reaches the re-normalization
+// step, so a scheme CSRF will not accept cannot match a CSRF wildcard.
+func Test_MatchAny_PolicyIsApplied(t *testing.T) {
+	t.Parallel()
+	subs := []Subdomain{{Prefix: "app://", Suffix: "example.com"}}
+	assert.True(t, MatchAny(subs, "app://api.example.com", AnyScheme))
+	assert.False(t, MatchAny(subs, "app://api.example.com", WebSchemesOnly))
+}
+
+func Test_FromURL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{raw: "https://example.com", want: "https://example.com"},
+		{raw: "HTTPS://Example.COM:8443/Path?q=1#frag", want: "https://example.com:8443"},
+		{raw: "https://user:pass@example.com/", want: "https://example.com"},
+		{raw: "http://[::1]:8080/x", want: "http://[::1]:8080"},
+		{raw: "http://[0:0:0:0:0:0:0:1]:8080/x", want: "http://[::1]:8080"},
+		{raw: "http://[2001:DB8:0:0:0:0:0:1]", want: "http://[2001:db8::1]"},
+		{raw: "http://[::ffff:127.0.0.1]", want: "http://[::ffff:7f00:1]"},
+		{raw: "http://[fe80:0::1%25eth0]", want: "http://[fe80:0::1%eth0]"},
+		// No validation: an empty host still serializes, and can match no AllowList entry.
+		{raw: "https:///path", want: "https://"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			t.Parallel()
+			u, err := url.Parse(tt.raw)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, FromURL(u))
+		})
+	}
+}
+
+// Test_FromURL_AgreesWithNormalize pins that the two spell an origin the same
+// way, so a Referer-derived origin compares equal to a configured one.
+func Test_FromURL_AgreesWithNormalize(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"https://example.com", "HTTP://EXAMPLE.COM/", "app://Example.com:3000", "http://[0:0:0:0:0:0:0:1]:3000"} {
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+		normalized, ok := Normalize(raw, AnyScheme)
+		require.True(t, ok)
+		assert.Equal(t, normalized, FromURL(u), raw)
+	}
+}
+
+func Test_ParseAllowList(t *testing.T) {
+	t.Parallel()
+	t.Run("sorts entries into exact and wildcard", func(t *testing.T) {
+		t.Parallel()
+		list, invalid, ok := ParseAllowList([]string{" https://Example.com/ ", "https://*.example.org", "\thttp://localhost:3000"}, WebSchemesOnly)
+		require.True(t, ok)
+		assert.Empty(t, invalid)
+		assert.Equal(t, map[string]struct{}{"https://example.com": {}, "http://localhost:3000": {}}, list.exact)
+		assert.Equal(t, []Subdomain{{Prefix: "https://", Suffix: "example.org"}}, list.subdomains)
+		assert.Equal(t, WebSchemesOnly, list.policy)
+	})
+
+	t.Run("returns the first invalid entry as written", func(t *testing.T) {
+		t.Parallel()
+		list, invalid, ok := ParseAllowList([]string{"https://example.com", " http:// ", "also bad"}, AnyScheme)
+		require.False(t, ok)
+		assert.Equal(t, " http:// ", invalid)
+		assert.False(t, list.Contains("https://example.com"), "a failed parse returns an empty list")
+	})
+
+	t.Run("applies the scheme policy", func(t *testing.T) {
+		t.Parallel()
+		_, invalid, ok := ParseAllowList([]string{"chrome-extension://abc"}, WebSchemesOnly)
+		require.False(t, ok)
+		assert.Equal(t, "chrome-extension://abc", invalid)
+
+		list, _, ok := ParseAllowList([]string{"chrome-extension://abc"}, AnyScheme)
+		require.True(t, ok)
+		assert.True(t, list.Contains("chrome-extension://abc"))
+	})
+
+	t.Run("empty and nil lists", func(t *testing.T) {
+		t.Parallel()
+		for _, entries := range [][]string{nil, {}} {
+			list, invalid, ok := ParseAllowList(entries, AnyScheme)
+			require.True(t, ok)
+			assert.Empty(t, invalid)
+			assert.False(t, list.Contains("https://example.com"))
+		}
+	})
+}
+
+func Test_AllowList_Contains(t *testing.T) {
+	t.Parallel()
+	list, _, ok := ParseAllowList([]string{"https://example.com", "https://*.example.org"}, WebSchemesOnly)
+	require.True(t, ok)
+
+	tests := []struct {
+		origin string
+		want   bool
+	}{
+		{origin: "https://example.com", want: true},
+		{origin: "https://api.example.org", want: true},
+		{origin: "https://a.b.example.org", want: true},
+		{origin: "https://example.org"},     // a wildcard does not cover its apex
+		{origin: "https://evilexample.org"}, // a wildcard needs a label boundary
+		{origin: "http://example.com"},      // the scheme is part of the origin
+		{origin: "https://example.com:443"}, // default ports are not folded
+		{origin: "https://Example.com"},     // compared, not normalized
+		{origin: "https://API.example.org"}, // compared, not normalized
+		{origin: "https://example.com/"},    // compared, not normalized
+		{origin: "https://user@api.example.org"},
+		{origin: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.origin, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, list.Contains(tt.origin))
+		})
+	}
+
+	t.Run("zero value is empty", func(t *testing.T) {
+		t.Parallel()
+		var empty AllowList
+		assert.False(t, empty.Contains("https://example.com"))
+	})
+}
+
+func Benchmark_AllowList_Contains(b *testing.B) {
+	list, _, ok := ParseAllowList([]string{"https://a.com", "https://b.com", "https://c.com", "https://*.example.org"}, AnyScheme)
+	require.True(b, ok)
+
+	b.Run("exact", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = list.Contains("https://c.com")
+		}
+	})
+	b.Run("wildcard", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = list.Contains("https://api.example.org")
+		}
+	})
+}

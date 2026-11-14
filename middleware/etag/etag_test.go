@@ -2,252 +2,227 @@ package etag
 
 import (
 	"bytes"
+	"errors"
+	"hash/crc32"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/apptest"
+	"github.com/gofiber/utils/v2"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
 
-// go test -run Test_ETag_Next
+// etagTestHello is the handler most tests serve. Its body hashes to the ETag
+// "13-1831710635".
+func etagTestHello(c fiber.Ctx) error {
+	return c.SendString("Hello, World!")
+}
+
+// etagTestApp returns an app that serves handler at GET / behind New(cfg).
+func etagTestApp(handler fiber.Handler, cfg ...Config) *fiber.App {
+	app := fiber.New()
+	app.Use(New(cfg...))
+	app.Get("/", handler)
+	return app
+}
+
+// etagTestServe sends GET / through the fasthttp handler of app, which keeps a streamed response a stream.
+func etagTestServe(app *fiber.App) *fasthttp.RequestCtx {
+	fctx := &fasthttp.RequestCtx{}
+	fctx.Request.Header.SetMethod(fiber.MethodGet)
+	fctx.Request.SetRequestURI("/")
+	app.Handler()(fctx)
+	return fctx
+}
+
 func Test_ETag_Next(t *testing.T) {
 	t.Parallel()
 	app := fiber.New()
-	app.Use(New(Config{
-		Next: func(_ fiber.Ctx) bool {
-			return true
+	app.Use(New(Config{Next: func(_ fiber.Ctx) bool { return true }}))
+
+	apptest.Expect(t, app, "/", fiber.StatusNotFound)
+}
+
+func Test_ETag_SSE(t *testing.T) {
+	t.Parallel()
+	app := etagTestApp(func(c fiber.Ctx) error {
+		c.Set(fiber.HeaderContentType, fiber.MIMETextEventStream)
+		return c.SendString("data: hello\n\n")
+	})
+
+	resp := apptest.Expect(t, app, "/", fiber.StatusOK)
+	require.Empty(t, resp.Header.Get(fiber.HeaderETag))
+
+	require.Equal(t, "data: hello\n\n", apptest.Body(t, resp))
+}
+
+// failOnReadStream is a body stream whose Read fails, proving the middleware
+// never materializes it.
+type failOnReadStream struct{ readCalls int }
+
+func (s *failOnReadStream) Read(_ []byte) (int, error) {
+	s.readCalls++
+	return 0, errors.New("stream should not be read")
+}
+
+// A stream of unknown length may never end, so hashing it would hold it; a sized one is still hashed.
+func Test_ETag_StreamOfUnknownLength(t *testing.T) {
+	t.Parallel()
+	for name, contentType := range map[string]string{
+		"unknown length": "",
+		// A real SSE stream must pass through untouched too: hashing the body would materialize the stream and break
+		// real-time delivery. The charset exercises the media-type strip in isEventStream.
+		"event stream": fiber.MIMETextEventStream + "; charset=utf-8",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stream := &failOnReadStream{}
+			fctx := etagTestServe(etagTestApp(func(c fiber.Ctx) error {
+				if contentType != "" {
+					c.Set(fiber.HeaderContentType, contentType)
+				}
+				c.Response().SetBodyStream(stream, -1)
+				return nil
+			}))
+
+			require.True(t, fctx.Response.IsBodyStream())
+			require.Zero(t, stream.readCalls)
+			require.Empty(t, string(fctx.Response.Header.Peek(fiber.HeaderETag)))
+		})
+	}
+
+	t.Run("declared length", func(t *testing.T) {
+		t.Parallel()
+		fctx := etagTestServe(etagTestApp(func(c fiber.Ctx) error {
+			c.Response().SetBodyStream(bytes.NewReader([]byte("hello")), 5)
+			return nil
+		}))
+
+		require.Equal(t, string(Generate([]byte("hello"))), string(fctx.Response.Header.Peek(fiber.HeaderETag)))
+	})
+}
+
+// Body keeps a read error as the body, and an outer cache would store it under this ETag.
+func Test_ETag_SizedStreamIsTaggedOnlyWhole(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		stream  func() io.Reader
+		maxRead int
+	}{
+		"fails": {
+			maxRead: 4,
+			stream: func() io.Reader {
+				return io.MultiReader(strings.NewReader("part"), iotest.ErrReader(errors.New("upstream reset")))
+			},
 		},
-	}))
+		"longer than declared": {
+			maxRead: 64 << 10, // short of the whole MiB
+			stream:  func() io.Reader { return strings.NewReader(strings.Repeat("x", 1<<20)) },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var read strings.Builder
+			app := etagTestApp(func(c fiber.Ctx) error { return c.SendStream(io.TeeReader(tc.stream(), &read), 10) })
+			fctx := etagTestServe(app)
 
-	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
-	require.NoError(t, err)
-	require.Equal(t, fiber.StatusNotFound, resp.StatusCode)
+			require.Empty(t, fctx.Response.Header.Peek(fiber.HeaderETag))
+			require.True(t, fctx.Response.IsBodyStream())
+			require.Equal(t, 10, fctx.Response.Header.ContentLength())
+			require.LessOrEqual(t, read.Len(), tc.maxRead)
+		})
+	}
 }
 
-// go test -run Test_ETag_SkipError
-func Test_ETag_SkipError(t *testing.T) {
+// The middleware leaves a handler error, a status other than 200 and a response
+// without a body alone.
+func Test_ETag_PassThrough(t *testing.T) {
 	t.Parallel()
-	app := fiber.New()
-
-	app.Use(New())
-
-	app.Get("/", func(_ fiber.Ctx) error {
-		return fiber.ErrForbidden
-	})
-
-	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
-	require.NoError(t, err)
-	require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+	for _, tc := range []struct {
+		handler fiber.Handler
+		name    string
+		status  int
+	}{
+		{func(_ fiber.Ctx) error { return fiber.ErrForbidden }, "skip error", fiber.StatusForbidden},
+		{func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusCreated) }, "not status OK", fiber.StatusCreated},
+		{func(_ fiber.Ctx) error { return nil }, "no body", fiber.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			apptest.Expect(t, etagTestApp(tc.handler), "/", tc.status)
+		})
+	}
 }
 
-// go test -run Test_ETag_NotStatusOK
-func Test_ETag_NotStatusOK(t *testing.T) {
+// A GET with If-None-Match against a generated, a weak and a handler-set ETag:
+// it is answered with the page unless the tag the client sends matches.
+func Test_ETag_ConditionalGet(t *testing.T) {
 	t.Parallel()
-	app := fiber.New()
+	for _, variant := range []struct {
+		handler  fiber.Handler
+		name     string
+		tag      string // the ETag of the response, which matches when sent back
+		nonMatch string
+		cfg      []Config
+	}{
+		{name: "new etag", handler: etagTestHello, tag: `"13-1831710635"`, nonMatch: `"non-match"`},
+		{name: "weak etag", cfg: []Config{{Weak: true}}, handler: etagTestHello, tag: `W/"13-1831710635"`, nonMatch: `W/"non-match"`},
+		{
+			name: "custom etag",
+			handler: func(c fiber.Ctx) error {
+				c.Set(fiber.HeaderETag, `"custom"`)
+				if bytes.Equal(c.Request().Header.Peek(fiber.HeaderIfNoneMatch), []byte(`"custom"`)) {
+					return c.SendStatus(fiber.StatusNotModified)
+				}
+				return c.SendString("Hello, World!")
+			},
+			tag:      `"custom"`,
+			nonMatch: `"non-match"`,
+		},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			t.Parallel()
+			for _, tc := range []struct {
+				name        string
+				ifNoneMatch string
+				status      int
+			}{
+				{name: "without HeaderIfNoneMatch", status: fiber.StatusOK},
+				{name: "with HeaderIfNoneMatch and not matched", ifNoneMatch: variant.nonMatch, status: fiber.StatusOK},
+				{name: "with HeaderIfNoneMatch and matched", ifNoneMatch: variant.tag, status: fiber.StatusNotModified},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					app := etagTestApp(variant.handler, variant.cfg...)
 
-	app.Use(New())
+					ifNoneMatch := apptest.WithHeaderIf(fiber.HeaderIfNoneMatch, tc.ifNoneMatch)
+					req := apptest.Req(fiber.MethodGet, "/", ifNoneMatch)
+					resp := apptest.Expect(t, app, req, tc.status)
 
-	app.Get("/", func(c fiber.Ctx) error {
-		return c.SendStatus(fiber.StatusCreated)
-	})
+					if tc.status == fiber.StatusOK {
+						require.Equal(t, variant.tag, resp.Header.Get(fiber.HeaderETag))
+						return
+					}
 
-	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
-	require.NoError(t, err)
-	require.Equal(t, fiber.StatusCreated, resp.StatusCode)
-}
-
-// go test -run Test_ETag_NoBody
-func Test_ETag_NoBody(t *testing.T) {
-	t.Parallel()
-	app := fiber.New()
-
-	app.Use(New())
-
-	app.Get("/", func(_ fiber.Ctx) error {
-		return nil
-	})
-
-	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
-	require.NoError(t, err)
-	require.Equal(t, fiber.StatusOK, resp.StatusCode)
-}
-
-// go test -run Test_ETag_NewEtag
-func Test_ETag_NewEtag(t *testing.T) {
-	t.Parallel()
-	t.Run("without HeaderIfNoneMatch", func(t *testing.T) {
-		t.Parallel()
-		testETagNewEtag(t, false, false)
-	})
-	t.Run("with HeaderIfNoneMatch and not matched", func(t *testing.T) {
-		t.Parallel()
-		testETagNewEtag(t, true, false)
-	})
-	t.Run("with HeaderIfNoneMatch and matched", func(t *testing.T) {
-		t.Parallel()
-		testETagNewEtag(t, true, true)
-	})
-}
-
-func testETagNewEtag(t *testing.T, headerIfNoneMatch, matched bool) { //nolint:revive // We're in a test, so using bools as a flow-control is fine
-	t.Helper()
-
-	app := fiber.New()
-
-	app.Use(New())
-
-	app.Get("/", func(c fiber.Ctx) error {
-		return c.SendString("Hello, World!")
-	})
-
-	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
-	if headerIfNoneMatch {
-		etag := `"non-match"`
-		if matched {
-			etag = `"13-1831710635"`
-		}
-		req.Header.Set(fiber.HeaderIfNoneMatch, etag)
-	}
-
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-
-	if !headerIfNoneMatch || !matched {
-		require.Equal(t, fiber.StatusOK, resp.StatusCode)
-		require.Equal(t, `"13-1831710635"`, resp.Header.Get(fiber.HeaderETag))
-		return
-	}
-
-	if matched {
-		require.Equal(t, fiber.StatusNotModified, resp.StatusCode)
-		b, err := io.ReadAll(resp.Body)
-		require.NoError(t, err)
-		require.Empty(t, b)
+					require.Empty(t, apptest.BodyBytes(t, resp))
+				})
+			}
+		})
 	}
 }
 
-// go test -run Test_ETag_WeakEtag
-func Test_ETag_WeakEtag(t *testing.T) {
-	t.Parallel()
-	t.Run("without HeaderIfNoneMatch", func(t *testing.T) {
-		t.Parallel()
-		testETagWeakEtag(t, false, false)
-	})
-	t.Run("with HeaderIfNoneMatch and not matched", func(t *testing.T) {
-		t.Parallel()
-		testETagWeakEtag(t, true, false)
-	})
-	t.Run("with HeaderIfNoneMatch and matched", func(t *testing.T) {
-		t.Parallel()
-		testETagWeakEtag(t, true, true)
-	})
-}
-
-func testETagWeakEtag(t *testing.T, headerIfNoneMatch, matched bool) { //nolint:revive // We're in a test, so using bools as a flow-control is fine
-	t.Helper()
-
-	app := fiber.New()
-
-	app.Use(New(Config{Weak: true}))
-
-	app.Get("/", func(c fiber.Ctx) error {
-		return c.SendString("Hello, World!")
-	})
-
-	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
-	if headerIfNoneMatch {
-		etag := `W/"non-match"`
-		if matched {
-			etag = `W/"13-1831710635"`
-		}
-		req.Header.Set(fiber.HeaderIfNoneMatch, etag)
-	}
-
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-
-	if !headerIfNoneMatch || !matched {
-		require.Equal(t, fiber.StatusOK, resp.StatusCode)
-		require.Equal(t, `W/"13-1831710635"`, resp.Header.Get(fiber.HeaderETag))
-		return
-	}
-
-	if matched {
-		require.Equal(t, fiber.StatusNotModified, resp.StatusCode)
-		b, err := io.ReadAll(resp.Body)
-		require.NoError(t, err)
-		require.Empty(t, b)
-	}
-}
-
-// go test -run Test_ETag_CustomEtag
-func Test_ETag_CustomEtag(t *testing.T) {
-	t.Parallel()
-	t.Run("without HeaderIfNoneMatch", func(t *testing.T) {
-		t.Parallel()
-		testETagCustomEtag(t, false, false)
-	})
-	t.Run("with HeaderIfNoneMatch and not matched", func(t *testing.T) {
-		t.Parallel()
-		testETagCustomEtag(t, true, false)
-	})
-	t.Run("with HeaderIfNoneMatch and matched", func(t *testing.T) {
-		t.Parallel()
-		testETagCustomEtag(t, true, true)
-	})
-}
-
-func testETagCustomEtag(t *testing.T, headerIfNoneMatch, matched bool) { //nolint:revive // We're in a test, so using bools as a flow-control is fine
-	t.Helper()
-
-	app := fiber.New()
-
-	app.Use(New())
-
-	app.Get("/", func(c fiber.Ctx) error {
-		c.Set(fiber.HeaderETag, `"custom"`)
-		if bytes.Equal(c.Request().Header.Peek(fiber.HeaderIfNoneMatch), []byte(`"custom"`)) {
-			return c.SendStatus(fiber.StatusNotModified)
-		}
-		return c.SendString("Hello, World!")
-	})
-
-	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
-	if headerIfNoneMatch {
-		etag := `"non-match"`
-		if matched {
-			etag = `"custom"`
-		}
-		req.Header.Set(fiber.HeaderIfNoneMatch, etag)
-	}
-
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-
-	if !headerIfNoneMatch || !matched {
-		require.Equal(t, fiber.StatusOK, resp.StatusCode)
-		require.Equal(t, `"custom"`, resp.Header.Get(fiber.HeaderETag))
-		return
-	}
-
-	if matched {
-		require.Equal(t, fiber.StatusNotModified, resp.StatusCode)
-		b, err := io.ReadAll(resp.Body)
-		require.NoError(t, err)
-		require.Empty(t, b)
-	}
-}
-
-// go test -run Test_ETag_CustomEtagPut
 func Test_ETag_CustomEtagPut(t *testing.T) {
 	t.Parallel()
 	app := fiber.New()
-
 	app.Use(New())
-
 	app.Put("/", func(c fiber.Ctx) error {
 		c.Set(fiber.HeaderETag, `"custom"`)
 		if !bytes.Equal(c.Request().Header.Peek(fiber.HeaderIfMatch), []byte(`"custom"`)) {
@@ -256,24 +231,12 @@ func Test_ETag_CustomEtagPut(t *testing.T) {
 		return c.SendString("Hello, World!")
 	})
 
-	req := httptest.NewRequest(fiber.MethodPut, "/", http.NoBody)
-	req.Header.Set(fiber.HeaderIfMatch, `"non-match"`)
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-	require.Equal(t, fiber.StatusPreconditionFailed, resp.StatusCode)
+	req := apptest.Req(fiber.MethodPut, "/", apptest.WithHeader(fiber.HeaderIfMatch, `"non-match"`))
+	apptest.Expect(t, app, req, fiber.StatusPreconditionFailed)
 }
 
-// go test -v -run=^$ -bench=Benchmark_Etag -benchmem -count=4
 func Benchmark_Etag(b *testing.B) {
-	app := fiber.New()
-
-	app.Use(New())
-
-	app.Get("/", func(c fiber.Ctx) error {
-		return c.SendString("Hello, World!")
-	})
-
-	h := app.Handler()
+	h := etagTestApp(etagTestHello).Handler()
 
 	fctx := &fasthttp.RequestCtx{}
 	fctx.Request.Header.SetMethod(fiber.MethodGet)
@@ -287,4 +250,171 @@ func Benchmark_Etag(b *testing.B) {
 
 	require.Equal(b, 200, fctx.Response.Header.StatusCode())
 	require.Equal(b, `"13-1831710635"`, string(fctx.Response.Header.Peek(fiber.HeaderETag)))
+}
+
+func Test_ETag_WeakComparison(t *testing.T) {
+	t.Parallel()
+	testCases := []struct {
+		name           string
+		ifNoneMatch    string
+		weak           bool
+		expectedStatus int
+	}{
+		{name: "weak client tag matches strong server tag", ifNoneMatch: `W/"13-1831710635"`, weak: false, expectedStatus: fiber.StatusNotModified},
+		{name: "strong client tag matches weak server tag", ifNoneMatch: `"13-1831710635"`, weak: true, expectedStatus: fiber.StatusNotModified},
+		{name: "match in list after weak tag", ifNoneMatch: `W/"non-match", "13-1831710635"`, weak: false, expectedStatus: fiber.StatusNotModified},
+		{name: "weak match in list", ifNoneMatch: `"non-match", W/"13-1831710635"`, weak: false, expectedStatus: fiber.StatusNotModified},
+		{name: "wildcard", ifNoneMatch: `*`, weak: false, expectedStatus: fiber.StatusNotModified},
+		{name: "no match in list", ifNoneMatch: `W/"non-match", "other"`, weak: false, expectedStatus: fiber.StatusOK},
+		{name: "unquoted tag never matches", ifNoneMatch: `13-1831710635`, weak: false, expectedStatus: fiber.StatusOK},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := etagTestApp(etagTestHello, Config{Weak: tc.weak})
+
+			req := apptest.Req(fiber.MethodGet, "/", apptest.WithHeader(fiber.HeaderIfNoneMatch, tc.ifNoneMatch))
+			resp := apptest.Expect(t, app, req, tc.expectedStatus)
+
+			expectedTag := `"13-1831710635"`
+			if tc.weak {
+				expectedTag = `W/"13-1831710635"`
+			}
+			require.Equal(t, expectedTag, resp.Header.Get(fiber.HeaderETag))
+
+			if tc.expectedStatus == fiber.StatusNotModified {
+				b := apptest.BodyBytes(t, resp)
+				require.Empty(t, b)
+			}
+		})
+	}
+}
+
+func Test_ETag_IfNoneMatchOnlyForGetHead(t *testing.T) {
+	t.Parallel()
+	// RFC 9110 §13.1.2 reserves 304 for GET and HEAD.
+	testCases := []struct {
+		method         string
+		expectedStatus int
+	}{
+		{method: fiber.MethodGet, expectedStatus: fiber.StatusNotModified},
+		{method: fiber.MethodHead, expectedStatus: fiber.StatusNotModified},
+		{method: fiber.MethodPost, expectedStatus: fiber.StatusOK},
+		{method: fiber.MethodPut, expectedStatus: fiber.StatusOK},
+		{method: fiber.MethodPatch, expectedStatus: fiber.StatusOK},
+		{method: fiber.MethodDelete, expectedStatus: fiber.StatusOK},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.method, func(t *testing.T) {
+			t.Parallel()
+			app := fiber.New()
+			app.Use(New())
+			app.All("/", etagTestHello)
+
+			req := apptest.Req(tc.method, "/", apptest.WithHeader(fiber.HeaderIfNoneMatch, `"13-1831710635"`))
+			resp := apptest.Expect(t, app, req, tc.expectedStatus)
+			require.Equal(t, `"13-1831710635"`, resp.Header.Get(fiber.HeaderETag))
+
+			body := apptest.BodyBytes(t, resp)
+			if tc.expectedStatus == fiber.StatusOK {
+				require.Equal(t, "Hello, World!", string(body))
+			} else {
+				require.Empty(t, body)
+			}
+		})
+	}
+}
+
+func Test_ETag_SplitIfNoneMatch(t *testing.T) {
+	t.Parallel()
+	app := etagTestApp(etagTestHello)
+
+	resp := apptest.Do(t, app, "/")
+	generated := resp.Header.Get(fiber.HeaderETag)
+	require.NotEmpty(t, generated)
+
+	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+	req.Header.Add(fiber.HeaderIfNoneMatch, `"other"`)
+	req.Header.Add(fiber.HeaderIfNoneMatch, generated)
+	apptest.Expect(t, app, req, fiber.StatusNotModified)
+}
+
+// Test_ETag_HandlerETagWithoutNormalizing covers a handler's own ETag under
+// DisableHeaderNormalizing, set through c.Set and under every spelling of the
+// name: the middleware must keep it and add no second ETag line.
+func Test_ETag_HandlerETagWithoutNormalizing(t *testing.T) {
+	t.Parallel()
+	// Without a spelling the handler sets its ETag through c.Set.
+	for _, tc := range []struct{ name, spelling, etag string }{
+		{"c.Set", "", `"custom"`},
+		{"ETag", "ETag", `"upstream"`},
+		{"Etag", "Etag", `"upstream"`},
+		{"etag", "etag", `"upstream"`},
+		{"ETAG", "ETAG", `"upstream"`},
+		{"eTaG", "eTaG", `"upstream"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := fiber.New(fiber.Config{DisableHeaderNormalizing: true})
+			app.Use(New())
+			app.Get("/", func(c fiber.Ctx) error {
+				if tc.spelling == "" {
+					c.Set("ETag", tc.etag)
+				} else {
+					c.Response().Header.Set(tc.spelling, tc.etag)
+				}
+				return c.SendString("Hello, World!")
+			})
+
+			fctx := &fasthttp.RequestCtx{}
+			fctx.Request.SetRequestURI("/")
+			fctx.Request.Header.SetMethod(fiber.MethodGet)
+			fctx.Request.Header.DisableNormalizing()
+			fctx.Response.Header.DisableNormalizing()
+			app.Handler()(fctx)
+
+			var lines []string
+			for k, v := range fctx.Response.Header.All() {
+				if utils.EqualFold(string(k), fiber.HeaderETag) {
+					lines = append(lines, string(v))
+				}
+			}
+			require.Equal(t, []string{tc.etag}, lines)
+		})
+	}
+}
+
+func Test_Generate_MatchesCRC(t *testing.T) {
+	t.Parallel()
+	tab := crc32.MakeTable(0xD5828281)
+	r := rand.New(rand.NewPCG(1, 2))
+	check := func(n int) {
+		body := make([]byte, n)
+		for i := range body {
+			body[i] = byte(r.UintN(256))
+		}
+		want := `"` + strconv.Itoa(n) + "-" + strconv.FormatUint(uint64(crc32.Checksum(body, tab)), 10) + `"`
+		require.Equal(t, want, string(Generate(body)), "length %d", n)
+	}
+	for n := range 300 {
+		check(n)
+	}
+	for _, n := range []int{1 << 10, 4<<10 + 3, 64<<10 - 1} {
+		check(n)
+	}
+}
+
+func Benchmark_Generate(b *testing.B) {
+	for _, size := range []int{13, 100, 1 << 10, 10 << 10, 100 << 10} {
+		body := bytes.Repeat([]byte("0123456789abcdef"), size/16+1)[:size]
+		b.Run(utils.FormatInt(int64(size))+"B", func(b *testing.B) {
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = Generate(body)
+			}
+		})
+	}
 }

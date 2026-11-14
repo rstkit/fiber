@@ -7,14 +7,14 @@ id: earlydata
 The Early Data middleware adds TLS 1.3 "0-RTT" support to [Fiber](https://github.com/gofiber/fiber). When the client and server share a PSK, TLS 1.3 lets the client send data with the first flight and skip the initial round trip.
 
 Enable Fiber's `TrustProxy` option before using this middleware to avoid spoofed client headers.
-When `TrustProxy` is disabled (the default) or the remote address is not trusted by your proxy configuration, requests carrying the `Early-Data` header are rejected with `425 Too Early` to prevent 0-RTT spoofing from direct clients.
+When `TrustProxy` is disabled (the default) or the remote address is not trusted by your proxy configuration, requests carrying the `Early-Data` header are rejected with the configured `Error` (`425 Too Early` by default) to prevent 0-RTT spoofing from direct clients.
 
 Enabling early data in a reverse proxy (for example, `ssl_early_data on;` in nginx) makes requests replayable. Review these resources before proceeding:
 
 - [datatracker](https://datatracker.ietf.org/doc/html/rfc8446#section-8)
 - [trailofbits](https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt)
 
-By default, the middleware permits early data only for safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`) and rejects other requests before your handler runs. Override this behavior with the `AllowEarlyData` option.
+By default, the middleware permits early data only for safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `QUERY`) and rejects other requests before your handler runs. Override this behavior with the `AllowEarlyData` option.
 
 ## Signatures
 
@@ -66,7 +66,7 @@ var ConfigDefault = Config{
         return c.Get(DefaultHeaderName) == DefaultHeaderTrueValue
     },
     AllowEarlyData: func(c fiber.Ctx) bool {
-        return fiber.IsMethodSafe(c.Method())
+        return c.IsSafe()
     },
     Error: fiber.ErrTooEarly,
 }

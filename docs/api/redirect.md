@@ -29,7 +29,7 @@ app.Get("/coffee", func(c fiber.Ctx) error {
 })
 
 app.Get("/teapot", func(c fiber.Ctx) error {
-  return c.Status(fiber.StatusTeapot).Send("🍵 short and stout 🍵")
+  return c.Status(fiber.StatusTeapot).SendString("🍵 short and stout 🍵")
 })
 ```
 
@@ -41,7 +41,7 @@ app.Get("/", func(c fiber.Ctx) error {
   return c.Redirect().To("../login")
   // => HTTP - GET 303 http://example.com
   return c.Redirect().To("http://example.com")
-  // => HTTP - GET 301 https://example.com
+  // => HTTP - GET 301 http://example.com
   return c.Redirect().Status(301).To("http://example.com")
 })
 ```
@@ -87,6 +87,33 @@ app.Get("/user/:name", func(c fiber.Ctx) error {
 }).Name("user")
 ```
 
+`Route` returns `fiber.ErrNotFound` when no route has the given name. Values in `Queries` are percent-encoded and keys are written as given. The order of the query parameters is not specified.
+
+:::note
+Each `Params` value is automatically percent-encoded with URL path-segment
+rules. Greedy parameters (`*` and `+`) preserve `/` inside the matched path
+tail; delimiters such as `?` and `#` remain parameter data instead of adding a
+query or fragment, and cannot absorb or discard `Queries`.
+[`Route.URL`](./app.md#getroute) and [`GetRouteURL`](./ctx.md#getrouteurl) apply
+the same encoding.
+
+These take the value as data, not as URL text. Representable values use the same
+encoding under any configuration. With `UnescapePath` off (the default) `c.Params`
+returns the value still percent-encoded, so forwarding it straight back encodes
+the `%` a second time. Turn `UnescapePath` on, or decode with
+[`url.PathUnescape`](https://pkg.go.dev/net/url#PathUnescape) first.
+An app with `UnescapePath` enabled decodes `%2F` before route matching, so an
+ordinary single-segment parameter holding a `/` cannot round-trip and returns
+`ErrRouteNotRepresentable`. Greedy (`*` or `+`), adjacent single-byte parameters
+and required parameters with a single-byte non-slash terminator retain their
+existing slash-matching rules. An optional parameter with such a terminator does
+not match a `/`, so a decoded `/` in its value returns `ErrRouteNotRepresentable`.
+Dot-containing values are also rejected when the composed path has a `.` or
+`..` segment that would be removed during normalization. Surrounding route
+constants are considered: `:name.txt` with `name="."` remains representable.
+Pass a different value or use a route that can represent it; do not pre-encode it.
+:::
+
 ### Back
 
 Redirects to the referer. If it's missing, fall back to the provided URL. You can also set the status code.
@@ -95,8 +122,23 @@ Redirects to the referer. If it's missing, fall back to the provided URL. You ca
 If unspecified, status defaults to **303 See Other**.
 :::
 
+:::note
+
+The referer is only used when it is same-origin with the current request, and
+the value sent in `Location` is a normalized form of it, not the raw header.
+The check reads the referer the way a browser does — folding backslashes,
+dropping ASCII tab, CR and LF, and collapsing a leading run of slashes — so a
+value like `/\evil.com`, which a browser resolves to `//evil.com`, is not
+mistaken for a local path. A referer that is missing, cross-origin, or
+unparsable falls back to the provided URL. If there is no fallback either,
+`Back` returns `fiber.ErrRedirectBackNoFallback`, an error with status 500.
+
+This browser-style normalization applies to the referer checked by `Back`, not to every redirect API or the fallback URL. The [HTTP client](../client/request.md#control-characters-in-redirect-targets) instead rejects upstream `Location` values containing control bytes rather than removing them and following a changed target.
+
+:::
+
 ```go title="Signature"
-func (r *Redirect) Back(fallback string) error
+func (r *Redirect) Back(fallback ...string) error
 ```
 
 ```go title="Example"
@@ -159,12 +201,35 @@ type RedirectConfig struct {
 
 Similar to [Laravel](https://laravel.com/docs/11.x/redirects#redirecting-with-flashed-session-data), we can flash a message and retrieve it in the next request.
 
+:::note
+
+Flash messages travel in the `fiber_flash` cookie (`fiber.FlashCookieName`), so only a client that keeps cookies across the redirect (a browser, typically) receives them, and every request is scanned for the cookie. Deployments whose clients keep no cookies can turn the feature off with `fiber.Config{DisableFlashMessages: true}`: `With` and `WithInput` then set no cookie, `Messages` and `OldInput` report nothing, and the scan is skipped.
+
+:::
+
+The next request that carries the cookie can read the data, and Fiber expires the cookie on that request, so it is delivered once. The accessors return these types:
+
+```go title="Definition"
+// FlashMessage is returned by Messages and Message.
+type FlashMessage struct {
+  Key   string
+  Value string
+  Level uint8
+}
+
+// OldInputData is returned by OldInputs and OldInput.
+type OldInputData struct {
+  Key   string
+  Value string
+}
+```
+
 #### Messages
 
-Retrieve all flash messages. See [With](#with) for details.
+Retrieve all flash messages. Reading removes them from the request, so a second call returns none. See [With](#with) for details.
 
 ```go title="Signature"
-func (r *Redirect) Messages() map[string]string
+func (r *Redirect) Messages() []FlashMessage
 ```
 
 ```go title="Example"
@@ -176,16 +241,16 @@ app.Get("/", func(c fiber.Ctx) error {
 
 #### Message
 
-Get a flash message by key; see [With](#with).
+Get a flash message by key; see [With](#with). It returns an empty `FlashMessage` when the key is not found and, like `Messages`, removes the message it returns.
 
 ```go title="Signature"
-func (r *Redirect) Message(key string) *Redirect
+func (r *Redirect) Message(key string) FlashMessage
 ```
 
 ```go title="Example"
 app.Get("/", func(c fiber.Ctx) error {
   message := c.Redirect().Message("status")
-  return c.SendString(message)
+  return c.SendString(message.Value)
 })
 ```
 
@@ -194,7 +259,7 @@ app.Get("/", func(c fiber.Ctx) error {
 Retrieve stored input data. See [WithInput](#withinput).
 
 ```go title="Signature"
-func (r *Redirect) OldInputs() map[string]string
+func (r *Redirect) OldInputs() []OldInputData
 ```
 
 ```go title="Example"
@@ -206,25 +271,25 @@ app.Get("/", func(c fiber.Ctx) error {
 
 #### OldInput
 
-Get stored input data by key; see [WithInput](#withinput).
+Get stored input data by key; see [WithInput](#withinput). It returns an empty `OldInputData` when the key is not found.
 
 ```go title="Signature"
-func (r *Redirect) OldInput(key string) string
+func (r *Redirect) OldInput(key string) OldInputData
 ```
 
 ```go title="Example"
 app.Get("/name", func(c fiber.Ctx) error {
   oldInput := c.Redirect().OldInput("name")
-  return c.SendString(oldInput)
+  return c.SendString(oldInput.Value)
 })
 ```
 
 #### With
 
-Send flash messages with `With`.
+Send flash messages with `With`. The optional `level` sets the message's `Level` and defaults to `0`. Calling `With` again with the same key replaces the earlier message.
 
 ```go title="Signature"
-func (r *Redirect) With(key, value string) *Redirect
+func (r *Redirect) With(key, value string, level ...uint8) *Redirect
 ```
 
 ```go title="Example"
@@ -234,7 +299,7 @@ app.Get("/login", func(c fiber.Ctx) error {
 
 app.Get("/", func(c fiber.Ctx) error {
   // => Logged in successfully
-  return c.SendString(c.Redirect().Message("status"))
+  return c.SendString(c.Redirect().Message("status").Value)
 })
 ```
 
@@ -243,6 +308,24 @@ app.Get("/", func(c fiber.Ctx) error {
 Send input data with `WithInput`, which stores them in a cookie.
 
 It captures form, multipart, or query data depending on the request content type.
+
+:::caution
+
+`WithInput` copies the whole submitted body into the `fiber_flash` cookie — a
+rejected login carries the password the user just typed. The payload is
+hex-encoded, not encrypted or signed, so anything sensitive in the request goes
+back to the browser as a cookie value. Prefer `With` for the specific fields you
+need to carry across the redirect.
+
+The cookie is `HttpOnly`, and `Secure` when the request that produced it arrived
+over TLS — so script cannot read it and it is not replayed in the clear. Neither
+attribute protects the payload from whoever is at the browser.
+
+Browsers typically drop a cookie larger than about 4 KB, and Fiber sets no flash
+cookie at all when a redirect carries more than 256 entries (messages plus input
+fields), so a large form does not make the round trip.
+
+:::
 
 ```go title="Signature"
 func (r *Redirect) WithInput() *Redirect
@@ -256,6 +339,6 @@ app.Post("/login", func(c fiber.Ctx) error {
 
 app.Get("/name", func(c fiber.Ctx) error {
   // => John
-  return c.SendString(c.Redirect().OldInput("name"))
+  return c.SendString(c.Redirect().OldInput("name").Value)
 }).Name("name")
 ```

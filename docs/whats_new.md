@@ -1,7 +1,7 @@
 ---
 id: whats_new
 title: 🆕 What's New in v3
-sidebar_position: 2
+sidebar_position: 1.5
 toc_max_heading_level: 4
 ---
 
@@ -55,13 +55,15 @@ Here's a quick overview of the changes in Fiber `v3`:
   - [Logger](#logger)
   - [Monitor](#monitor)
   - [Proxy](#proxy)
+  - [Recover](#recover)
   - [Session](#session)
+  - [SSE](#sse)
 - [🔌 Addons](#-addons)
 - [📋 Migration guide](#-migration-guide)
 
 ## Dropping support for old Go versions
 
-Fiber `v3` requires Go `1.25` or later. Update your toolchain to `1.25+` before upgrading so the module `go` directive and standard library features align with the new minimum version.
+Fiber `v3` requires Go `1.26` or later. Update your toolchain to `1.26+` before upgrading so the module `go` directive and standard library features align with the new minimum version.
 
 ## 🚀 App
 
@@ -74,8 +76,21 @@ We have made several changes to the Fiber app, including:
   - `EnablePrefork` (previously `Prefork`)
   - `EnablePrintRoutes`
   - `ListenerNetwork` (previously `Network`)
-- **Trusted Proxy Configuration**: The `EnabledTrustedProxyCheck` has been moved to `app.Config.TrustProxy`, and `TrustedProxies` has been moved to `TrustProxyConfig.Proxies`.
+- **Trusted Proxy Configuration**: The `EnabledTrustedProxyCheck` has been moved to `app.Config.TrustProxy`, and `TrustedProxies` has been moved to `TrustProxyConfig.Proxies`. Additionally, `ProxyHeader` must be set to read client IPs from proxy headers (e.g., `X-Forwarded-For`).
 - **XMLDecoder Config Property**: The `XMLDecoder` property has been added to allow usage of 3rd-party XML libraries in XML binder.
+- **SkipUnmatchedRoutes Config Property**: Opt-in flag that answers requests with no matching route with `404`/`405` before the middleware chain runs. Note that middleware (loggers, static or catch-all responders) does not run for these requests; CORS preflight requests are exempt so cors middleware keeps working. Customize the responses via `ErrorHandler`.
+- **StreamRequestBody**: A `multipart/form-data` body is no longer parsed by the server before the handlers run, as if
+  `DisablePreParseMultipartForm` were set: the pre-parse ignored `BodyLimit` and stored an upload of any declared length
+  before a middleware could refuse it. `FormFile`, `MultipartForm` and `Bind().Form()` parse it on demand within
+  `BodyLimit`, so an app that takes larger uploads this way has to raise the limit or read `BodyStream()`. `Body()`,
+  `BodyRaw()` and `FormValue()` now read a streamed body within `BodyLimit` too and answer a larger one
+  `413 Request Entity Too Large` while no response body was written, and the body binders fail on it; only `BodyStream()` reads past the limit.
+  `Bind().All()` reads the body only when the request has a `Content-Type`. `net/http` handlers, registered directly or
+  through the adaptor, and `adaptor.ConvertRequest` answer a streamed body larger than `BodyLimit` with `413` as well,
+  and the cache middleware leaves a request whose streamed body is chunked or longer than `BodyLimit` uncached instead
+  of reading it to build the key. The logger's `${body}` and `${form:}` read it within `BodyLimit` too, without
+  changing the handler's response.
+- **Buffer sizes**: The default `ReadBufferSize` and `WriteBufferSize` are now `8192` bytes (they were `4096` in v2). The read buffer also limits the size of the request headers, so requests with larger headers or cookies are accepted by default. Set either field to keep a different size.
 
 ### New Methods
 
@@ -83,9 +98,11 @@ We have made several changes to the Fiber app, including:
 - **RegisterCustomConstraint**: Allows for the registration of custom constraints.
 - **NewWithCustomCtx**: Initialize an app with a custom context in one step.
 - **State**: Provides a global state for the application, which can be used to store and retrieve data across the application. Check out the [State](./api/state) method for further details.
+- **SharedState**: Introduces storage-backed app state for prefork-safe/multi-process coordination via `Config.SharedStorage`, with optional `Config.SharedStatePrefix` namespacing, codec-aware helpers (`SetJSON`, `SetMsgPack`, `SetCBOR`, `SetXML`, matching getters, and `WithContext` variants), empty-key no-op handling, and `Reset`/`Close` passthrough helpers.
 - **NewErrorf**: Allows variadic parameters when creating formatted errors.
 - **GetBytes / GetString**: Helpers that detach values only when `Immutable` is enabled and the data still references request or response buffers. Access via `c.App().GetString` and `c.App().GetBytes`.
 - **ReloadViews**: Lets you re-run the configured view engine's `Load()` logic at runtime, including guard rails for missing or nil view engines so development hot-reload hooks can refresh templates safely.
+- **Render**: Renders a template through the configured view engine to any `io.Writer`, applying `Config.ViewsLayout` unless you pass layouts, and returns `ErrNoViewEngineConfigured` when no engine is set. See [Render](./api/app.md#render).
 
 #### Custom Route Constraints
 
@@ -216,7 +233,17 @@ app.Listen(":444", fiber.ListenConfig{
 
 ### MIME Constants
 
-`MIMEApplicationJavaScript` and `MIMEApplicationJavaScriptCharsetUTF8` are deprecated. Use `MIMETextJavaScript` and `MIMETextJavaScriptCharsetUTF8` instead.
+`MIMEApplicationJavaScriptCharsetUTF8` has been removed. Use `MIMETextJavaScriptCharsetUTF8` instead. `MIMEApplicationJavaScript` is still defined, but prefer `MIMETextJavaScript` for new code.
+
+### Protocol error responses
+
+Requests that the server refuses before routing, because of how they are framed or which method they use, are answered as [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) and [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112) ask:
+
+- **`GETOnly`**: the `405 Method Not Allowed` sent for any other method now carries `Allow: GET, HEAD`, as every 405 must. Middleware registered with `Use` no longer runs for such a request: a handler that ends the chain, such as a proxy, used to carry out the method the client was told was not allowed.
+- **Unknown transfer coding**: a request whose `Transfer-Encoding` names a coding the server cannot decode (`gzip, chunked`, say) is answered `501 Not Implemented`; it used to be `400 Bad Request`, and the body no longer repeats the start of the request. A malformed message, such as a repeated `Transfer-Encoding` field or the field on an HTTP/1.0 request, is still `400`, and so is every one of these when `app.Server().SecureErrorLogMessage` is set, because fasthttp then no longer says which coding it saw.
+- **Status from the parser's error**: the status follows the error the parser reported, not text found anywhere in its message, so request bytes the message quotes, such as a malformed trailer, no longer turn a `400 Bad Request` into a `501` or a `408`.
+- **Middleware run for a refused request**: the body that middleware registered with `Use` wrote is dropped before the `ErrorHandler` runs, so an `ErrorHandler` that keeps a body, as `c.SendStatus` does, no longer sends a catch-all's answer with the refusal status, and `static` serves no file for such a request. Route handlers are skipped for it, and a guard registered as a route with them.
+- **`Content-Length` together with `Transfer-Encoding`**: the request is processed as before, by its `Transfer-Encoding` or, when the field says `identity`, which fasthttp ignores, by its `Content-Length`, and the connection is now closed after the response (`Connection: close`). The two fields are how a request-smuggling message looks, and the bytes behind it on the connection may belong to a request that another recipient framed differently. Fiber installs this check right before the server it starts begins to serve (`Listen`, `Listener`, `Test`), and keeps the `HeaderReceived` callback you set on `app.Server()` up to then, in `ListenConfig.BeforeServeFunc` too. A callback you set again between two starts is wrapped at the next one. A `fasthttp.Server` of your own that serves `app.Handler()` needs the same check in its own `HeaderReceived` callback.
 
 ## 🎣 Hooks
 
@@ -226,8 +253,8 @@ We have made several changes to the Fiber hooks, including:
   - `OnPreShutdown` - Executes before the server starts shutting down
   - `OnPostShutdown` - Executes after the server has shut down, receives any shutdown error
   - `OnPreStartupMessage` - Executes before the startup message is printed, allowing customization of the banner and info entries
-  - `OnPostStartupMessage` - Executes after the startup message is printed, allowing post-startup logic
-- Deprecated `OnShutdown` in favor of the new pre/post shutdown hooks
+  - `OnPostStartupMessage` - Executes after the startup message is printed or skipped, allowing post-startup logic
+- Replaced `OnShutdown` with the new pre/post shutdown hooks
 - Improved shutdown hook execution order and reliability
 - Added mutex protection for hook registration and execution
 
@@ -353,6 +380,48 @@ func main() {
 
 We have slightly adapted our router interface
 
+### Path normalization
+
+The router normalizes every request path before matching, as [RFC 3986 Section 6.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-6.2.2) describes. Percent-encoded unreserved characters are decoded, so `/%70rivate` is matched as `/private`; every other escape keeps its encoding with uppercase hex digits; and `.` and `..` segments are removed, so `/static/x/../private` and `/static/./private` are both matched as `/static/private`. Middleware mounted on a prefix therefore sees those spellings of a path under it, and the static middleware serves the file that same path names. An encoded slash (`%2F`) still does not split a segment, so `/static%2Fprivate` does not match `/static/private`, and empty segments are kept, so neither does `/static//private`. `UnescapePath` decodes every escape, as before. Decoding happens exactly once, so `/%2570rivate` never becomes `/private`. A stray `%` that begins no escape is kept as sent, unless an escape decoded after it would complete a new escape with it: `/%%370rivate` is matched as `/%2570rivate`, never as `/%70rivate`, while `/files/100%` and `/files/./100%` both give the parameter `100%`. A request target that is not a rooted path, the asterisk form of `OPTIONS *` or an absolute-form URI with an empty path, is routed as the rooted path fasthttp reports for it (`/*` and `/`), so root-level middleware runs for it as for any other request; so is the authority form fasthttp admits for `CONNECT`, whose `admin//secret` is routed as `/admin//secret`. `RoutePatternMatch` takes a path rather than a request target: it reads the empty string as `/` and answers `false` for any other string without a leading slash; before, `RoutePatternMatch("*", "/*")` was `true`.
+
+`c.Path()` returns the normalized path. `c.OriginalURL()` still returns the request target as the client sent it.
+
+### Path and method overrides
+
+After `c.Path(...)` or `c.Method(...)`, `c.Next()` continues with the routes registered after the current one that match the new path and method. Before, a handler mounted on a prefix, such as `app.Use("/v1", rewrite.New(...))` or `http.StripPrefix` through `adaptor.HTTPMiddleware`, or registered for a single method resumed at a position taken from another route list, and skipped routes registered after it, middleware included. A `Use` registered right after a route for a single method is no longer merged into the previous `Use` under the other methods, and a route is merged into the one before it on the same path only when both were registered for the same methods: `app.Get` after `app.All` or a multi-method `app.Add` on one path stays a route of its own, so `app.Stack()` can list one more route there.
+
+### Trailing slashes
+
+Without `StrictRouting`, a path of slashes alone, such as `//`, is matched as `/`, the way `/about//` is matched as `/about`. Before, it was matched as the empty path, which a root `app.Use` did not cover while a `/*` or `/:name?` route still answered it. A route registered as `//` is the root route now, and `//` also answers a `/` route. `c.Path()` still returns `//`.
+
+With `StrictRouting`, middleware registered with `Use` on `/users/` also runs for `/users`, which routes below it such as `/users/:id?` and `/users/*` answer. Before, a mounted app's own `Use` middleware, composed as `/users/`, and `Group("/users").Use("/", mw)` did not run for `/users` while such a route of theirs still answered it. `RemoveRoute("/users/")` still removes such middleware.
+
+### Optional parameters
+
+An optional parameter that ends at a single-character constant, such as `:month?-` or `:name?.`, no longer matches across a `/`. Before, `/api/:day-:month?-:year?` matched `/api/1-/-` with `month` set to `/`, and `/file/:name?.:ext` matched `/file/a/b.txt` with `name` set to `a/b`; both now return 404. A required parameter keeps its behavior: `/file/:name.:ext` still matches `/file/a/b.txt`. With `UnescapePath` on, `Route.URL`, `GetRouteURL` and `Redirect().Route` return `ErrRouteNotRepresentable` for a `/` in the value of such an optional parameter.
+
+### Mount prefixes
+
+The routes of a mounted app are re-parsed with the mount prefix as written. Before, they were re-parsed from its comparison key, which has the case folded and the escapes removed: an escaped literal such as `/v1\:internal` became a parameter, and a custom constraint with an upper-case name such as `/tenants/:id<tenantID>` was dropped, so the mounted routes answered paths that middleware on the same prefix did not cover. `Route.Path` of a mounted route now keeps the prefix's case and escapes, as it does for a route registered through a `Group`.
+
+### Wildcards and parameters in middleware prefixes
+
+A `Use`, `Group` or mount prefix whose only wildcard is followed only by literal text, such as `app.Use("/api/*/admin", mw)`, now covers every path in which that text ends a path segment, such as `/api/acme/admin/admins`, which it skipped before while `/api/:tenant/admin/:page` answered it; other greedy shapes in a prefix keep the v3.6.1 behavior, including the trailing slash with `StrictRouting`, so use a named parameter in the prefix and in the routes below it, as in `/api/:tenant/admin/:id`.
+
+Likewise, a prefix without wildcards whose last segment ends in a named parameter followed by literal text, such as `app.Use("/files/:name.json", mw)`, now covers `/files/a.json.json/raw`, which `/files/:name.json/raw` answered with `name` set to `a.json`; the parameter still ends at the first copy of the text when it is optional, has a constraint or shares its segment with another parameter.
+
+### Use with a sub-app
+
+`Use` panics when one call receives both handlers and a sub-app, as in `app.Use("/admin", auth, adminApp)`, on an `App`, a `Group` and a `Domain` router. Before, it mounted the sub-app and dropped the handlers without an error. Register them in separate calls: `app.Use("/admin", auth)`, then `app.Use("/admin", adminApp)`. It also panics on two sub-apps in one call, which mounted only the last, and on two path arguments, such as `app.Use("/admin", "/internal", auth)` or a path next to a `[]string`, which registered the handlers on only one of them. Pass several paths as one `[]string`.
+
+### Generated route URLs
+
+`Route.URL`, `GetRouteURL` and `Redirect().Route` percent-encode each parameter value with URL path-segment rules. A value is data, so a representable value composes the same URL under any configuration. Previously the value was written into the path as given: `a/b` under `/user/:name` produced `/user/a/b`, which matched no route; `a?b` produced `/user/a?b`, whose tail became a query and truncated the value; and `100%` produced `/user/100%`, which Go's own URL parser rejects. Greedy parameters (`*` and `+`) keep the `/` of the matched path tail.
+
+Because the value is data, one that already carries escapes is encoded again. With `UnescapePath` off, which is the default, `c.Params` returns the value as the request spelled it, so forwarding it into a generated URL turns `M%C3%BCller` into `M%25C3%25BCller`. Decode it first, or turn `UnescapePath` on.
+
+A value the router could not match back returns `ErrRouteNotRepresentable` instead of a URL: one that forms a `.` or `..` segment, which clients and the router remove (`/user/:name` with `..`), and, with `UnescapePath` on, a `/` in an ordinary single-segment parameter, which the router decodes before matching. Greedy parameters keep accepting slashes.
+
 ### Handler compatibility
 
 Fiber now ships with a routing adapter (see `adapter.go`) that understands native Fiber handlers alongside `net/http` and `fasthttp` handlers. Route registration helpers accept a required `handler` argument plus optional additional `handlers`, all typed as `any`, and the adapter transparently converts supported handler styles so you can keep using the ecosystem functions you're familiar with.
@@ -391,20 +460,20 @@ RouteChain(path string) Register
 <summary>Example</summary>
 
 ```go
-app.RouteChain("/api").RouteChain("/user/:id?")
-    .Get(func(c fiber.Ctx) error {
+app.RouteChain("/api").RouteChain("/user/:id?").
+    Get(func(c fiber.Ctx) error {
         // Get user
         return c.JSON(fiber.Map{"message": "Get user", "id": c.Params("id")})
-    })
-    .Post(func(c fiber.Ctx) error {
+    }).
+    Post(func(c fiber.Ctx) error {
         // Create user
         return c.JSON(fiber.Map{"message": "User created"})
-    })
-    .Put(func(c fiber.Ctx) error {
+    }).
+    Put(func(c fiber.Ctx) error {
         // Update user
         return c.JSON(fiber.Map{"message": "User updated", "id": c.Params("id")})
-    })
-    .Delete(func(c fiber.Ctx) error {
+    }).
+    Delete(func(c fiber.Ctx) error {
         // Delete user
         return c.JSON(fiber.Map{"message": "User deleted", "id": c.Params("id")})
     })
@@ -413,6 +482,66 @@ app.RouteChain("/api").RouteChain("/user/:id?")
 </details>
 
 You can find more information about `app.RouteChain` and `app.Route` in the API documentation ([RouteChain](./api/app#routechain), [Route](./api/app#route)).
+
+Named routes retrieved with `app.GetRoute(name)` also support `route.URL(params)` for generating relative URLs directly from the route definition, including parameter substitution for named, wildcard (`*`), and plus (`+`) segments.
+
+### Domain routing
+
+`Domain` creates a router scoped to a specific hostname pattern. Routes registered through the returned `Router` only match requests whose hostname (from `c.Hostname()`) matches the pattern. When `TrustProxy` is enabled and the proxy is trusted (as defined by [`TrustProxyConfig`](./api/fiber#trustproxyconfig)), the hostname may be derived from the `X-Forwarded-Host` header. Be sure to configure `TrustProxyConfig` to restrict which proxies are trusted and prevent header spoofing when enabling `TrustProxy`.
+
+The pattern can contain parameters prefixed with `:`, accessible via `fiber.DomainParam`.
+
+Routes for one path registered through different `Domain` patterns stay separate routes, each with its own name and automatic `HEAD` route, even when they are registered one after another; [`c.Endpoint()`](./api/ctx#endpoint) reports a `Domain` route only for a hostname its pattern matches.
+
+Domain routing has **zero performance impact** on routes that don't use it because the hostname check is applied as a handler wrapper, not a change to the core router.
+
+> **Note:** Because domain filtering happens at handler-execution time, Fiber's `405 Method Not Allowed` responses may advertise methods from domain-scoped routes even when the requesting host does not match. This is a known trade-off of the handler-wrapping approach.
+>
+> When mounting sub-applications via `Domain(...).Use(*fiber.App)`, routes are cloned at mount time. The same sub-app can safely be mounted on multiple domains, but routes added to the sub-app after mounting will not inherit domain filtering. Register all sub-app routes before mounting.
+
+```go
+Domain(host string) Router
+```
+
+<details>
+<summary>Example</summary>
+
+```go
+app := fiber.New()
+
+// Static domain
+app.Domain("api.example.com").Get("/users", func(c fiber.Ctx) error {
+    return c.SendString("API users")
+})
+
+// Domain with parameter
+app.Domain(":user.blog.example.com").Get("/", func(c fiber.Ctx) error {
+    user := fiber.DomainParam(c, "user")
+    return c.SendString(user + "'s blog")
+})
+
+// Domain with groups
+api := app.Domain("api.example.com")
+v1 := api.Group("/v1")
+v1.Get("/posts", listPosts)
+
+// Domain with middleware
+admin := app.Domain("admin.example.com")
+admin.Use(authMiddleware)
+admin.Get("/dashboard", dashboardHandler)
+
+// Mount sub-applications on domain routers
+subApp := fiber.New()
+subApp.Get("/users", listUsers)
+app.Domain("api.example.com").Use("/api", subApp)
+
+// Fallback for unmatched domains
+app.Get("/", func(c fiber.Ctx) error {
+    return c.SendString("default site")
+})
+```
+
+</details>
 
 ### Automatic HEAD routes for GET
 
@@ -451,6 +580,23 @@ app.Get("/health", handler) // HEAD /health now returns 405 unless you add it ma
 
 Auto-generated `HEAD` routes appear in tooling such as `app.Stack()` and cover the same routing scenarios as their `GET` counterparts, including groups, mounted apps, dynamic parameters, and static file handlers.
 
+Each automatic `HEAD` route runs where its `GET` route does, and every `GET` route gets its own, also when a path has several. An app that sets `DisableHeadAutoRegister` takes no automatic `HEAD` routes from the apps mounted into it either, plain, `Group` or `Domain` mounts alike, since a guard it registered with `Get` has no `HEAD` companion to run in front of them. Before, they ran after every `Use` handler, mounted app and explicit `HEAD` route, so a guard registered with `Get`, such as `app.Get("/admin/*", auth)` followed by `app.Use("/admin", adminApp)` or `app.Use(static.New(dir))`, did not run for `HEAD`, and a `GET` route followed by a catch-all `Use` answered `HEAD` with that handler. A route registered for `HEAD` alone still replaces the automatic ones of its path in the same app and `Domain` pattern. One on another `Domain` pattern or in a mounted app now keeps its place in the route order, behind the automatic route of a `GET` route registered before it. One registered for `GET` and `HEAD` together, with `All` or `Add`, answers only for itself. Two apps mounted on one prefix now both get their `HEAD` routes, and a sub-app that leaves `HEAD` out of its `RequestMethods` answers `HEAD` with `405` behind nested `Domain` mounts as well.
+
+### QUERY method (RFC 10008)
+
+Fiber now supports the HTTP `QUERY` method ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008.html)) as a first-class verb. `QUERY` is safe and idempotent like `GET`, but allows a request body for complex queries.
+
+```go title="Register a QUERY route"
+app := fiber.New()
+
+app.Query("/search", func(c fiber.Ctx) error {
+    // QUERY carries a request body, unlike GET.
+    return c.Send(c.Body())
+})
+```
+
+`Query` is available on `App`, `Group`, the route-chaining `Register` interface, and domain routers, plus the HTTP client (`Request.Query`, `Client.Query`, and the package-level `Query`). `fiber.IsMethodSafe` and `fiber.IsMethodIdempotent` both return `true` for `QUERY`, so middleware that keys off method safety (CSRF, idempotency, early data) treats it like the other safe methods. The cache middleware can cache `QUERY` responses when `QUERY` is added to `Config.Methods`; the default key generator folds the request body into the cache key so different bodies on the same URL do not collide.
+
 ### Middleware registration
 
 We have aligned our method for middlewares closer to [`Express`](https://expressjs.com/en/api.html#app.use) and now also support the [`Use`](./api/app#use) of multiple prefixes.
@@ -464,7 +610,7 @@ Registering a subapp is now also possible via the [`Use`](./api/app#use) method 
 
 ```go
 // register multiple prefixes
-app.Use(["/v1", "/v2"], func(c fiber.Ctx) error {
+app.Use([]string{"/v1", "/v2"}, func(c fiber.Ctx) error {
     // Middleware for /v1 and /v2
     return c.Next()
 })
@@ -497,12 +643,12 @@ The `app.Test()` method now allows users to customize their test configurations:
 ```go
 // Create a test app with a handler to test
 app := fiber.New()
-app.Get("/", func(c fiber.Ctx) {
+app.Get("/", func(c fiber.Ctx) error {
     return c.SendString("hello world")
 })
 
 // Define the HTTP request and custom TestConfig to test the handler
-req := httptest.NewRequest(MethodGet, "/", nil)
+req := httptest.NewRequest(fiber.MethodGet, "/", nil)
 testConfig := fiber.TestConfig{
     Timeout:       0,
     FailOnTimeout: false,
@@ -549,6 +695,33 @@ testConfig := fiber.TestConfig{
 }
 ```
 
+A request body of unknown length, such as an `*os.File` or an `io.Pipe` reader, is read and sent with its measured `Content-Length`, so it reaches the handler instead of failing with `cannot parse content-length` or being dropped.
+
+A request with a `TLS` state, such as `httptest.NewRequest` builds for an `https://` target, is served as a TLS connection, so `c.Scheme()` is `https` and `c.Secure()` is `true` in the handler. A test that sent an `https://` target and relied on plain HTTP behavior, such as a redirect to HTTPS or a missing `Strict-Transport-Security` header, now sees `https` and has to be adjusted.
+
+### Constraint System
+
+The internal constraint system has been unified into a single `ConstraintHandler` interface. Built-in and custom constraints are now treated uniformly through this interface, with an optional `ConstraintAnalyzer` phase for precomputation at route registration time.
+
+```go
+type ConstraintHandler interface {
+    Name() string
+    Execute(param string, data []any) bool
+}
+
+type ConstraintAnalyzer interface {
+    Analyze(args []string) ([]any, error)
+}
+```
+
+Key improvements:
+
+- **Zero per-request parsing**: `strconv.Atoi`, `time.Parse` layouts, and regex compilation happen once at registration via `Analyze()`, not on every request.
+- **Single dispatch**: The previous `TypeConstraint` bitmask switch has been replaced by a single `handler.Execute()` call.
+- **Backward compatible**: Existing `CustomConstraint` implementations continue to work unchanged. The `CustomConstraint` interface, `RegisterCustomConstraint()` API, and `CheckConstraint()` method are all preserved. `RegisterCustomConstraint()` still takes a `CustomConstraint`, which Fiber wraps in a `ConstraintHandler` itself; a `ConstraintHandler` cannot be registered directly.
+
+The `TypeConstraint` type, `Constraint.ID`, and `Constraint.RegexCompiler` fields are retained but deprecated.
+
 ## 🧠 Context
 
 ### New Features
@@ -567,7 +740,7 @@ testConfig := fiber.TestConfig{
 - **Port**: Similar to Express.js, returns the port number of the request.
 - **IsProxyTrusted**: Checks the trustworthiness of the remote IP.
 - **Reset**: Resets context fields for server handlers.
-- **Schema**: Similar to Express.js, returns the schema (HTTP or HTTPS) of the request.
+- **Scheme**: Similar to Express.js, returns the scheme (`http` or `https`) of the request.
 - **SendEarlyHints**: Sends `HTTP 103 Early Hints` status code with `Link` headers so browsers can preload resources while the final response is being prepared.
 - **SendStream**: Similar to Express.js, sends a stream as the response.
 - **SendStreamWriter**: Sends a stream using a writer function.
@@ -576,6 +749,7 @@ testConfig := fiber.TestConfig{
 - **Value**: For implementing `context.Context`. Returns request-scoped value from Locals.
 - **Context()**: Returns a `context.Context` that can be used outside the handler.
 - **SetContext**: Sets the base `context.Context` returned by `Context()` for propagating deadlines or values.
+- **SetLocal**: Stores a request-scoped value like `Locals(key, value)`, without building the one-element slice the variadic call allocates through the `Ctx` interface.
 - **ViewBind**: Binds data to a view, replacing the old `Bind` method.
 - **CBOR**: Introducing [CBOR](https://cbor.io/) binary encoding format for both request & response body. CBOR is a binary data serialization format which is both compact and efficient, making it ideal for use in web applications.
 - **MsgPack**: Introducing [MsgPack](https://msgpack.org/) binary encoding format for both request & response body. MsgPack is a binary serialization format that is more efficient than JSON, making it ideal for high-performance applications.
@@ -589,8 +763,9 @@ testConfig := fiber.TestConfig{
 - **AcceptLanguage**: Returns the `Accept-Language` request header.
 - **AcceptEncoding**: Returns the `Accept-Encoding` request header.
 - **HasHeader**: Reports whether the request includes a header with the given key.
+- **HasHeaderValue**: Reports whether a comma-separated request header such as `Cache-Control` lists a member on any of its field lines, case-insensitively and respecting quoted arguments.
 - **MediaType**: Returns the MIME type from the `Content-Type` header without parameters.
-- **Charset**: Returns the `charset` parameter from the `Content-Type` header.
+- **Charset**: Returns the `charset` parameter from the `Content-Type` header, or an empty string when the first `charset` value is not a valid token.
 - **IsJSON**: Reports whether the `Content-Type` header is JSON.
 - **IsForm**: Reports whether the `Content-Type` header is form-encoded.
 - **IsMultipart**: Reports whether the `Content-Type` header is multipart form data.
@@ -599,11 +774,51 @@ testConfig := fiber.TestConfig{
 - **AcceptsXML**: Reports whether the `Accept` header allows XML.
 - **AcceptsEventStream**: Reports whether the `Accept` header allows `text/event-stream`.
 - **Matched**: Detects when the current request path matched a registered route.
+- **Endpoint**: Looks ahead to the route that will handle the request, without advancing the handler chain, so global middleware can read its `Path` or `Name` before calling `Next`. It returns `nil` when no route will run. A route registered through `Domain` is reported only for a hostname its pattern matches.
 - **IsMiddleware**: Indicates if the current handler was registered as middleware.
 - **HasBody**: Quickly checks whether the request includes a body.
 - **OverrideParam**: Overwrites the value of an existing route parameter, or does nothing if the parameter does not exist
 - **IsWebSocket**: Reports if the request attempts a WebSocket upgrade.
 - **IsPreflight**: Identifies CORS preflight requests before handlers run.
+- **ID**: Returns the connection-unique identifier of the request, without depending on a header.
+- **StartTime** / **Elapsed**: Report when the server began handling the request and how long it has taken so far.
+- **LocalAddr** / **RemoteAddr**: Return the connection's addresses as `net.Addr`, where `IP` returns a string.
+- **Hijack** / **Hijacked**: Take over the connection after the response is sent, and report whether that has happened.
+- **RouteName**: Returns the name of the route currently executing.
+- **IsFinal**: Reports whether the current handler is the last one of a matched, non-middleware route.
+- **MountPath**: Returns the prefix the sub-app owning the current route was mounted under.
+- **Error**: Builds a `*fiber.Error` with the given status code, so a handler can reject a request in one line.
+- **GetAll**: Returns every field line of a request header, where `Get` returns only the first.
+- **GetHeaders**: Returns all headers as a map from name to every value. On `Ctx` and `Req` it returns the request headers, like `GetReqHeaders`; on `Res` it returns the response headers, like `GetRespHeaders`.
+- **Authorization** / **Bearer**: Split the `Authorization` header into scheme and credentials, and read a `Bearer` token.
+- **Origin**: Returns the `Origin` request header.
+- **ContentLength**: Returns the value of the `Content-Length` request header; `Res` carries one for the response.
+- **ContentType**: Returns the `Content-Type` request header with its parameters; `Res` carries one for the response.
+- **BodyStream**: Returns the request body as a stream when `StreamRequestBody` is enabled.
+- **URI**: Returns the parsed `*fasthttp.URI` of the request.
+- **CookieNames** / **AllCookies**: Enumerate the cookies the client sent.
+- **IfNoneMatch** / **IfModifiedSince**: Read the conditional-request headers, parsed.
+- **IsSafe** / **IsIdempotent**: Classify the request method per RFC 9110.
+- **Add**: Appends a response header as a new field line, where `Append` folds values into one.
+- **Del**: Removes a response header.
+- **StatusCode**: Returns the status code set on the response, the read side of `Status`.
+- **Body** (on `Res`): Returns the response body buffered so far.
+- **ResetBody**: Discards the response body, keeping the status and headers.
+- **Written**: Reports whether anything has been written to the response body yet.
+- **ContentType**: Returns the `Content-Type` response header, the read side of `Type`.
+- **GetCookie** / **GetCookies** (on `Res`): Read back the cookies the response is set to send.
+- **NoContent**: Replies `204 No Content`, discarding any body and the `Content-Type`.
+
+### Req and Res Method Placement
+
+The request helpers listed above are defined on `Req`, so they are reachable both as `c.UserAgent()` and as
+`c.Req().UserAgent()`. This also applies to `Path`, `Secure`, `XHR`, `HasBody`, `IsWebSocket`, `IsPreflight`
+and the `Accept`/`Content-Type` helpers, which are request methods and are now on `Req` as well.
+
+`Req` and `Res` each define a `Get`, `GetHeaders`, `Body`, `ContentLength` and `ContentType`. On `Ctx` these
+resolve to the **request**; use `c.Res().Get()`, `c.Res().GetHeaders()`, `c.Res().Body()`,
+`c.Res().ContentLength()` and `c.Res().ContentType()` for the response. The response cookies are `c.Res().GetCookies()`, named apart from `Req.Cookies` so that a
+`Ctx` keeps satisfying `fiber.Res`.
 
 ### Removed Methods
 
@@ -624,13 +839,90 @@ testConfig := fiber.TestConfig{
 ### Changed Methods
 
 - **Bind**: Now used for binding instead of view binding. Use `c.ViewBind()` for view binding.
-- **Format**: Parameter changed from `body interface{}` to `handlers ...ResFmt`.
+- **Format**: Parameter changed from `body any` to `handlers ...ResFmt`.
 - **Redirect**: Use `c.Redirect().To()` instead.
-- **SendFile**: Now supports different configurations using a config parameter.
+- **SendFile**: Now supports different configurations using a config parameter. The file name is taken literally, as `os.Open` takes it: it is no longer percent-decoded, and a `?` or `#` in it is part of the name, so drop any `url.PathEscape` applied to it. An encoded separator carried by a route parameter (`..%2Fsecret.txt`) no longer decodes into a step out of the directory the name was joined to, a directory named without a trailing slash is not found instead of redirected to its filesystem path, and a name holding an ASCII control byte is not found. With `UnescapePath` off, a route parameter keeps its escapes, so a handler that passes one to `SendFile` must decode it first and confine the result, or enable `UnescapePath` (see the [migration guide](#-context-1)). `Download` follows, since it serves through `SendFile`. An app keeps at most 64 file handlers, one per distinct config; a config that has none once that many exist is served without the file cache (see [`SendFile`](./api/ctx.md#sendfile)).
 - **Attachment and Download**: Non-ASCII filenames now use `filename*` as
   specified by [RFC 6266](https://www.rfc-editor.org/rfc/rfc6266) and
-  [RFC 8187](https://www.rfc-editor.org/rfc/rfc8187).
+  [RFC 8187](https://www.rfc-editor.org/rfc/rfc8187). The `filename` parameter
+  is now emitted as a plain RFC 9110 quoted-string instead of being
+  URL-encoded: `c.Download("report 2024.txt")` produces
+  `filename="report 2024.txt"` (previously `filename="report+2024.txt"`), with
+  quotes and backslashes escaped as quoted-pairs, so browsers save files under
+  their real names.
+- **Get, GetReqHeader and the request header helpers**: Field names are now matched case-insensitively, as
+  [RFC 9110, Section 5.1](https://www.rfc-editor.org/rfc/rfc9110#section-5.1) requires. This is only observable
+  under `DisableHeaderNormalizing: true`, where the store keeps the spelling the peer sent: with a
+  `x-test: yes` line, `c.Get("X-Test")` returned `""` in v2 and returns `"yes"` now. The default configuration
+  is unchanged, because fasthttp canonicalizes the names on the way in.
+- **Request header helpers and trailers**: Fiber drops the trailer section of a chunked request and the
+  `Trailer` field announcing it as the request arrives
+  ([RFC 9112, Section 7.1.2](https://www.rfc-editor.org/rfc/rfc9112#section-7.1.2)), so `Get`, `GetReqHeader`,
+  `GetAll`, `HasHeader`, `HasHeaderValue`, `UserAgent`, `Referer`, `Origin`, `XHR` and the middleware reading
+  request headers no longer return a field sent there, and a header your code writes under a name the client
+  announced is returned like any other. `c.Request().Header` and the `r.Trailer` of an adapted `net/http`
+  handler no longer hold those fields either. A request that names more than 16 trailer fields before the handlers
+  run is refused with `431 Request Header Fields Too Large`. With `StreamRequestBody`, the trailer section arrives
+  at the end of the body and is dropped once the body has been read; when it names more than 16 fields, reading
+  the body also fails with `ErrRequestHeaderFieldsTooLarge`.
+- **Fresh()**: `If-None-Match`, `If-Modified-Since` and `Cache-Control` are read case-insensitively for the
+  same reason, so `c.Fresh()` can now return `true` where it returned `false` under `DisableHeaderNormalizing`.
+  That changes which requests are answered `304 Not Modified`.
+- **SendStatus()**: For a status that cannot carry a body — `1xx`, `204`, `205` and `304` — the response body and
+  any `Content-Length` already set are now dropped.
+  [RFC 9110, Section 8.6](https://www.rfc-editor.org/rfc/rfc9110#section-8.6) requires that for `1xx` and `204`;
+  Fiber also does it for `205` and `304`. `c.Set(fiber.HeaderContentLength, "42")`
+  followed by `c.SendStatus(204)` previously put `Content-Length: 42` on the wire, along with a `Content-Type`
+  fasthttp emits for a declared length; neither line is sent now. `205 Reset Content` still sends
+  `Content-Length: 0`: it has no content ([Section 15.3.6](https://www.rfc-editor.org/rfc/rfc9110#section-15.3.6)),
+  but unlike `1xx`, `204` and `304` it still has to be framed
+  ([RFC 9112, Section 6.3](https://www.rfc-editor.org/rfc/rfc9112#section-6.3)).
+  Unlike the two above, this applies under the default configuration. A streamed body counts as a body, so
+  `SendStatus` leaves it unread instead of reading it into memory to check its length.
+- **Body()**: A `Content-Encoding` that cannot be undone sets `415`, `501` or `413` only while the response has no
+  body yet. A middleware that reads `c.Body()` after `c.Next()`, such as the logger's `${body}` tag, no longer
+  replaces the status the handler sent.
+- **AcceptsEncodings()**: Follows [RFC 9110, Section 12.5.3](https://www.rfc-editor.org/rfc/rfc9110#section-12.5.3).
+  `identity`, the absence of a coding, is now acceptable when the `Accept-Encoding` header does not list it, unless
+  the header excludes it with `identity;q=0` or `*;q=0`: `c.AcceptsEncodings("br", "identity")` answers `"identity"`
+  for `Accept-Encoding: gzip`, where it answered `""`. An unlisted `identity` ranks below every coding the header does
+  list. A header that is present but empty now accepts only `identity`; it used to read as absent, which accepts the
+  first offer.
+- **Status()**: A code outside `100` to `999` cannot be written as a status line
+  ([RFC 9112, Section 4](https://www.rfc-editor.org/rfc/rfc9112#section-4)). `c.Status(99)` and `c.Status(1000)` used to
+  put a malformed line on the wire that clients refuse, and `c.Status(0)` or a negative code put `200 OK` there. They
+  now answer `500 Internal Server Error` and log the code. `SendStatus`, `Redirect().Status` and an error built with
+  `fiber.NewError` go through `Status`, so they follow. Codes from `600` to `999` are still sent as given.
+- **Cookie()**: A value with a space or a comma is now written in double quotes, as `net/http` does, because neither is
+  a `cookie-octet` ([RFC 6265, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc6265#section-4.1.1)).
+  `c.Cookie(&fiber.Cookie{Name: "n", Value: "hello world"})` used to send `n=hello world` and sends `n="hello world"`
+  now; the quotes frame the value, and `Cookies` and `GetCookie` return `hello world`. A value that already starts and
+  ends with a double quote is accepted and written quoted instead of being dropped as invalid. Values with a semicolon,
+  an inner double quote, a backslash, a control character or a non-ASCII character are still refused. Percent-encode a
+  value that has to pass through a strict parser.
+- **SendFile() and the static middleware, with `ByteRange`**: The file server answered one byte range and nothing
+  else. Fiber now applies the rest of [RFC 9110, Section 13.1.5 and Section 14.2](https://www.rfc-editor.org/rfc/rfc9110#section-14.2)
+  around it. A request for several ranges used to get `416`; it gets the whole file, as does one with a range unit the
+  server does not know and one with a method other than `GET` (a `HEAD` or `POST` with a `Range` used to get `206`).
+  The unit is case-insensitive (`Bytes=0-4` used to get `416`). `If-Range` was ignored, so a resumed download was
+  spliced onto a file that had changed; the range is now served only when the date in `If-Range` is exactly the file's
+  `Last-Modified` (and at least two seconds old), and the whole file is sent otherwise.
+- **Body()**: A `Content-Encoding` list of more than five codings, `identity` members included, is now answered
+  `415 Unsupported Media Type` before anything is decoded, since `BodyLimit` bounds each decoding step but not their
+  number. A chain of codings is now undone without replacing the request body, so slices returned by an earlier
+  `BodyRaw()` or by `Body()` stay valid for the whole handler, also under `ReduceMemoryUsage` and behind the adaptor
+  middleware.
+- **Render()**: The `fiber.Map` passed as `bind` is no longer modified. `ViewBind` values and, with
+  `PassLocalsToViews`, the `Locals` used to be written into it, so a map kept across requests carried the first
+  request's values into every later render, and a nil `fiber.Map` panicked. They are now merged into a copy, and a
+  key in the passed map still wins. Without a `Views` engine, `Render` now parses a copy of the template file, so
+  the output no longer depends on `Config.Immutable`.
 - **Context()**: Renamed to `RequestCtx()` to access the underlying `fasthttp.RequestCtx`.
+- **Host()**: Behind a trusted proxy, empty `X-Forwarded-Host` elements are skipped and repeated field lines are read in the order they were received, so `,example.com` answers `example.com`, and a value with no host left falls back to the `Host` header instead of an empty string. See [`Ctx.Host`](./api/ctx.md#host).
+- **IP()**: When `EnableIPValidation` is `true` and `TrustProxyConfig` is set, `c.IP()` now walks the `X-Forwarded-For` chain from right to left and returns the first non-trusted IP, instead of the leftmost syntactically valid IP. This closes an IP-spoofing vector where an attacker could prepend a fake address and have it returned by `c.IP()`. An entry that is not an IP address, such as `203.0.113.50:51234` or `unknown`, ends the walk, and `c.IP()` returns the last trusted proxy passed or the TCP remote address instead of an entry further left; a proxy that appends `IP:port` entries has to send the bare address. Repeated field lines of the proxy header are joined in the order they were received. Apps with `EnableIPValidation = false` (the default) are unaffected. See [`Ctx.IP`](./api/ctx.md#ip) and the [reverse proxy guide](./guide/reverse-proxy.md#getting-the-real-client-ip-address) for details.
+- **IPs()**: Empty `X-Forwarded-For` elements are now ignored after trimming spaces and tabs, even when `EnableIPValidation` is disabled. Repeated commas and whitespace-only elements no longer produce empty strings in the returned slice. See [`Ctx.IPs`](./api/ctx.md#ips).
+- **Links()**: Adds to a `Link` header that is already set, as `res.links` does in Express, instead of replacing it. A second call, or one after `SendEarlyHints`, keeps the earlier links; call `c.Del(fiber.HeaderLink)` first to replace them. See [`Ctx.Links`](./api/ctx.md#links).
+- **Scheme()**: Behind a trusted proxy, the scheme headers are ranked instead of read in the order they arrive: `X-Forwarded-Proto` wins over `X-Forwarded-Protocol`, then `X-Forwarded-Ssl: on`, then `X-Url-Scheme`, so a client can no longer override the proxy's `X-Forwarded-Proto` with one of the others. A proxy that sets only a lower-ranked header must drop the ones above it. Empty elements of an `X-Forwarded-Proto` or `X-Forwarded-Protocol` list are skipped, so `,https` announces `https`. See the [reverse proxy guide](./guide/reverse-proxy.md#scheme-and-host-behind-a-proxy).
 
 ### SendEarlyHints
 
@@ -653,7 +945,7 @@ Older HTTP/1.1 clients may ignore these interim responses or handle them inconsi
 In v3, we introduced support for buffered streaming with the addition of the `SendStreamWriter` method:
 
 ```go
-func (c Ctx) SendStreamWriter(streamWriter func(w *bufio.Writer))
+func (c Ctx) SendStreamWriter(streamWriter func(w *bufio.Writer)) error
 ```
 
 With this new method, you can implement:
@@ -663,7 +955,7 @@ With this new method, you can implement:
 - Live data streaming
 
 ```go
-app.Get("/sse", func(c fiber.Ctx) {
+app.Get("/sse", func(c fiber.Ctx) error {
     c.Set("Content-Type", "text/event-stream")
     c.Set("Cache-Control", "no-cache")
     c.Set("Connection", "keep-alive")
@@ -690,7 +982,7 @@ You can find more details about this feature in [/docs/api/ctx.md](./api/ctx.md)
 In v3, we introduced support to silently terminate requests through `Drop`.
 
 ```go
-func (c Ctx) Drop()
+func (c Ctx) Drop() error
 ```
 
 With this method, you can:
@@ -721,7 +1013,7 @@ You can find more details about this feature in [/docs/api/ctx.md](./api/ctx.md)
 In v3, we introduced a new method to match the Express.js API's `res.end()` method.
 
 ```go
-func (c Ctx) End()
+func (c Ctx) End() error
 ```
 
 With this method, you can:
@@ -734,7 +1026,7 @@ With this method, you can:
 app.Use(func (c fiber.Ctx) error {
     err := c.Next()
     if err != nil {
-        log.Println("Got error: %v", err)
+        log.Printf("Got error: %v", err)
         return c.SendString(err.Error()) // Will be unsuccessful since the response ended below
     }
     return nil
@@ -743,8 +1035,8 @@ app.Use(func (c fiber.Ctx) error {
 app.Get("/hello", func (c fiber.Ctx) error {
     query := c.Query("name", "")
     if query == "" {
-        c.SendString("You don't have a name?")
-        c.End() // Closes the underlying connection
+        _ = c.SendString("You don't have a name?")
+        _ = c.End() // Closes the underlying connection; errors intentionally ignored
         return errors.New("No name provided")
     }
     return c.SendString("Hello, " + query + "!")
@@ -763,15 +1055,19 @@ Fiber v3 introduces a new binding mechanism that simplifies the process of bindi
 - Support for custom binders and constraints.
 - Improved error handling and validation.
 - Support multipart file binding for `*multipart.FileHeader`, `*[]*multipart.FileHeader`, and `[]*multipart.FileHeader` field types.
-- Support for unified binding (`Bind().All()`) with defined precedence order: (URI -> Body -> Query -> Headers -> Cookies). [Learn more](./api/bind.md#all).
+- Support for unified binding (`Bind().All()`) with defined precedence order: (URI -> Body -> Query -> Headers -> Cookies). A struct can customize the order for all its fields with one `binding_source` tag on any top-level field. [Learn more](./api/bind.md#all).
 - Support MsgPack binding for request body.
+- Support `map[string]T` struct fields in query and form binding: `attributes[color]=red` or `attributes.color=red` fills `Attributes map[string]string`, and maps of slices keep repeated values. [Learn more](./api/bind.md#map-fields).
+- With `EnableSplittingOnParsers`, the header and response header binders read a comma-separated value as an HTTP list: the spaces and tabs around each element are removed and empty elements are skipped, so `X-Ids: 1, 2` binds `[]int{1, 2}`. This also applies to a `map[string][]string`, whose elements no longer keep a leading space. [Learn more](./api/bind.md#header).
+
+A key bound into a struct can have at most 64 segments (`items[0][sku]` has three). A deeper key fails the bind with `binder.ErrKeyTooDeep`; map destinations are not limited. In a struct with a slice of structs inside a slice element or below a field of its own type, an index that can grow such a slice, such as the `3` in `items[0][variants][3][sku]`, counts as its value plus one elements of the largest such slice element, and keys that add up to more than 8 MiB fail the bind with `binder.ErrTooManyElements`. [Learn more](./api/bind.md#nested-and-array-form-fields).
 
 <details>
 <summary>Example</summary>
 
 ```go
 type User struct {
-    ID    int    `params:"id"`
+    ID    int    `uri:"id"`
     Name  string `json:"name"`
     Email string `json:"email"`
 }
@@ -797,7 +1093,7 @@ Fiber v3 introduces a new shared `extractors` package that consolidates value ex
 
 - **Unified API**: Single package for extracting values from headers, cookies, query parameters, form data, and URL parameters
 - **Chain Logic**: Built-in fallback mechanism to try multiple extraction sources in order
-- **Source Awareness**: Source inspection capabilities for security-sensitive operations
+- **Source Awareness**: Source inspection for security-sensitive operations: `Resolve` reports which source produced a value, and `Extractor.Walk` and `Extractor.Contains` inspect every extractor of a chain
 - **Type Safety**: Strongly typed extraction with proper error handling
 - **Performance**: Optimized extraction functions with minimal overhead
 
@@ -868,6 +1164,10 @@ app.Get("/new", func(c fiber.Ctx) error {
 
 </details>
 
+### Disabling flash messages
+
+Flash messages travel in the `fiber_flash` cookie, so only a client that keeps cookies across the redirect (a browser, typically) receives them, and every request is scanned for the cookie. Deployments whose clients keep no cookies can turn the feature off with `fiber.Config{DisableFlashMessages: true}`: `Redirect().With` and `WithInput` then set no cookie, `Messages` and `OldInput` report nothing, and the scan is skipped.
+
 ### Changed behavior
 
 :::info
@@ -892,12 +1192,12 @@ cc := client.New().
     SetBaseURL("https://api.service.local").
     AddHeader("Authorization", "Bearer <token>").
     SetTimeout(5 * time.Second).
-    SetPathParam("tenant", "acme")
+    SetPathParam("tenant", "acme").
+    SetDisablePathNormalizing(true)
 
 resp, err := cc.Get("/users/:tenant/:id", client.Config{
-    PathParam:              map[string]string{"id": "42"},
-    Param:                  map[string]string{"include": "profile"},
-    DisablePathNormalizing: true,
+    PathParam: map[string]string{"id": "42"},
+    Param:     map[string]string{"include": "profile"},
 })
 if err != nil {
     panic(err)
@@ -906,11 +1206,41 @@ defer resp.Close()
 fmt.Println(resp.StatusCode(), resp.String())
 ```
 
+:::caution
+A path parameter value now fills exactly one path segment. A value holding `/`
+or `\`, a value that is exactly `.` or `..`, an empty value, and one of those
+followed by `;` parameters, such as `..;`, are rejected with
+`ErrPathParamInPath`; a value substituted into the host must already be a
+valid host or the request fails with `ErrPathParamInHost`. Previously such a
+value was pasted in unchanged, so `SetPathParam("id", "../../admin")` on
+`/api/:id` quietly sent the request to `/admin`. Call
+`SetDisablePathNormalizing(true)` on the client to send a multi-segment value on
+purpose (for a client from `NewWithClient`, create the fasthttp client with
+`DisablePathNormalizing: true` as well); the setting on a single request only
+counts for a client that already sends paths as written. `.`, `..` and an empty
+value stay rejected either way, with or without `;` parameters, because a server
+resolves a dot segment and may merge slashes.
+:::
+
+:::note
+`Debug()` logs the raw request and response after each response through the
+client's logger, which is Fiber's default logger unless `SetLogger` chose
+another one. The text is logged as it is, `Authorization` and `Cookie` headers
+and bodies included. A request with no referer set carries no `Referer` header;
+it used to carry an empty one.
+:::
+
 ### Fasthttp transport integration
 
 - `client.NewWithHostClient` and `client.NewWithLBClient` allow you to plug existing `fasthttp` clients directly into Fiber while keeping retries, redirects, and hook logic consistent.
 - Dialer, TLS, and proxy helpers now update every host client inside a load balancer, so complex pools inherit the same configuration.
-- The Fiber client exposes `Do`, `DoTimeout`, `DoDeadline`, and `CloseIdleConnections`, matching the surface area of the wrapped fasthttp transports.
+- The Fiber client exposes `Do`, `DoTimeout`, `DoDeadline`, `DoRedirects`, and `CloseIdleConnections`, matching the surface area of the wrapped fasthttp transports.
+- Redirects are off by default (`MaxRedirects` is `0`). The `Request` methods follow them for `GET`, `HEAD` and `QUERY` requests only, while `Client.DoRedirects` follows any method. A redirect to a host that is neither the original hostname (on any port) nor one of its subdomains drops the credentials of the original request (`Authorization`, `Proxy-Authorization`, `Cookie` and related headers), and a redirect from HTTPS to HTTP fails with `client.ErrRedirectDowngrade`. Headers named with `Client.SetRedirectSensitiveHeaders`, `Request.SetRedirectSensitiveHeaders` or `Config.RedirectSensitiveHeaders` are dropped with them, and all of them are removed whatever case they are stored under; every other header is forwarded. A redirect that drops the body drops the request's trailer section with it, instead of sending its fields to the target as header lines, and fails with `client.ErrRedirectTrailers` when that section announces more than 16 names. With a retry configuration, a chain that fails is retried from the original request.
+- A client from `client.New`, the default client behind `client.Get` and the other package-level helpers included, buffers a response body of at most 100 MiB and fails a larger one with `fasthttp.ErrBodyTooLarge`. `SetMaxResponseBodySize` changes the limit, and `SetStreamResponseBody(true)` reads a body without buffering it. A wrapped `fasthttp` client keeps its own `MaxResponseBodySize`.
+- A timeout, set with `SetTimeout`, `Config.Timeout` or a context deadline, now bounds the transport as well as the caller: every attempt, retry and redirect hop gets what is left of it, the connection is closed when it passes, and retries stop once the call is over. On a client from `client.New` it also bounds the TLS handshake. With response streaming the deadline also ends reads from `Response.BodyStream()`, so leave it unset for a long-lived stream.
+- A canceled context, with or without a deadline, ends the exchange of a client from `client.New` at the transport too, unless the response is streamed: the connection the request was using is closed, so the goroutine and the connection no longer wait for a server that never answers once the connection is open; a dial still in progress runs to its end (3 seconds for the built-in dialer) and its connection is then closed. With `SetStreamResponseBody(true)`, and on a wrapped `fasthttp` client, the caller returns at once while the exchange ends on its own, as before; a timeout or deadline still bounds it, so give such requests one.
+- A `Request` sent again picks its cookies anew: it no longer carries the cookie jar's cookies for its previous URL or a cookie deleted or expired since, and a cookie written straight to `RawRequest` before the send is dropped. The cookie jar drops a cookie without a name and trims whitespace around a name, and only a host name matches a cookie `Domain` by suffix: an IP address, with or without an IPv6 zone, matches only itself.
+- `SetParam`, `SetParams`, `SetFormData` and `SetFormDataWithMap` on a `Request`, `SetParam`, `SetParams` and `SetHeader` on the `Client`, and `QueryParam.Set` and `FormData.Set` replace every value stored under the key, not only the first, so a value added before with `AddParam`, `AddFormData` or `AddHeader` is no longer sent next to the new one. The key moves to the end of the query string or form body.
 
 ## 🧰 Generic functions
 
@@ -918,11 +1248,14 @@ Fiber v3 introduces new generic functions that provide additional utility and fl
 
 ### New Generic Functions
 
+- **StoreInContext**: Stores request-scoped values in both `c.Locals()` and the request `context.Context`, so the same value can be read through middleware `FromContext` helpers and direct locals access.
 - **Convert**: Converts a value with a specified converter function and default value.
 - **Locals**: Retrieves or sets local values within a request context.
 - **Params**: Retrieves route parameters and can handle various types of route parameters.
 - **Query**: Retrieves the value of a query parameter from the request URI and can handle various types of query parameters.
 - **GetReqHeader**: Returns the HTTP request header specified by the field and can handle various types of header values.
+
+`fiber.Config.PassLocalsToContext` is now available to control whether `StoreInContext` also synchronizes values with request `context.Context` for Fiber-backed contexts. The default is `false` for backward compatibility. `ValueFromContext` continues reading Fiber-backed values from `c.Locals()`.
 
 ### Example
 
@@ -1121,7 +1454,9 @@ Fiber v3 introduces a new feature called Services. This feature allows developer
 package main
 
 import (
-    "strconv"
+    "context"
+    "log"
+
     "github.com/gofiber/fiber/v3"
 )
 
@@ -1164,6 +1499,8 @@ func main() {
     app := fiber.New(*cfg)
 
     // ...
+
+    log.Fatal(app.Listen(":3000"))
 }
 ```
 
@@ -1193,9 +1530,11 @@ INFO Total process count:       1
 
 </details>
 
+See [Services](./api/services.md) for the configuration and the startup and shutdown lifecycle.
+
 ## 📃 Log
 
-`fiber.AllLogger[T]` interface now has a new generic type parameter `T` and a method called `Logger`. This method can be used to get the underlying logger instance from the Fiber logger middleware. This is useful when you want to configure the logger middleware with a custom logger and still want to access the underlying logger instance with the appropriate type.
+The `log.AllLogger[T]` interface (package `github.com/gofiber/fiber/v3/log`) now has a generic type parameter `T` and a method called `Logger`. This method returns the underlying logger instance. This is useful when you register a custom logger with `log.SetLogger` and still want to access the underlying logger with its concrete type.
 
 You can find more details about this feature in [/docs/api/log.md](./api/log.md#logger).
 
@@ -1262,7 +1601,15 @@ When used with the Logger middleware, the recommended approach is to use the `Cu
 
 The adaptor middleware has been significantly optimized for performance and efficiency. Key improvements include reduced response times, lower memory usage, and fewer memory allocations. These changes make the middleware more reliable and capable of handling higher loads effectively. Enhancements include the introduction of a `sync.Pool` for managing `fasthttp.RequestCtx` instances and better HTTP request and response handling between net/http and fasthttp contexts.
 
-Incoming body sizes now respect the Fiber app's configured `BodyLimit` (falling back to the default when unset) when running Fiber from `net/http` through the adaptor, returning `413 Request Entity Too Large` for oversized payloads.
+Incoming body sizes now respect the Fiber app's configured `BodyLimit` (falling back to the default when unset) when running Fiber from `net/http` through the adaptor, returning `413 Request Entity Too Large` for oversized payloads. `FiberHandler` and `FiberHandlerFunc` run the handler on a fresh app, so they always apply the default limit; pass your own app to `FiberApp` to configure it.
+
+The adaptor also propagates the request's protocol version, normalized to Fiber's convention (`HTTP/2.0` → `HTTP/2`, `HTTP/3.0` → `HTTP/3`), so `c.Protocol()` reports the real version instead of always `HTTP/1.1`. Interim responses such as `SendEarlyHints`' `103` are silently skipped through the adaptor — there is no client connection to write them to — while the `Link` headers still reach the final response.
+
+`FiberHandler`, `FiberHandlerFunc` and `FiberApp` keep the order `net/http` received a header's repeated lines in for `c.IP()`, `c.Scheme()` and the proxy middleware, even after a header line was removed: removing one could move a front proxy's `X-Forwarded-For` line in front of the client's.
+
+An adapted `net/http` handler, middleware or `ConvertRequest` request is built from the path the router matched, `c.Path()`, followed by the query as the client sent it, rather than from the request line as it arrived, so a `net/http` guard on `r.URL.Path` sees the `/admin/x` that `/a/../admin/x` was routed as. A byte a path may not carry raw is written as its escape, and the request keeps the host Fiber saw, including the one an absolute-form request line names. `HTTPHandler`, `HTTPHandlerFunc` and `HTTPHandlerWithContext` answer `404 Not Found` for a routed path with an empty segment or an escaped slash, such as `//admin/x` or `/public/..%2Fadmin/x`, which `net/http` would otherwise decode and clean into a path no Fiber middleware ran for, and for one with a backslash, a dot segment carrying parameters (`..;`) or a segment of parameters alone before another (`/;x/admin`), which an upstream behind a handler such as `httputil.ReverseProxy` may resolve into another path; a handler that must serve such names can be wrapped with `HTTPMiddleware` instead. `HTTPMiddleware` answers `400 Bad Request`, and `ConvertRequest` returns `fiber.ErrBadRequest`, for a routed path fasthttp would read as an authority rather than a path: one that begins with `//` and holds `://`, or one beginning with `//` on a request without a `Host` header. A routed path holding an escape of an unreserved character, which only a stray `%` can forge, is `404 Not Found` from the handler adapters and `400 Bad Request` from `HTTPMiddleware` and `ConvertRequest`, since `URL.Path` would read a forged `%2e%2e` as `..`. `FiberHandler`, `FiberHandlerFunc` and `FiberApp` route `r.RequestURI` as received, so a raw `/über` is routed as a Fiber server routes it, and when `r.URL` no longer matches that line, the request line `net/http` would write for `r`: a rewritten `r.URL`, as `http.StripPrefix` produces, a request built in code without a `RequestURI`, and the authority of a `CONNECT` request in the authority form. Fiber drops the trailer section of a chunked request as the request arrives or, with `StreamRequestBody`, once its body has been read, so a trailer no longer stands in for a header the wrapped middleware removed or replaced. See the adaptor's [notes and limitations](./middleware/adaptor.md#notes-and-limitations).
+
+A request the timeout middleware gave up on behind `FiberHandler`, `FiberHandlerFunc` or `FiberApp` is answered with its timeout response, as on Fiber's own server, and its `fasthttp.RequestCtx` no longer goes back to the pool while the timed-out handler may still run on it. The body stream of a response to a `HEAD` request is closed unread, as Fiber's own server does, so a stream writer or an SSE `Handler` does not run for it.
 
 | Payload Size | Metric         | V2           | V3          | Percent Change |
 | ------------ | -------------- | ------------ | ----------- | -------------- |
@@ -1290,7 +1637,7 @@ Incoming body sizes now respect the Fiber app's configured `BodyLimit` (falling 
 
 ### BasicAuth
 
-The BasicAuth middleware now validates the `Authorization` header more rigorously and sets security-focused response headers. Passwords must be provided in **hashed** form (e.g. SHA-256 or bcrypt) rather than plaintext. The default challenge includes the `charset="UTF-8"` parameter and disables caching. Responses also set a `Vary: Authorization` header to prevent caching based on credentials. Passwords are no longer stored in the request context. A `Charset` option controls the value used in the challenge header.
+The BasicAuth middleware now validates the `Authorization` header more rigorously and sets security-focused response headers. Passwords must be provided in **hashed** form (e.g. SHA-256 or bcrypt) rather than plaintext. The default challenge includes the `charset="UTF-8"` parameter and disables caching. Responses also set a `Vary: Authorization` header to prevent caching based on credentials. Passwords are no longer stored in the request context. A `Charset` option controls the value used in the challenge header. A request that carries the `Authorization` field on more than one line is refused with `400 Bad Request`: the field is defined as a single value, and reading either line would let the other decide what the request means.
 A new `HeaderLimit` option restricts the maximum length of the `Authorization` header (default: `8192` bytes).
 The `Authorizer` function now receives the current `fiber.Ctx` as a third argument, allowing credential checks to incorporate request context.
 
@@ -1298,12 +1645,28 @@ The `Authorizer` function now receives the current `fiber.Ctx` as a third argume
 
 We are excited to introduce a new option in our caching middleware: Cache Invalidator. This feature provides greater control over cache management, allowing you to define custom conditions for invalidating cache entries.
 
-The middleware now emits `Cache-Control` headers by default via the new `DisableCacheControl` flag, increases the default `Expiration` from `1 minute` to `5 minutes`, and applies a new `MaxBytes` limit of `1 MB` (previously unlimited).
+`CacheInvalidator` is called before the cache takes its lock, so a slow one stalls no other request; it can therefore be running for several requests at once, and one that keeps state of its own has to guard it. It is not asked about an entry the request or the entry's own lifetime has already ruled out.
+
+The middleware now emits `Cache-Control` headers by default via the new `DisableCacheControl` flag, increases the default `Expiration` from `1 minute` to `5 minutes`, and applies a new `MaxBytes` limit of `1 MB` (previously unlimited). That limit is the default of `cache.New()` called without a `Config`: a `Config` that leaves `MaxBytes` unset still stores bodies without a limit. A streamed response is not read into memory to measure it: one that declares more than `MaxBytes`, or no length, is passed on as a stream and not stored. That includes a file served behind `compress.New()` registered after `cache.New()`, which `compress` encodes as it is sent and which used to be cached: register `compress.New()` first, or serve the files with `static.Config{Compress: true}`, to keep caching it. A stream of known length that ends early, fails or runs past that length is not stored either; it used to be read to its end and stored, with a read error as its body. The limit also holds while misses are stored concurrently, and a response that does not fit beside the ones still being stored is served uncached (`X-Cache: unreachable`) instead of failing with `500`. `MaxBytes` counts each entry's key and the headers it stores along with its body, and the number of entries is limited along with it, to `MaxBytes / 256` but no fewer than 1024, so a flood of URLs with a short or empty body, such as a `204` or a redirect, evicts the entries closest to expiring instead of piling up, and the Vary manifest of a URL is deleted by the next stored response once no entry stored under it is left.
+
+The middleware also caches `308 Permanent Redirect` responses and honors the request directives `max-age`, `min-fresh`, `max-stale` and `only-if-cached`, as well as `Pragma: no-cache`. A hit served stale carries a `Warning` header; an entry that holds one client's response (keyed or varied by a cookie or credential) is not served stale unless `AllowStaleCredentialResponses` is set, and one that `CacheInvalidator` has invalidated never is. See [Request directives](./middleware/cache.md#request-directives).
+
+Cache hits replay the stored `Vary` header even when `StoreResponseHeaders` is off, and a hit on an entry keyed by a cookie or credential (`Vary: Cookie`, `KeyCookies`, `KeyCredentialHeaders`, or `KeyHeaders` naming `Cookie`, `Authorization` or another header that carries a credential) is sent with `Cache-Control: private` rather than `public`, so a shared cache in front of the app does not store one user's response for the next.
+
+A response is stored under the request headers its own `Vary` names, also when other responses of the same URL name a different list, so a page sent with `Vary: Cookie` is served only to requests with the same `Cookie`. The values are the ones the request carried when it reached the cache, and a response is stored only if the headers it varies on reach the handler as they came. A response that varies on a header middleware registered after the cache added, rewrote or removed, as `encryptcookie` does with the cookies it decrypts or drops, is not stored and is sent with `X-Cache: unreachable`: its key holds the value the client sent, which any client sending the same one, a placeholder the middleware overwrote with its session's included, would have been served the page for. Register the cache behind such middleware, and have a response derived from another input vary on the input the client sends, such as `Cookie`. The key version moves with this rule, so every cache starts cold after the upgrade: an entry stored under the old rule is served, on an external `Storage` that outlives the upgrade, to any client sending the value its key holds, so the earlier entries are not read. They expire on their own, or a shared store can drop them by their key prefix (`v6|`).
+
+A request the server refused while reading it, such as one over `BodyLimit`, is neither served from the cache nor stored: its route never ran. With `QUERY` in `Methods`, the default key includes `Content-Type` and `Content-Encoding` besides the body. With an external `Storage`, a response past the size limits an entry is decoded under is not stored (`X-Cache: unreachable`) instead of making every later lookup of its key fail with `500`.
+
+Credential headers named in `KeyHeaders` (`Cookie`, `Authorization`, `Proxy-Authorization`, `X-API-Key`, `X-Auth-Token`, `X-Access-Token` or a header named in `KeyCredentialHeaders`) and the values of the cookies named in `KeyCookies` are hashed in the cache key, so a key listing of an external `Storage` no longer shows them, and the key version moves with that change: every cache starts cold after the upgrade, whatever its config, since the entries of the earlier version are not read. With an external `Storage` they expire on their own, or a shared store can drop them by the earlier version's key prefix (`v4|`). The body an external `Storage` keeps beside an entry, and the entry's `Vary` manifest, now have keys of their own (`v7|body|...` and `v7|manifest|...`) instead of the entry key plus a suffix, which a request could spell to overwrite the body of another entry. A custom `KeyGenerator`'s key is stored with `\`, `|` and `:` escaped as `\\`, `\p` and `\c`, so client text it copies cannot spell the key of another entry's `Vary` variant.
 
 Additionally, the caching middleware has been optimized to avoid caching non-cacheable status codes, as defined by the [HTTP standards](https://datatracker.ietf.org/doc/html/rfc7231#section-6.1). This improvement enhances cache accuracy and reduces unnecessary cache storage usage.
 Cached responses now include an RFC-compliant Age header, providing a standardized indication of how long a response has been stored in cache since it was originally generated. This enhancement improves HTTP compliance and facilitates better client-side caching strategies.
 
 Cache keys are now redacted in logs and error messages by default, and a `DisableValueRedaction` boolean (default `false`) lets you opt out when you need the raw value for troubleshooting.
+
+The default cache key strategy was also hardened. Instead of path-only behavior, keys now use structured request dimensions: method partitioning, scheme and host, path, canonical query string, and selected representation headers (`Accept`, `Accept-Encoding`, `Accept-Language`). This avoids collisions such as `/items?id=1` vs `/items?id=2`, or the same path on two hosts served by one app, while keeping key generation deterministic. New config fields were added for explicit control: `DisableQueryKeys`, `KeyHeaders`, `KeyCookies`, and `DisableVaryHeaders`.
+
+As a security/performance default, request body/form values are not part of the default cache key. Cache handling is limited to `GET` and `HEAD` requests by default, configurable via the `Methods` field.
 
 :::note
 The deprecated `Store` and `Key` options have been removed in v3. Use `Storage` and `KeyGenerator` instead.
@@ -1332,7 +1695,11 @@ We've updated several fields from a single string (containing comma-separated va
 - `Config.AllowHeaders`: Now accepts a slice of strings, each representing an allowed header.
 - `Config.ExposeHeaders`: Now accepts a slice of strings, each representing an exposed header.
 
-Additionally, panic messages and logs redact misconfigured origins by default, and a `DisableValueRedaction` flag (default `false`) lets you reveal them when necessary.
+Additionally, the panic for an invalid `AllowOrigins` entry redacts the origin by default, and a `DisableValueRedaction` flag (default `false`) lets you reveal it when necessary.
+
+When all origins are allowed (the default), `Access-Control-Allow-Origin: *` is also sent on responses to requests without `Origin`, `OPTIONS` excepted, so a cache in front of the middleware cannot hand a response without it to a cross-origin request.
+
+An IPv6 host in `AllowOrigins` is written in the form browsers send in `Origin`, so `http://[0:0:0:0:0:0:0:1]:3000` matches `Origin: http://[::1]:3000`.
 
 ### Compression
 
@@ -1341,6 +1708,8 @@ Additionally, panic messages and logs redact misconfigured origins by default, a
 - Compression is bypassed for responses that already specify `Content-Encoding`, for range requests or `206` statuses, and when either side sends `Cache-Control: no-transform`.
 - `HEAD` requests still negotiate compression so `Content-Encoding`, `Content-Length`, `ETag`, and `Vary` match a corresponding `GET`, but the body is omitted.
 - `Vary: Accept-Encoding` is merged into responses even when compression is skipped, preventing caches from mixing encoded and unencoded variants.
+- Decoding compressed request bodies now enforces the app `BodyLimit` through fasthttp `WithLimit` helpers, including when the compression middleware is active.
+- Multipart form parsing now enforces the app `BodyLimit` by using fasthttp `MultipartFormWithLimit`.
 
 ### CSRF
 
@@ -1348,16 +1717,31 @@ The `Expiration` field in the CSRF middleware configuration has been renamed to 
 
 CSRF now redacts tokens and storage keys by default and exposes a `DisableValueRedaction` toggle (default `false`) if you must surface those values in diagnostics.
 
+With a `Storage`, a token is stored under `csrf:<token>`, so a token sent by a client cannot read, extend or delete an entry another middleware keeps in the same storage. Tokens stored by an earlier version are not found after the upgrade: an unsafe request that still carries one is rejected, and the next safe request receives a new token.
+
 The CSRF middleware now validates the [`Sec-Fetch-Site`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Sec-Fetch-Site) header for unsafe HTTP methods. When present, requests with invalid `Sec-Fetch-Site` values (not one of "same-origin", "none", "same-site", or "cross-site") are rejected with `ErrFetchSiteInvalid`. Valid or absent headers proceed to standard origin and token validation checks, providing an early gate to catch malformed requests while maintaining compatibility with legitimate cross-site traffic.
+
+`csrf.NewCrossOriginProtection` adds a tokenless alternative that follows Go's [`net/http.CrossOriginProtection`](https://pkg.go.dev/net/http#CrossOriginProtection). It rejects unsafe cross-origin browser requests by their `Sec-Fetch-Site` and `Origin` headers and needs no cookie, token, or storage. See [Cross-Origin Protection Without Tokens](./middleware/csrf.md#cross-origin-protection-without-tokens) for the rules and the differences from `net/http`.
+
+An IPv6 host matches in any spelling, in `TrustedOrigins`, in the `Origin` and `Referer` comparison with the request, and in `Redirect().Back()`: `http://[::1]:3000` matches `Host: [0:0:0:0:0:0:0:1]:3000`.
 
 ### Idempotency
 
+Unchanged response header lines from middleware registered before idempotency are no longer stored. CORS and request ID middleware registered there produce fresh values on each request without cached copies being appended. Headers added or changed downstream still replay, including those from route-level CORS. Existing cache entries keep their previously stored headers until expiration; this change does not invalidate idempotency keys. See [Behavior](./middleware/idempotency.md#behavior) for middleware ordering.
+
 Idempotency middleware now redacts keys by default and offers a `DisableValueRedaction` configuration flag (default `false`) to expose them when debugging.
+
+A streamed response that declares no length (`SendStreamWriter`, or `SendStream` without a size) is sent as it is produced and no longer read to its end to store it, so a retry with its key runs the handler again. A stream of known length is stored only when it is no longer than 1 MiB and delivers that length without an error; a failed read used to be stored as its body. A request the server refused while reading it, such as one over `BodyLimit`, is not stored either, so the retry with its key reaches the handler instead of an empty `413`.
+
+The key alone identifies a request, so whoever sends a stored key receives the response stored for it, whatever the user or route. The new `KeyScope` function returns the scope a key belongs to, such as the ID of the authenticated user, and a response is then stored, replayed and locked per scope and key. `Set-Cookie` and `Set-Cookie2` are no longer stored, and an entry that holds one is replayed without it, unless `KeepResponseHeaders` names the header; a replay no longer hands the cookie of the first client to the next one, while a session or token carried in another response header is still replayed unless `KeepResponseHeaders` leaves it out or `KeyScope` scopes the key. Have clients draw keys from a cryptographically secure random source, as the default validator checks only the length. See [Behavior](./middleware/idempotency.md#behavior).
+
+A response is stored under `idempotency:` followed by the key (or its digest with `KeyScope`), so a key sent by a client cannot read or overwrite an entry another middleware keeps in the same `Storage`. Responses stored by an earlier version are not replayed after the upgrade: a retry with such a key runs the handler again.
 
 ### EncryptCookie
 
 - Added support for specifying key length when using `encryptcookie.GenerateKey(length)`. Keys must be base64-encoded and may be 16, 24, or 32 bytes when decoded, supporting AES-128, AES-192, and AES-256 (default).
 - Custom encryptor and decryptor callbacks now receive the cookie name. The default AES-GCM helpers bind it as additional authenticated data (AAD) so ciphertext cannot be replayed under a different cookie.
+- Every `Set-Cookie` line of a response is encrypted, also when a name repeats or the line was written with `c.Add`, and only its value is replaced, so `Path`, `HttpOnly`, `Secure` and any other attribute are kept as written.
 - **Breaking change:** Custom encryptor/decryptor hooks now accept the cookie name as their first argument. Update overrides like:
 
   ```go
@@ -1369,6 +1753,10 @@ Idempotency middleware now redacts keys by default and offers a `DisableValueRed
   Encryptor func(name, value, key string) (string, error)
   Decryptor func(name, value, key string) (string, error)
   ```
+
+### ETag
+
+A streamed response that declares no length is sent without an `ETag` and no longer read to its end to hash it. A stream of known length is tagged only when it delivers that length without an error; a failed read used to be hashed and sent as the body of a `200` with an `ETag`, which `cache` or `idempotency` registered before it then stored.
 
 ### Favicon
 
@@ -1385,15 +1773,21 @@ The static middleware now covers the functionality of both. Review the [static m
 
 ### Healthcheck
 
-The healthcheck middleware has been simplified into a single generic probe handler. No endpoints are registered automatically. Register the middleware on each route you need—using helpers like `healthcheck.LivenessEndpoint`, `healthcheck.ReadinessEndpoint`, or `healthcheck.StartupEndpoint`—and optionally supply a `Probe` function to determine the service's health. This approach lets you expose any number of health check routes.
+The healthcheck middleware has been simplified into a single generic probe handler. No endpoints are registered automatically. Register the middleware on each route you need—using the conventional paths `healthcheck.LivenessEndpoint` (`/livez`), `healthcheck.ReadinessEndpoint` (`/readyz`), or `healthcheck.StartupEndpoint` (`/startupz`)—and optionally supply a `Probe` function to determine the service's health. This approach lets you expose any number of health check routes.
 
 Refer to the [healthcheck middleware migration guide](./middleware/healthcheck.md) or the [general migration guide](#-migration-guide) to review the changes.
+
+### HostAuthorization
+
+IPv6 hosts are compared in their RFC 5952 Section 4 form, and an IPv4-mapped address as the IPv4 address it maps, in requests and in `AllowedHosts` alike: `[0:0:0:0:0:0:0:1]` matches `[::1]`, and `[::ffff:127.0.0.1]` and `127.0.0.1` match each other. `AllowedHostsFunc` receives that form too, so `[::ffff:127.0.0.1]` arrives as `127.0.0.1` and `[64:ff9b::192.0.2.33]` as `64:ff9b::c000:221`. A request host with brackets around anything but an IPv6 address, such as `[allowed.com]`, is refused.
+
+An `AllowedHosts` entry no request could match now panics in `New()` instead of loading as a rule that never matches: a URL (`http://localhost:3000`), a `%` such as a zoned `[fe80::1%25eth0]`, a port that is not numeric, brackets around anything but an IPv6 address, another colon that is not part of an IPv6 address, and a `*.` entry holding an IP address (`*.127.0.0.1`). Write an entry as `host`, `host:port` or `[IPv6]:port`. See [Host Normalization](./middleware/hostauthorization.md#host-normalization).
 
 ### KeyAuth
 
 The keyauth middleware was updated to introduce a configurable `Realm` field for the `WWW-Authenticate` header.
-The old string-based `KeyLookup` configuration has been replaced with an `Extractor` field. Use helper functions like `keyauth.FromHeader`, `keyauth.FromAuthHeader`, or `keyauth.FromCookie` to define where the key should be retrieved from. Multiple sources can be combined with `keyauth.Chain`. See the migration guide below.
-New `Challenge`, `Error`, `ErrorDescription`, `ErrorURI`, and `Scope` fields allow customizing the `WWW-Authenticate` header, returning Bearer error details, and specifying required scopes. `ErrorURI` values are validated as absolute, a default `ApiKey` challenge is emitted when using non-Authorization extractors, Bearer `error` values are validated, credentials must conform to RFC 7235 `token68` syntax, and `scope` values are checked against RFC 6750's `scope-token` format. The header is also emitted only after the status code is finalized.
+The old string-based `KeyLookup` configuration has been replaced with an `Extractor` field. Use the helpers of the shared [`extractors`](#-extractors-package) package, such as `extractors.FromHeader`, `extractors.FromAuthHeader`, or `extractors.FromCookie`, to define where the key should be retrieved from. Multiple sources can be combined with `extractors.Chain`. See the migration guide below.
+New `Challenge`, `Error`, `ErrorDescription`, `ErrorURI`, and `Scope` fields allow customizing the `WWW-Authenticate` header, returning Bearer error details, and specifying required scopes. `ErrorURI` values are validated as absolute, a default `ApiKey` challenge is emitted when using non-Authorization extractors, Bearer `error` values are validated, credentials must conform to RFC 7235 `token68` syntax, and `scope` values are checked against RFC 6750's `scope-token` format. The header is also emitted only after the status code is finalized, and the Bearer `error`, `error_description`, `error_uri`, and `scope` parameters are left out when the request carried no credentials or used an Authorization scheme other than Bearer, as RFC 6750 section 3 asks.
 
 ### Logger
 
@@ -1441,6 +1835,8 @@ func main() {
 ```
 
 </details>
+
+For a request the timeout middleware gave up on, `${status}`, `${bytesSent}`, `${resBody}`, `${respHeader:}` and the default format report the timeout response the client receives. Tags that read the request, such as `${cookie:}`, `${query:}`, `${reqHeader:}` or `${body}`, and behind a trusted proxy `${ip}`, log nothing, since the timed-out handler may still read or change it. The logger returns the timeout error for such a request instead of `nil`, so `cache`, `compress`, `etag` or `idempotency` registered before it no longer store or rewrite the timed-out handler's response. An error-handling middleware registered before the logger now receives that error too and should check `c.IsAbandoned()` before it writes.
 
 :::note
 The deprecated `TagHeader` constant was removed. Use `TagReqHeader` when you need to log request headers.
@@ -1519,6 +1915,41 @@ app.Use(logger.New(logger.Config{
 
 Both approaches ensure your logger can access these values while respecting Go's context practices.
 
+The same template/tag mechanism is also available for application logs emitted through `log.WithContext`. This keeps request logging and handler logging consistent without hard-coding middleware-specific values into the `log` package:
+
+```go
+app.Use(requestid.New())
+
+// The requestid middleware automatically registers the ${requestid} tag.
+log.MustSetContextTemplate(log.ContextConfig{Format: "[${requestid}] "})
+
+app.Get("/", func(c fiber.Ctx) error {
+    // Pass c so middleware values stored on Fiber's request context can be read.
+    log.WithContext(c).Info("handling request")
+    return c.SendString("OK")
+})
+```
+
+`SetContextTemplate` configures Fiber's built-in default logger. Custom loggers registered with `log.SetLogger` keep control over their own `WithContext` behavior.
+
+#### Breaking change: `WithContext(ctx any)`
+
+The signature of `log.WithContext`, `baseLogger.WithContext`, and `AllLogger[T].WithContext` changed from `WithContext(ctx context.Context)` to `WithContext(ctx any)`. The wider parameter type is what allows the same call site to receive `fiber.Ctx`, `*fasthttp.RequestCtx`, or a standard `context.Context` and still resolve middleware-stored values via `Value` / `UserValue`. Adapter packages that implement `AllLogger[T]` directly (for example community Zap, Zerolog, or Logrus integrations) must update their `WithContext` method signature accordingly. Direct call sites that already pass a `context.Context` or a `fiber.Ctx` continue to compile.
+
+#### New API surface
+
+The `log` and `middleware/logger` packages now expose the following exported symbols:
+
+- `log.SetContextTemplate(ContextConfig) error` / `log.MustSetContextTemplate(ContextConfig)` — configure the active context template.
+- `log.RegisterContextTag(name string, fn ContextTagFunc) error` / `log.MustRegisterContextTag` — register a global context tag.
+- `log.ContextConfig`, `log.ContextData`, `log.ContextTagFunc`, `log.Buffer` — supporting types.
+- `log.DefaultFormat`, `log.RequestIDFormat`, `log.KeyValueFormat`, `log.TagContextValue` — built-in format and tag constants.
+- `logger.RegisterTag(name string, fn LogFunc) error` / `logger.MustRegisterTag` — register a global access-log tag (in addition to per-instance `Config.CustomTags`).
+- `logger.RegisterContextTag(name string, extract func(ctx any) string)` — convenience helper that registers a string-valued tag in **both** the access-log registry and the `log.RegisterContextTag` registry, so middleware authors do not have to maintain two parallel renderers.
+- `logger.ErrUnknownTag` (sentinel) and `logger.UnknownTagError` (typed) — replace the older `ErrTemplateParameterMissing` sentinel that was never exported in a stable release. `New(Config{})` panics with `*UnknownTagError` when the format references a tag that has no registered renderer; `errors.As` retrieves the offending tag name.
+
+The `requestid`, `basicauth`, `keyauth`, `csrf`, and `session` middlewares automatically register their respective context tags (`${requestid}`, `${request-id}`, `${username}`, `${api-key}`, `${csrf-token}`, `${session-id}`) on first `New(...)`. Empty stubs for the same names are pre-registered at package init, so a logger format that references one of them compiles even when the corresponding middleware has not been initialized. For `log.WithContext`, later registration rebuilds the active context template. For `middleware/logger` access logs, construct the producing middleware (or call `logger.RegisterTag`) before `logger.New(...)`; existing logger instances keep the function chain compiled at construction time and do not retroactively pick up later registrations.
+
 The `Skip` is a function to determine if logging is skipped or written to `Stream`.
 
 <details>
@@ -1553,7 +1984,7 @@ Logger provides predefined formats that you can use by name or directly by speci
 
 ```go
 app.Use(logger.New(logger.Config{
-    Format: logger.FormatCombined,
+    Format: logger.CombinedFormat,
 }))
 ```
 
@@ -1566,7 +1997,15 @@ The limiter middleware uses a new Fixed Window Rate Limiter implementation.
 
 Custom limiter algorithms should now implement the updated `limiter.Handler` interface, whose `New` method receives a pointer to the active config: `New(cfg *limiter.Config) fiber.Handler`.
 
-Limiter now redacts request keys in error paths by default. A new `DisableValueRedaction` boolean (default `false`) lets you reveal the raw limiter key if diagnostics require it.
+`limiter.FixedWindow` and `limiter.SlidingWindow` give a field their config leaves unset the default `limiter.New` would, when you call their `New` method yourself: `MaxFunc` and `ExpirationFunc` return `Max` and `Expiration`, and a `nil` config selects the default config. Their `New` works on a copy of the config, which is left as it is; a change to it after the call does not reach the handler.
+
+`SkipFailedRequests` and `SkipSuccessfulRequests` judge the status a request ends with, errors included: a handler that returns a `*fiber.Error` counts with that error's status code, and one that returns any other error counts as a `500` unless it already set an error status. In v2 both options read the response status alone, which is still `200` when a handler returns an error; such a request now counts as failed.
+
+Limiter now redacts request keys in error paths by default. A new `DisableValueRedaction` boolean (default `false`) lets you reveal the limiter key, as the storage sees it, if diagnostics require it.
+
+A custom `Storage` keeps an entry under `limiter:` followed by the key the `KeyGenerator` returned, so a key a client controls cannot reach an entry another middleware keeps in the same storage. Building that key copies it, one allocation per request: the key can point into request memory that fasthttp reuses, and the storage may keep it. The built-in store copies the keys it keeps, so nothing changes there. Counters stored by an earlier version are not read after the upgrade, so every window starts over once.
+
+For a request the timeout middleware gave up on, the limiter leaves the response alone, since the timed-out handler may still be writing it: the timeout response carries no `X-RateLimit-*` headers, and `SkipFailedRequests` and `SkipSuccessfulRequests` judge the timeout response's status.
 
 :::note
 Deprecated fields `Duration`, `Store`, and `Key` have been removed in v3. Use `Expiration`, `Storage`, and `KeyGenerator` instead.
@@ -1574,7 +2013,7 @@ Deprecated fields `Duration`, `Store`, and `Key` have been removed in v3. Use `E
 
 ### Monitor
 
-Monitor middleware is migrated to the [Contrib package](https://github.com/gofiber/contrib/tree/main/monitor) with [PR #1172](https://github.com/gofiber/contrib/pull/1172).
+Monitor middleware is migrated to the [Contrib package](https://github.com/gofiber/contrib/tree/main/v3/monitor) with [PR #1172](https://github.com/gofiber/contrib/pull/1172).
 
 ### Proxy
 
@@ -1582,7 +2021,23 @@ The proxy middleware has been updated to improve consistency with Go naming conv
 
 The new `KeepConnectionHeader` option (default `false`) drops the `Connection` header unless explicitly enabled to retain it.
 
-`proxy.Balancer` now accepts an optional variadic configuration: call `proxy.Balancer()` to use defaults or continue passing a `proxy.Config` value as before.
+The headers a request lists in `Connection` are removed before it is forwarded, and a request whose `Connection` fields list more than 32 names is answered with `431 Request Header Fields Too Large`; an upstream response that does is answered with `502 Bad Gateway`. Under `DisableHeaderNormalizing`, further spellings of a removed name count toward the same limit; `Balancer`, `Forward`, `DomainForward` and `BalancerForward` also answer `431` to a request that spells `X-Real-IP` in more than 32 further ways, and `DoRedirects` fails a redirect with `431` when the fields it drops are spelled in more than 32 further ways. See [hop-by-hop header stripping](./middleware/proxy.md#rfc-9110-hop-by-hop-header-stripping) and [redirect method and body](./middleware/proxy.md#redirect-method-and-body).
+
+`proxy.Balancer` takes its `proxy.Config` as an optional variadic argument, like the other middleware constructors. `Servers` (or a custom `Client` with `Clients`) is required, so `proxy.Balancer()` without a config panics at startup, as `proxy.Balancer(proxy.Config{})` does, and so does a `Client` without `Clients`. A server without a port is dialed on the port of its scheme, and each server is reached with its own scheme, so an `https` upstream works behind a plain-HTTP listener.
+
+The proxy is secure by default. Upstreams that resolve to loopback, private, link-local, multicast, unspecified, CGNAT or other special-use addresses (IPv6 transition forms included) are refused, and so are schemes other than `http` and `https` and HTTPS-to-HTTP redirects. Every request is bounded: `Balancer` takes at most `MaxResponseBodySize` of an upstream response, 100 MiB unless set, whether it buffers the body or streams it (a negative value lifts the bound; a `Config.Client` keeps the bounds of its own clients for the bodies they buffer, and a `MaxResponseBodySize` you set holds the body it streams, which fasthttp does not bound), and the client behind `Do`, `DoRedirects`, `Forward`, `DomainForward` and `BalancerForward` gives each request, and each redirect hop, 30 seconds for the whole exchange, connect and body included, unless `DoTimeout` or `DoDeadline` set the request's own bound, and takes at most 100 MiB of a response, one set to stream included, until `proxy.WithClient` replaces it; a client of your own that streams is held to its `MaxResponseBodySize`. A streamed body that declares more than the bound is refused before any of it is sent, and one that passes it without declaring its length ends the response early. Hop-by-hop headers are stripped, and `Balancer`, `Forward`, `DomainForward` and `BalancerForward` overwrite `X-Real-IP` with `c.IP()`; with `Do`, `DoTimeout`, `DoDeadline` and `DoRedirects` you set it yourself. The trailer section of a chunked request is dropped instead of reaching the upstream as header lines, the trailer section of an upstream's chunked response is dropped instead of reaching the client as header lines, whether the client buffers the response or streams it, and a forwarding header sent on several lines keeps them in the order they were received; a request carrying more than 64 forwarding lines, the `X-Real-IP` line the proxy writes included, is refused with `431 Request Header Fields Too Large`. To proxy to an internal host, relax the policy with `proxy.WithSecurityPolicy` (or `Config.SecurityPolicy` for `Balancer`), for example `proxy.SecurityPolicy{AllowPrivateIPs: true}`, before you build `DomainForward` or `BalancerForward`: they check their upstreams when the handler is built and panic on a rejected one. Keep the policy installed while they serve: `Forward`, `DomainForward` and `BalancerForward` read it on every request, whereas `Balancer` reads it once, when it is built. See [Security](./middleware/proxy.md#security).
+
+`ErrUpstreamHostUnresolvable` is new: a name that cannot be resolved, or that resolves to no address, is rejected with an error that matches it and `ErrUpstreamHostBlocked` both, and `errors.As` finds the `*net.DNSError` of the lookup. A host with only IPv6 addresses and `DialDualStack` off fails with an error that matches neither, where it matched `ErrUpstreamHostBlocked` before. An address `net/url` cannot parse is rejected with `ErrUpstreamHostInvalid` and the `*url.Error` wrapped beside it, so the message of that error carries the parse error. The time `DoTimeout`, `DoDeadline` or `Config.Timeout` allows bounds the lookup and the connects of the request as well; a connect that nothing bounds has five seconds, as before.
+
+`Balancer`, `DomainForward` and `BalancerForward` forward the path the router matched, `c.Path()`, followed by the query as the client sent it, instead of the request line as it arrived. Spellings such as `/public/..%2Fadmin/secret` and `//admin/secret`, which fasthttp's normalization of the raw request line turned into `/admin/secret` on the way to the upstream, are answered with `400 Bad Request`, since an upstream that decodes `%2F` or merges `//` before it matches routes would still serve a path no middleware matched; the new `SecurityPolicy.AllowAmbiguousSlashes` forwards them exactly as the router matched them, for an upstream that keeps both. A path parameter, a `;` in any segment, is answered with `400` as well: servlet containers such as Tomcat and Jetty strip the parameters from every segment before they match routes, so `/admin;x/secret`, `/admin;/secret` and `/;/admin/secret` are `/admin/secret` there. The new `SecurityPolicy.AllowPathParameters` forwards them, for an upstream that relies on `;jsessionid`; a client can also send a literal `;` as `%3B`. A path holding a backslash, a dot segment carrying parameters (`..;`), or an escape of an unreserved character, which only a stray `%` can forge, is answered with `400` regardless. A path with dot segments is forwarded resolved, and a byte a path may not carry raw is forwarded as its escape. Every entry in `Config.Servers` must be a scheme and host only; an entry with a path, userinfo, query or fragment panics at startup with `ErrUpstreamNotOrigin`. `Balancer` answers `400 Bad Request` for an absolute-form request, such as `GET http://public.example/x`, whose `Host` header names another host or is missing: `c.Host()`, `app.Domain` and `hostauthorization` went by the host of the request line, the upstream by the `Host` header ([RFC 9112 Section 3.2.2](https://www.rfc-editor.org/rfc/rfc9112#section-3.2.2)). The two are compared without regard to case or to a default port, and only a host name or an IP address, with an optional port, can match. An application that sets the `Host` header in a middleware before `Balancer` now gets `400` for an absolute-form request whose line names another host than the one it set, and an HTTP/1.0 absolute-form request without `Host` is refused before `ModifyRequest` runs; set the upstream `Host` in `ModifyRequest` instead. `DomainForward` and `BalancerForward` keep the escapes of the routed path and of their upstream URL's path as written, so `%3B` behind `http://backend/my%20app` is no longer sent as `;`. `Balancer` also answers `400 Bad Request` for a request whose `Host` header carries userinfo and for a routed target fasthttp would read as an authority rather than a path (one that begins with `//` and holds `://`, or one beginning with `//` on a request without a `Host` header). A path override without a leading slash is forwarded rooted. Every `*fasthttp.HostClient` in a custom `Client` gets `DisablePathNormalizing` set, and behind any other `BalancingClient` a target that normalization would change is answered with `400`. Path normalization is also disabled on the default client, on a client registered with `WithClient` and on every host client a per-call client creates once the proxy has it. See [Request target](./middleware/proxy.md#request-target).
+
+`Balancer`, `Forward`, `DomainForward` and `BalancerForward` no longer forward a request the server refused while reading it, such as one over `BodyLimit`: the client is answered with the refusal, and the upstream used to run a copy of the request without its body.
+
+`DoRedirects` rewrites the request for each hop as RFC 9110 §15.4 describes: a `303` turns every method but `GET` and `HEAD` into `GET`, a `301` or `302` turns `POST` into `GET`, and a `307` or `308` repeats the request. When the method changes, the body goes with it, and the fields that framed, described or expected it, for that hop: the request your handler holds keeps its method, body and credentials. A hop sent as a copy keeps the request timeout, the user values and the body of a multipart form the server parsed ahead of the handler. A redirect that would repeat the body of a streamed request is followed when the first hop left all of it in memory, as it does for a body of known length up to 8 KiB, and fails with `fasthttp.ErrRedirectBodyStream` for a chunked or a longer one. A `DoRedirects` that fails while following the chain, `fasthttp.ErrTooManyRedirects` included, leaves the response empty, where it used to keep the redirect it stopped at, `Location` and `Set-Cookie` included. `Authorization`, `Cookie` and the related credential headers are dropped when a redirect leaves the origin ([RFC 6454](https://www.rfc-editor.org/rfc/rfc6454)): another scheme now counts as leaving it, as another host or port did, and a default port spelled out in `Location`, `http://example.com/` to `http://example.com:80/`, no longer does. Every other header the request still carries is forwarded, application-defined credentials such as `X-Api-Key` included; the new `SecurityPolicy.RedirectSensitiveHeaders` lists extra names to drop on such a redirect, and is empty by default, so nothing changes until it is set. See [Headers on a cross-origin redirect](./middleware/proxy.md#headers-on-a-cross-origin-redirect) and [Redirect method and body](./middleware/proxy.md#redirect-method-and-body).
+
+### Recover
+
+The Recover middleware allows customizing the error it returns. Set a `PanicHandler` in its `Config` to change the default behavior.
 
 ### Session
 
@@ -1606,7 +2061,28 @@ The session middleware has undergone significant improvements in v3, focusing on
 
 - **Default KeyGenerator**: Changed from `utils.UUIDv4` to `utils.SecureToken`, producing base64-encoded tokens instead of UUID format.
 
+- **Context-Aware Lifecycle Methods**: The `DestroyWithContext`, `RegenerateWithContext`, and `ResetWithContext` methods (on both `Session` and `Middleware`), and `SaveWithContext` (on `Session`, since the middleware saves the session itself), accept a `context.Context` to propagate cancellation and deadlines to the underlying storage I/O, mirroring the existing `Storage` and `SharedState` `WithContext` convention. The non-context variants delegate to these. A nil context is treated as `context.Background()`.
+
+- **Session ID Write-Back**: When a request already carries a session ID, the ID is written back only through the extractor that supplied it, and only when that extractor is a cookie or a non-Authorization header. An ID from a read-only source (Authorization header, Query, Form, Param, or Custom) is never copied into a cookie or header, which prevents session fixation. A request without an ID gets a server-generated one through every cookie and non-Authorization header extractor of the chain. When the middleware issues a new ID for a request that carried one, because of `Regenerate()`, `Reset()`, or an ID the storage does not know, the new ID goes back through the same cookie or header, or through every such extractor of the chain when the old ID came from a read-only source. An extractor error other than `extractors.ErrNotFound` is passed to `ErrorHandler` instead of being treated as a new visitor.
+
+- **Storage Key Prefix**: Sessions are stored under `session:<session ID>` instead of the bare ID, so a session ID from a request cannot name an entry another middleware keeps in the same `Storage`. `store.GetByID` and `store.Delete` still take the bare ID. Sessions an earlier version stored are not found after the upgrade, so users sign in once more.
+
+- **Logout Holds Against Running Requests**: A request that loaded a session before another request ended it with `Reset()`, `Destroy()` or `Regenerate()`, or before `store.Delete` or `store.Reset`, no longer stores it again or sends its cookie when it finishes, even after a `Regenerate()` of its own, which still changes the ID but neither stores nor sends the new one, so a logout is not undone by a request that was still running. A request that left the session unchanged no longer writes it back over a change another request stored meanwhile either, reads of values it could change in place included, and a `Regenerate()` by such a request carries that change over to the new ID instead of its snapshot; `Set`, `Delete`, `Reset` and a value changed in place through `Get` make a request a writer, and the CSRF middleware behind the session middleware leaves a token with more than half its lifetime left as it is, so its requests are not writers either; there a token stays valid for at least half of `IdleTimeout` after its last use rather than the whole of it, and its cookie expires with it. Within one process, saves and deletes of the same session ID are serialized; processes that share one `Storage` are not coordinated, as `fiber.Storage` has no conditional write.
+
+- **Timed-out Requests**: The session of a request the timeout middleware gave up on is neither saved nor handed to another request while its handler may still run.
+
 For more details on these changes and migration instructions, check the [Session Middleware Migration Guide](./middleware/session.md#migration-guide).
+
+### SSE
+
+Fiber now includes an [SSE middleware](./middleware/sse.md) for Server-Sent Events. It handles native
+`SendStreamWriter` setup, SSE response headers, event formatting, flushing, heartbeat comments, and
+disconnect detection through flush errors while leaving application-level hubs, topics, replay stores, and
+pub/sub bridges to user code or recipes.
+
+`Handler` starts when the server begins to send the response body, after the middleware before the route has
+returned from `c.Next()`, and the server waits for `Handler` and `OnClose` before it reuses the request. A
+response whose body is never sent, such as the answer to a `HEAD` request, runs neither.
 
 ### Timeout
 
@@ -1614,16 +2090,22 @@ The timeout middleware is now configurable. A new `Config` struct allows customi
 
 **Behavioral changes:**
 
+- **Status**: The default response for a timed-out handler is `503 Service Unavailable`, not `408 Request Timeout`. The request arrived complete and the handler is what is slow, whereas `408` means the server did not receive a complete request in time ([RFC 9110, Section 15.5.9](https://www.rfc-editor.org/rfc/rfc9110#section-15.5.9)) and tells the client it may send the request again, while the timed-out handler can still be running. Return `fiber.ErrRequestTimeout` (or `fiber.ErrGatewayTimeout` for a handler that waits on an upstream) from `OnTimeout` to keep or choose another status.
 - **Immediate return on timeout**: The middleware now returns immediately when a timeout occurs, without waiting for the handler to finish. This is achieved through the new **Abandon mechanism** which marks the context as abandoned so it won't be returned to the pool while the handler is still running.
 - **Context propagation**: The timeout context is properly propagated to the handler. Handlers can detect timeouts by listening on `c.Context().Done()` and return early.
 - **Panic handling**: Panics in the handler are caught and converted to `500 Internal Server Error` responses.
-- **Race-free design**: The implementation uses fasthttp's `TimeoutErrorWithCode` combined with Fiber's Abandon mechanism to ensure complete race-freedom between the middleware, handler goroutine, and context pooling.
+- **Race-free design**: The implementation uses fasthttp's `TimeoutErrorWithResponse` combined with Fiber's Abandon mechanism to ensure complete race-freedom between the middleware, handler goroutine, and context pooling.
+- **HEAD**: The timeout response to a `HEAD` request carries no body, on the default path and the `OnTimeout` path alike, so a client reading the connection does not take a body for the start of the next response.
+- **Nesting**: Under an enclosing timeout middleware whose deadline comes no later than its own, such as a shorter timeout on `app.Use`, the middleware runs the handler on the calling goroutine and leaves the timeout to the enclosing one. A shorter deadline set any other way, such as with `c.SetContext`, still times the request out with this middleware's response. Nested timeouts that fire together write one timeout response, from the first to answer. `ScheduleReclaim` may be armed more than once per request; the context is reclaimed once every abandoned goroutine has finished.
+- **OnTimeout context**: When the deadline passes while the handler still runs, `OnTimeout` runs on a context of its own that carries the request, its locals, `c.Context()` and the response headers as they were when the handler started, so the timed-out handler can no longer change the response it writes. The request body, the matched route's parameters and `c.Next()` are not available there, and a panic in `OnTimeout` answers `500` as one in the handler does.
+- **Returned error**: When `OnTimeout` writes the response and returns `nil` while the handler still runs, the middleware returns `fiber.ErrServiceUnavailable`, so middleware before it, such as `compress`, `etag`, `cache` or `idempotency`, leaves the response to the timed-out handler. The client still receives the response `OnTimeout` wrote.
 
 **New Ctx methods for the Abandon mechanism:**
 
 - `Abandon()`: Marks the context as abandoned
 - `IsAbandoned()`: Returns true if the context was abandoned
 - `ForceRelease()`: Releases an abandoned context back to the pool (for advanced use)
+- `ScheduleReclaim(handlerDone, cancel)`: Abandons the context and returns it to the pool by itself once the handler goroutine has finished and Fiber has released the context
 
 **Migration:** Replace calls like `timeout.New(handler, 2*time.Second)` with `timeout.New(handler, timeout.Config{Timeout: 2 * time.Second})`.
 
@@ -1636,6 +2118,8 @@ In v3, Fiber introduced Addons. Addons are additional useful packages that can b
 The Retry addon is a new addon that implements a retry mechanism for unsuccessful network operations. It uses an exponential backoff algorithm with jitter.
 It calls the function multiple times and tries to make it successful. If all calls are failed, then, it returns an error.
 It adds a jitter at each retry step because adding a jitter is a way to break synchronization across the client and avoid collision.
+
+A field of `retry.ExponentialBackoff` left at zero takes its default, also on a struct literal, so even the zero value calls the function and waits between the attempts as the default config does. A literal that sets only `MaxRetryCount` used to retry at once; it now waits too.
 
 <details>
 <summary>Example</summary>
@@ -1749,12 +2233,18 @@ app.Get("*", static.New("./public/index.html"))
 ```
 
 :::caution
-You have to put `*` to the end of the route if you don't define static route with `app.Use`.
+You have to put `*` to the end of the route if you don't define static route with `app.Use`. Under a `/prefix*` or `/prefix+` route such as `/static*`, only `/static` and paths below `/static/` are served; `/static-v2/app.js` or `/staticapp.js` are no longer served. A route whose first parameter is a wildcard strips the text before it (`/assets/*.js` serves `app.js` for `/assets/app.js`). After a named parameter, a directory root takes the file name from the trailing wildcard (`/:lang/*` serves `app.js` for `/en/app.js`, and `//app.js` under `/:lang?/*` is `404`), and on a route with a named parameter but no trailing wildcard it serves nothing.
 :::
+
+The static middleware opens the name the router matched and does not percent-decode it a second time. Escapes the router keeps encoded, such as `%20`, stay encoded in the file name unless `UnescapePath` is enabled, and an escape of an unreserved character left in the routed path, which only a stray `%` can forge, is answered with `404` rather than decoded into a different file, so `/static/%%370rivate/secret.txt` never opens `private/secret.txt`. A path with an empty first segment, such as `//private/secret.txt` on a root mount, is `404` too, since the router keeps it apart from `/private/secret.txt`; [Static](./middleware/static.md) shows how to collapse a doubled slash for clients that send one. On Windows a path segment ending in a dot or a space is `404` as well, since the OS strips both when it opens a file. With `StrictRouting`, which keeps `/x` and `/x/` apart, a directory requested without its trailing slash is redirected to it with `302 Found` and a file requested with one is `404`. With `Browse`, a directory listing links below the routed path rather than the request target; on a route whose prefix holds a parameter, such as `/:lang/*`, the file cache is then off for files and listings alike, and a prefix that holds `%`, `\`, `?`, `#` or a control character is `404`. See [Static](./middleware/static.md).
+
+An empty root on disk is refused: `New` panics instead of serving the filesystem root, so an unset variable cannot expose every file the process can read; use `"."` for the working directory, and `FS` for an empty root that means the root of that file system. A directory root on disk is confined: a symbolic link that leaves it, and an absolute link even when it points inside, is handled like a missing file. Set `AllowSymlinksOutsideRoot` to follow such links. A file root, and a root given through `FS`, are not confined.
 
 #### Trusted Proxies
 
 We've renamed `EnableTrustedProxyCheck` to `TrustProxy` and moved `TrustedProxies` to `TrustProxyConfig`.
+
+**Important:** To use proxy headers like `X-Forwarded-For` with `c.IP()`, you must configure **all** of `TrustProxy`, `ProxyHeader`, and a trusted proxy via `TrustProxyConfig`. If the proxy is not trusted (for example, if you set only `ProxyHeader` or only `TrustProxy` without configuring `TrustProxyConfig`), proxy headers are ignored and `c.IP()` will return the remote TCP IP instead.
 
 ```go
 // Before
@@ -1771,15 +2261,21 @@ app := fiber.New(fiber.Config{
 app := fiber.New(fiber.Config{
     // TrustProxy enables the trusted proxy check
     TrustProxy: true,
+    // ProxyHeader specifies which header to read the real client IP from
+    ProxyHeader: fiber.HeaderXForwardedFor,
     // TrustProxyConfig allows for configuring trusted proxies.
     TrustProxyConfig: fiber.TrustProxyConfig{
         // Proxies is a list of trusted proxy IP ranges/addresses.
         Proxies: []string{"0.8.0.0"},
         // Trust all loop-back IP addresses (127.0.0.0/8, ::1/128)
         Loopback: true,
-    }
+        // Trust Unix domain socket connections
+        UnixSocket: true,
+    },
 })
 ```
+
+For detailed proxy configuration guidance, see the [reverse proxy guide](./guide/reverse-proxy.md).
 
 ### 🎣 Hooks
 
@@ -1838,6 +2334,12 @@ Adapted handlers stick to `net/http` semantics. They do not interact with `fiber
 and are slower than native Fiber handlers because of the extra conversion layer. Use
 them to ease migrations, but prefer Fiber handlers in performance-critical paths.
 :::
+
+Like `adaptor.HTTPHandler`, a directly registered handler is given the path the router
+matched rather than the request line as it arrived, and a routed path with an empty
+segment or an escaped slash, such as `//admin/x` or `/admin%2Fx`, is answered with
+`404 Not Found`, since `net/http` would decode and clean it into a path no Fiber
+middleware ran for.
 
 ```go
 httpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1901,15 +2403,15 @@ app.Route("/api", func(apiGrp Router) {
 
 ```go
 // After
-app.RouteChain("/api").RouteChain("/user/:id?")
-    .Get(func(c fiber.Ctx) error {
+app.RouteChain("/api").RouteChain("/user/:id?").
+    Get(func(c fiber.Ctx) error {
         // Get user
         return c.JSON(fiber.Map{"message": "Get user", "id": c.Params("id")})
-    })
-    .Post(func(c fiber.Ctx) error {
+    }).
+    Post(func(c fiber.Ctx) error {
         // Create user
         return c.JSON(fiber.Map{"message": "User created"})
-    });
+    })
 ```
 
 ### 🗺 RebuildTree
@@ -1921,8 +2423,8 @@ For more details, refer to the [app documentation](./api/app.md#rebuildtree):
 #### Example Usage
 
 ```go
-app.Get("/define", func(c Ctx) error {  // Define a new route dynamically
-    app.Get("/dynamically-defined", func(c Ctx) error {  // Adding a dynamically defined route
+app.Get("/define", func(c fiber.Ctx) error {  // Define a new route dynamically
+    app.Get("/dynamically-defined", func(c fiber.Ctx) error {  // Adding a dynamically defined route
         return c.SendStatus(http.StatusOK)
     })
 
@@ -1955,6 +2457,7 @@ Fiber v3 introduces several new features and changes to the Ctx interface, enhan
 - **QueryFloat**: Use `Query` with generic types.
 - **QueryInt**: Use `Query` with generic types.
 - **Bind**: Now used for binding instead of view binding. Use `c.ViewBind()` for view binding.
+- **SendFile**: The file name is taken literally and is no longer percent-decoded. With `UnescapePath` off, which is the default, a route parameter keeps the escapes the router keeps, so a handler such as `c.SendFile(filepath.Join(dir, c.Params("name")))` that served `my file.txt` for `/files/my%20file.txt`, `über.txt` for `/files/%C3%BCber.txt` or `100%.txt` for `/files/100%25.txt` now looks for the escaped name and answers `404 Not Found`. Enable `UnescapePath`, or decode the parameter with `url.PathUnescape` and serve it through the `FS` option from an `os.OpenRoot` root, which refuses a decoded name that leaves the directory (see [`SendFile`](./api/ctx.md#sendfile)). The same holds for `Download`.
 
 In Fiber v3, the `Ctx` parameter in handlers is now an interface, which means the `*` symbol is no longer used. Here is an example demonstrating this change:
 
@@ -2044,13 +2547,17 @@ The `Parser` section in Fiber v3 has undergone significant changes to improve fu
 
     </details>
 
-2. **ParamsParser**: Use `c.Bind().URI()` instead of `c.ParamsParser()`.
+2. **ParamsParser**: Use `c.Bind().URI()` instead of `c.ParamsParser()`. Note that the struct tag has changed from `params` to `uri`.
 
     <details>
     <summary>Example</summary>
 
     ```go
     // Before
+    type Params struct {
+        ID int `params:"id"`
+    }
+
     app.Get("/user/:id", func(c *fiber.Ctx) error {
         var params Params
         if err := c.ParamsParser(&params); err != nil {
@@ -2062,6 +2569,10 @@ The `Parser` section in Fiber v3 has undergone significant changes to improve fu
 
     ```go
     // After
+    type Params struct {
+        ID int `uri:"id"`
+    }
+
     app.Get("/user/:id", func(c fiber.Ctx) error {
         var params Params
         if err := c.Bind().URI(&params); err != nil {
@@ -2511,6 +3022,22 @@ import "github.com/gofiber/fiber/v3/client"
 | With Struct | - | `c.SetCookiesWithStruct(v)` | `req.SetCookiesWithStruct(v)` |
 | Cookie Jar | - | `c.SetCookieJar(jar)` | - |
 
+:::caution Cookie jar path scoping
+`CookieJar.Set(uri, cookies...)` scopes a cookie that carries no usable `Path` attribute to the request URI's [RFC 6265 §5.1.4](https://datatracker.ietf.org/doc/html/rfc6265#section-5.1.4) default-path, matching how a `Set-Cookie` received for that URI is stored. A cookie set against `/a/b` with no `Path` is scoped to `/a`, not to the whole host, so it is no longer sent to `/other`.
+
+Set `Path` explicitly to keep a cookie host-wide:
+
+```go
+c := fasthttp.AcquireCookie()
+c.SetKey("session")
+c.SetValue(token)
+c.SetPath("/") // without this, the scope comes from uri's directory
+jar.Set(uri, c)
+```
+
+`SetByHost`, `SetKeyValue` and `SetKeyValueBytes` take no URI, so they have no request path to derive a scope from and continue to store such cookies at `/`.
+:::
+
 ##### Query Parameters
 
 | Description | v2 | v3 (Client) | v3 (Request) |
@@ -2609,6 +3136,7 @@ import "github.com/gofiber/fiber/v3/client"
 | Feature | v3 API |
 |---------|--------|
 | Request Hooks | `c.AddRequestHook(fn)` |
+| Final Request Hooks | `c.AddFinalRequestHook(fn)` |
 | Response Hooks | `c.AddResponseHook(fn)` |
 | Proxy | `c.SetProxyURL(url)` |
 | Context | `req.SetContext(ctx)` |
@@ -2758,7 +3286,7 @@ Authorizer: func(user, pass string, _ fiber.Ctx) bool {
 }
 ```
 
-Passwords configured for BasicAuth must now be pre-hashed. If no prefix is supplied the middleware expects a SHA-256 digest encoded in hex. Common prefixes like `{SHA256}` and `{SHA512}` and bcrypt strings are also supported. Plaintext passwords are no longer accepted. Unauthorized responses also include a `Vary: Authorization` header for correct caching behavior.
+Passwords configured for BasicAuth must now be pre-hashed. If no prefix is supplied the middleware expects a SHA-256 digest encoded in hex or base64. Common prefixes like `{SHA256}` and `{SHA512}` and bcrypt strings are also supported. Plaintext passwords are no longer accepted. Unauthorized responses also include a `Vary: Authorization` header for correct caching behavior.
 
 You can also set the optional `HeaderLimit` and `Charset`
 options to further control authentication behavior.
@@ -2766,8 +3294,8 @@ options to further control authentication behavior.
 #### KeyAuth
 
 The keyauth middleware was updated to introduce a configurable `Realm` field for the `WWW-Authenticate` header.
-The old string-based `KeyLookup` configuration has been replaced with an `Extractor` field, and the `AuthScheme` field has been removed. The auth scheme is now inferred from the extractor used (e.g., `keyauth.FromAuthHeader`). Use helper functions like `keyauth.FromHeader`, `keyauth.FromAuthHeader`, or `keyauth.FromCookie` to define where the key should be retrieved from. Multiple sources can be combined with `keyauth.Chain`.
-New `Challenge`, `Error`, `ErrorDescription`, `ErrorURI`, and `Scope` options let you customize challenge responses, include Bearer error parameters, and specify required scopes. `ErrorURI` values are validated as absolute, credentials containing whitespace are rejected, and when multiple authorization extractors are chained, all schemes are advertised in the `WWW-Authenticate` header. The middleware defers emitting `WWW-Authenticate` until a 401 status is final, and `FromAuthHeader` now trims surrounding whitespace.
+The old string-based `KeyLookup` configuration has been replaced with an `Extractor` field, and the `AuthScheme` field has been removed. The auth scheme is now inferred from the extractor used (e.g., `extractors.FromAuthHeader`). Use the helpers of the shared [`extractors`](#-extractors-package) package, such as `extractors.FromHeader`, `extractors.FromAuthHeader`, or `extractors.FromCookie`, to define where the key should be retrieved from. Multiple sources can be combined with `extractors.Chain`.
+New `Challenge`, `Error`, `ErrorDescription`, `ErrorURI`, and `Scope` options let you customize challenge responses, include Bearer error parameters, and specify required scopes. `ErrorURI` values are validated as absolute, credentials containing whitespace are rejected, and when multiple authorization extractors are chained, all schemes are advertised in the `WWW-Authenticate` header. The middleware defers emitting `WWW-Authenticate` until a 401 status is final, and `extractors.FromAuthHeader` requires exactly one space after the scheme and validates the credential as `token68`.
 
 ```go
 // Before
@@ -2779,25 +3307,35 @@ app.Use(keyauth.New(keyauth.Config{
 
 // After
 app.Use(keyauth.New(keyauth.Config{
-    Extractor: keyauth.FromAuthHeader(fiber.HeaderAuthorization, "Bearer"),
+    Extractor: extractors.FromAuthHeader("Bearer"),
     Validator: validateAPIKey,
 }))
 ```
 
-Combine multiple sources with `keyauth.Chain()` when needed.
+Combine multiple sources with `extractors.Chain()` when needed.
 
 #### Cache
 
 The deprecated `Store` and `Key` fields were removed. Use `Storage` and
 `KeyGenerator` instead to configure caching backends and cache keys.
 
-Defaults also changed: the middleware now emits `Cache-Control` headers, the default `Expiration` increased to `5 minutes` (from `1 minute`), and a new `MaxBytes` limit of `1 MB` (previously unlimited) now caps cached payloads.
+Defaults also changed: the middleware now emits `Cache-Control` headers, the default `Expiration` increased to `5 minutes` (from `1 minute`), and a new `MaxBytes` limit of `1 MB` (previously unlimited) now caps cached payloads when you call `cache.New()` without a `Config`. A `Config` that leaves `MaxBytes` unset stores bodies without a limit, as in v2.
 
 To restore v2 behavior:
 
 - Set `DisableCacheControl` to `true` to suppress automatic `Cache-Control` headers.
 - Configure `Expiration` to `1*time.Minute`.
 - Set `MaxBytes` to `0` (or a higher value) when caching large responses.
+- Disable structured key dimensions as needed (for example `DisableQueryKeys: true`), or provide a custom `KeyGenerator`.
+
+Additional v3 cache key options:
+
+- `Methods`: HTTP methods eligible for caching (default `GET`, `HEAD`)
+- `DisableQueryKeys`: disable canonicalized query args in keys (default `false`)
+- `KeyHeaders`: request header allow-list for key partitioning
+- `KeyCookies`: explicit cookie allow-list for key partitioning; the values are hashed in the key
+- `KeyCredentialHeaders`: request headers that carry a client's credential; they partition entries like `KeyHeaders`, and hits on them are sent with `Cache-Control: private`
+- `DisableVaryHeaders`: disable response `Vary` dimensions in lookup/storage partitioning (default `false`)
 
 #### CORS
 
@@ -2820,6 +3358,38 @@ app.Use(cors.New(cors.Config{
     ExposeHeaders: []string{"Content-Length"},
 }))
 ```
+
+#### Redirect
+
+- **Ordered rules**: `Rules map[string]string` is deprecated in favor of `RuleList []Rule`. A map has no order, so which rule answered a path two rules both matched could not be expressed by the author. Rules in a `RuleList` are tried in the order written and the first match wins, exactly as routes are matched.
+
+```go
+// Before
+app.Use(redirect.New(redirect.Config{
+    Rules: map[string]string{
+        "/old":   "/new",
+        "/old/*": "/new/$1",
+    },
+}))
+
+// After
+app.Use(redirect.New(redirect.Config{
+    RuleList: []redirect.Rule{
+        {From: "/old", To: "/new"},
+        {From: "/old/*", To: "/new/$1"},
+    },
+}))
+```
+
+`Rules` keeps working for the whole of v3. Its order is now decided by a documented heuristic rather than by analyzing each pattern: most path text pinned before the first `*`, then most path text overall, then fewest asterisks, then the key. Configurations written with path text and `*` are unaffected; rules relying on regular-expression syntax beyond `*` may order differently, and `RuleList` gives exact control. Setting both fields panics.
+
+Fiber now also warns at startup when a rule can never fire because an earlier one matches every path it does.
+
+- **A rule matches the whole path**: both ends of the pattern are anchored, so a rule no longer matches just a suffix of the path, and an alternation such as `/a|/b` cannot match by prefix or suffix alone (#4476).
+
+- **A capture cannot leave the target's path**: a rule whose composed location holds more `.` or `..` segments than its target is skipped for that request, so `{From: "/@*", To: "https://cdn.example.com/public/$1"}` no longer sends `/@../other/x` to `https://cdn.example.com/public/../other/x`.
+
+- **A capture may no longer stand inside a target's authority**, which covers the host, the port and any userinfo: `"https://$1.cdn.example.com/"`, `"https://cdn.example.com:$1"` and `"https://$1"` are refused at startup with a warning, and those rules never fire. Whether such a value was safe depended on percent-decoding, IDNA mapping, numeric labels read as IPv4 addresses, IPv6 brackets and userinfo, and each of those was a way to move the host somewhere the target did not name. A capture in the path, query or fragment is unchanged. Where the destination host genuinely varies, pick it in a handler and use `c.Redirect()`, where the value is yours to validate.
 
 #### CSRF
 
@@ -2853,12 +3423,12 @@ app.Use(csrf.New(csrf.Config{
 
 // After - use Extractor instead
 app.Use(csrf.New(csrf.Config{
-    Extractor: csrf.FromHeader("X-Csrf-Token"),
+    Extractor: extractors.FromHeader("X-Csrf-Token"),
     // other config...
 }))
 ```
 
-- **FromCookie Extractor Removal**: The `csrf.FromCookie` extractor has been intentionally removed for security reasons. Using cookie-based extraction defeats the purpose of CSRF protection by making the extracted token always match the cookie value.
+- **Cookie Extractor Restriction**: The `csrf.FromCookie` extractor has been removed for security reasons, and `csrf.New` panics when its `Extractor` (or any extractor inside a `Chain`) reads the cookie named by `CookieName`. Using cookie-based extraction for the CSRF cookie defeats the purpose of CSRF protection by making the extracted token always match the cookie value.
 
 ```go
 // Before - This was a security vulnerability
@@ -2868,19 +3438,24 @@ app.Use(csrf.New(csrf.Config{
 
 // After - Use secure extractors instead
 app.Use(csrf.New(csrf.Config{
-    Extractor: csrf.FromHeader("X-Csrf-Token"), // ✅ Secure
-    // or
-    Extractor: csrf.FromForm("_csrf"),          // ✅ Secure
-    // or
-    Extractor: csrf.FromQuery("csrf_token"),    // ✅ Acceptable
+    Extractor: extractors.FromHeader("X-Csrf-Token"), // ✅ Secure
 }))
+
+// or read the token from a form field
+app.Use(csrf.New(csrf.Config{
+    Extractor: extractors.FromForm("_csrf"), // ✅ Secure
+}))
+
+// Avoid FromQuery and FromParam for CSRF tokens: URLs end up in logs and browser history.
 ```
 
-**Security Note**: The removal of `FromCookie` prevents a common misconfiguration that would completely bypass CSRF protection. The middleware uses the Double Submit Cookie pattern, which requires the token to be submitted through a different channel than the cookie to provide meaningful protection.
+**Security Note**: Rejecting an extractor that reads the CSRF cookie prevents a common misconfiguration that would completely bypass CSRF protection. The middleware uses the Double Submit Cookie pattern, which requires the token to be submitted through a different channel than the cookie to provide meaningful protection.
 
 #### Idempotency
 
 - **DisableValueRedaction Toggle**: The idempotency middleware now hides keys in logs and error paths by default, with a `DisableValueRedaction` boolean (default `false`) to reveal them when needed.
+- **KeyScope**: A function that returns the scope a key belongs to, such as the ID of the authenticated user. A response is stored, replayed and locked per scope and key, so a key another user sent or guessed returns nothing stored for you. Without it the key alone identifies a request, as before.
+- **Cookies are not replayed**: `Set-Cookie` and `Set-Cookie2` are left out of the stored response and out of a replay unless `KeepResponseHeaders` names them. Before, a response with `KeepResponseHeaders` unset replayed the cookie of the first client to every request that sent the key. A retry that needs the cookie must now name it, together with `KeyScope`.
 
 #### Timeout
 
@@ -2889,10 +3464,10 @@ Update your code as follows:
 
 ```go
 // Before
-app.Use(timeout.New(handler, 2*time.Second))
+app.Get("/", timeout.New(handler, 2*time.Second))
 
 // After
-app.Use(timeout.New(handler, timeout.Config{Timeout: 2 * time.Second}))
+app.Get("/", timeout.New(handler, timeout.Config{Timeout: 2 * time.Second}))
 ```
 
 **Important behavioral changes:**
@@ -2985,7 +3560,7 @@ app.Get("/live", healthcheck.New())
 
 #### Monitor
 
-Since v3 the Monitor middleware has been moved to the [Contrib package](https://github.com/gofiber/contrib/tree/main/monitor)
+Since v3 the Monitor middleware has been moved to the [Contrib package](https://github.com/gofiber/contrib/tree/main/v3/monitor)
 
 ```go
 // Before
@@ -3029,7 +3604,35 @@ proxy.WithClient(&fasthttp.Client{
 app.Get("/gif", proxy.Forward("https://i.imgur.com/IWaBepg.gif"))
 ```
 
-`proxy.Balancer` also adopts the common middleware signature pattern and now accepts an optional variadic config: call `proxy.Balancer()` to use the defaults or continue passing a single `proxy.Config` value as in v2.
+`proxy.Balancer` also adopts the common middleware signature pattern and now accepts its config as an optional variadic argument, so you can keep passing a single `proxy.Config` value as in v2. `Servers` (or a custom `Client`) is required, so `proxy.Balancer()` without a config panics at startup, as `proxy.Balancer(proxy.Config{})` does.
+
+#### Rewrite
+
+- **Captures decoded once**: with `UnescapePath` enabled a wildcard capture is escaped again before it is inserted into `To`, so the rewritten path is not decoded a second time. `/files/%252e%252e/secret` rewritten by `/files/*` to `/public/$1` now reaches the handler as `/public/%2e%2e/secret` instead of `/secret`.
+- **Ordered rules**: `Rules map[string]string` is deprecated in favor of `RuleList []Rule`. A map has no order, so which rule answered a path two rules both matched was decided by map iteration, which Go randomizes per run: the same request could be rewritten differently from one call to the next. Rules in a `RuleList` are tried in the order written and the first match wins, exactly as routes are matched.
+
+```go
+// Before
+app.Use(rewrite.New(rewrite.Config{
+    Rules: map[string]string{
+        "/old":   "/new",
+        "/old/*": "/new/$1",
+    },
+}))
+
+// After
+app.Use(rewrite.New(rewrite.Config{
+    RuleList: []rewrite.Rule{
+        {From: "/old", To: "/new"},
+        {From: "/old/*", To: "/new/$1"},
+    },
+}))
+```
+
+`Rules` keeps working for the whole of v3; its keys are ranked most path text before the first `*`, then most path text overall, then fewest asterisks, then the key. Setting both fields panics.
+
+- **A capture cannot leave `To`**: a rewritten path holding more `.` or `..` segments than `To` itself is skipped for that request, so `{From: "/@*", To: "/users/$1"}` no longer rewrites `/@../admin` to `/admin`.
+- **A rule is path text**: `From` is no longer compiled as an unescaped regular expression. `*` matches a run of any bytes but a newline and every other byte stands for itself, so `/preis-1.000-euro` rewrites that path and no longer also `/preis-1X000-euro`, and `/faq?` no longer rewrites `/fa`. This also completes the anchoring fix from #4476: `"^" + "/a|/b" + "$"` parsed as `(^/a)|(/b$)`, so a rule could match by prefix or suffix alone. Rules written with path text and `*` are unaffected; a rule relying on regular-expression syntax now matches the literal characters it spells.
 
 #### Session
 
@@ -3037,8 +3640,9 @@ app.Get("/gif", proxy.Forward("https://i.imgur.com/IWaBepg.gif"))
 create a store with `session.NewStore()` or call `Store()` on the middleware.
 Sessions obtained from a store must be released manually via `sess.Release()`.
 Additionally, replace the deprecated `KeyLookup` option with extractor
-functions such as `session.FromCookie()` or `session.FromHeader()`. Multiple
-extractors can be combined with `session.Chain()`.
+functions from the shared `extractors` package such as `extractors.FromCookie()`
+or `extractors.FromHeader()`. Multiple extractors can be combined with
+`extractors.Chain()`.
 
 ```go
 // Before
@@ -3051,10 +3655,21 @@ app.Use(session.New(session.Config{
 ```go
 // After
 app.Use(session.New(session.Config{
-    Extractor: session.FromCookie("session_id"),
+    Extractor: extractors.FromCookie("session_id"),
     Store:     session.NewStore(),
 }))
 ```
+
+`CookieSameSite` is now read the same way as it is for `Ctx.Cookie`:
+
+- **`"Disabled"` omits the attribute.** The session used to ignore
+  `CookieSameSiteDisabled` and send `SameSite=Lax`, while `Ctx.Cookie` honored
+  it, so one constant meant two things. A session cookie configured this way now
+  carries no `SameSite` attribute, which is weaker than what was sent before. Set
+  `CookieSameSite: "Lax"` explicitly to keep the old cookie.
+- **Any other value panics** during configuration instead of silently falling
+  back to `Lax`, matching how `AbsoluteTimeout` is already validated. `Disabled`,
+  `Lax`, `Strict` and `None` are accepted case-insensitively.
 
 See the [Session Middleware Migration Guide](./middleware/session.md#migration-guide)
 for complete details.

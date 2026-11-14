@@ -1,10 +1,13 @@
 package cache
 
 import (
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/utils/v2"
+	utilsstrings "github.com/gofiber/utils/v2/strings"
 )
 
 // Config defines the config for middleware.
@@ -24,11 +27,20 @@ type Config struct {
 	// Optional. Default: nil
 	CacheInvalidator func(fiber.Ctx) bool
 
-	// Key allows you to generate custom keys, by default c.Path() is used
+	// KeyGenerator allows you to generate custom keys.
 	//
-	// Default: func(c fiber.Ctx) string {
-	//   return utils.CopyString(c.Path())
-	// }
+	// When nil, the middleware uses a structured key based on:
+	//   - Request scheme and host, as c.Scheme() and c.Host() report them
+	//     (bounded; two hosts never share an entry)
+	//   - Request path (bounded to 192 bytes, hashed if longer)
+	//   - Canonical query string (sorted parameters, bounded)
+	//   - Selected request headers (from KeyHeaders)
+	//   - Selected cookies (from KeyCookies, their values hashed)
+	//
+	// The resulting cache key is always partitioned by request method internally.
+	// A custom key is stored with '\', '|' and ':' escaped as \\, \p and \c.
+	//
+	// Default: nil
 	KeyGenerator func(fiber.Ctx) string
 
 	// ExpirationGenerator allows you to generate a custom expiration per request.
@@ -37,6 +49,13 @@ type Config struct {
 	// Default: nil
 	ExpirationGenerator func(fiber.Ctx, *Config) time.Duration
 
+	// clock overrides the time source used for freshness decisions. It is
+	// unexported so it never becomes part of the public API and exists solely to
+	// make time-dependent tests deterministic. When nil, time.Now is used.
+	clock func() time.Time
+
+	accounting func(storedBytes uint, heapLen int)
+
 	// CacheHeader header on response header, indicate cache status, with the following possible return value
 	//
 	// hit, miss, unreachable
@@ -44,64 +63,150 @@ type Config struct {
 	// Optional. Default: X-Cache
 	CacheHeader string
 
-	// You can specify HTTP methods to cache.
-	// The middleware just caches the routes of its methods in this slice.
+	// KeyHeaders is the set of request headers that can change the selected representation and
+	// therefore should partition cache entries. Set this to an empty slice to disable
+	// header-based partitioning.
+	//
+	// Header names are normalized to lowercase for case-insensitive matching.
+	//
+	// Optional. Default: []string{"Accept", "Accept-Encoding", "Accept-Language"}
+	KeyHeaders []string
+
+	// KeyCookies is an explicit allow-list of request cookies that should partition cache entries.
+	// Cookies are excluded by default to avoid accidental per-user cache fragmentation.
+	//
+	// Values are hashed in the key. A missing and an empty cookie share a key.
+	//
+	// Optional. Default: nil
+	KeyCookies []string
+
+	// KeyCredentialHeaders names request headers that carry a client's credential, such as a
+	// token in a header of your own. They partition entries like KeyHeaders, with hashed values;
+	// hits on them are private and not served stale (see AllowStaleCredentialResponses), and a
+	// refusal (401, 403 or 407) ends the entry and the credential's other variants.
+	//
+	// Authorization, and Cookie, Proxy-Authorization, X-API-Key, X-Auth-Token and X-Access-Token
+	// when KeyHeaders names them, always count. A custom KeyGenerator's key is opaque: name every
+	// credential header it holds. They take no part in the key then, but a hit for a request that
+	// sends one is still private and not served stale.
+	//
+	// Optional. Default: nil
+	KeyCredentialHeaders []string
+
+	// Methods specifies which HTTP methods are eligible for caching.
+	// Requests with methods not in this list bypass the cache entirely.
+	// Method names are normalized to uppercase automatically.
+	// Set to nil to use the default; set to an empty slice to disable caching for all methods.
 	//
 	// Default: []string{fiber.MethodGet, fiber.MethodHead}
 	Methods []string
+
+	// credentialKeyHeaders is the part of KeyHeaders that carries a credential.
+	credentialKeyHeaders []string
+
+	// refusalRecordLimit overrides the limit in tests; zero derives it from MaxBytes.
+	refusalRecordLimit int
 
 	// Expiration is the time that a cached response will live
 	//
 	// Optional. Default: 5 * time.Minute
 	Expiration time.Duration
 
-	// Max number of bytes of response bodies simultaneously stored in cache. When limit is reached,
-	// entries with the nearest expiration are deleted to make room for new.
+	// Max number of bytes simultaneously stored in cache, counting each entry's body, key and stored
+	// headers. When limit is reached, entries with the nearest expiration are deleted to make room for new.
+	// The number of entries is limited along with it, to MaxBytes/256 but no fewer than 1024,
+	// since an entry also takes memory for bookkeeping that is not counted.
 	// 0 means no limit
 	//
 	// Optional. Default: 1 * 1024 * 1024
 	MaxBytes uint
+
+	// keyHeadersNameCredential: KeyHeaders names a credential header, so every entry is one client's,
+	// whatever the KeyGenerator.
+	keyHeadersNameCredential bool
+
+	// DisableQueryKeys disables query-string partitioning in cache keys.
+	//
+	// Optional. Default: false
+	DisableQueryKeys bool
+
+	// DisableVaryHeaders disables response Vary-based lookup partitioning.
+	//
+	// Optional. Default: false
+	DisableVaryHeaders bool
 
 	// DisableValueRedaction turns off masking cache keys in logs and error messages when set to true.
 	//
 	// Optional. Default: false
 	DisableValueRedaction bool
 
-	// DisableCacheControl disables client side caching if set to true
+	// DisableCacheControl disables client side caching if set to true.
+	//
+	// When false, a hit whose entry carries no Cache-Control of its own is sent
+	// with "public, max-age=<remaining>", or "private, max-age=<remaining>" when
+	// the entry holds one user's response: the response's Vary lists a credential
+	// header, KeyCookies or KeyCredentialHeaders is set, or KeyHeaders names a
+	// credential header (see KeyCredentialHeaders).
 	//
 	// Optional. Default: false
 	DisableCacheControl bool
+
+	// AllowStaleCredentialResponses lets Cache-Control: max-stale reach an expired entry that
+	// holds one client's response: one keyed or varied by a cookie or credential header, or
+	// looked up with Authorization. By default it is not served stale, as the app may have
+	// ended the credential by then. An invalidated entry is never served stale.
+	//
+	// Optional. Default: false
+	AllowStaleCredentialResponses bool
 
 	// StoreResponseHeaders allows you to store additional headers generated by
 	// next middlewares and handlers.
 	//
 	// Default: false
 	StoreResponseHeaders bool
+
+	// usesDefaultKeyGenerator records that KeyGenerator above is the one this
+	// package installed, which lets the handler build that key straight into the
+	// buffer holding the rest of the cache key. Set only by configDefault, so a
+	// KeyGenerator the user supplied is always called through the field.
+	usesDefaultKeyGenerator bool
 }
 
 // ConfigDefault is the default config
 var ConfigDefault = Config{
-	Next:                  nil,
-	Expiration:            5 * time.Minute,
-	CacheHeader:           "X-Cache",
-	DisableCacheControl:   false,
-	CacheInvalidator:      nil,
-	DisableValueRedaction: false,
-	KeyGenerator: func(c fiber.Ctx) string {
-		return utils.CopyString(c.Path())
-	},
-	ExpirationGenerator:  nil,
-	StoreResponseHeaders: false,
-	Storage:              nil,
-	MaxBytes:             1 * 1024 * 1024,
-	Methods:              []string{fiber.MethodGet, fiber.MethodHead},
+	Next:                          nil,
+	Expiration:                    5 * time.Minute,
+	CacheHeader:                   "X-Cache",
+	DisableCacheControl:           false,
+	AllowStaleCredentialResponses: false,
+	CacheInvalidator:              nil,
+	DisableValueRedaction:         false,
+	KeyGenerator:                  nil,
+	DisableQueryKeys:              false,
+	KeyHeaders:                    []string{fiber.HeaderAccept, fiber.HeaderAcceptEncoding, fiber.HeaderAcceptLanguage},
+	KeyCookies:                    nil,
+	KeyCredentialHeaders:          nil,
+	Methods:                       []string{fiber.MethodGet, fiber.MethodHead},
+	DisableVaryHeaders:            false,
+	ExpirationGenerator:           nil,
+	StoreResponseHeaders:          false,
+	Storage:                       nil,
+	MaxBytes:                      1 * 1024 * 1024,
 }
 
 // Helper function to set default values
 func configDefault(config ...Config) Config {
 	// Return default config if nothing provided
 	if len(config) < 1 {
-		return ConfigDefault
+		cfg := ConfigDefault
+		cfg.normalizeKeys()
+		if cfg.KeyGenerator == nil {
+			cfg.usesDefaultKeyGenerator = true
+			cfg.KeyGenerator = func(c fiber.Ctx) string {
+				return defaultKeyGenerator(c, &cfg)
+			}
+		}
+		return cfg
 	}
 
 	// Override default config
@@ -117,11 +222,91 @@ func configDefault(config ...Config) Config {
 	if cfg.CacheHeader == "" {
 		cfg.CacheHeader = ConfigDefault.CacheHeader
 	}
-	if cfg.KeyGenerator == nil {
-		cfg.KeyGenerator = ConfigDefault.KeyGenerator
-	}
-	if len(cfg.Methods) == 0 {
+	cfg.normalizeKeys()
+	// nil = use default methods; explicit empty slice = cache no methods
+	if cfg.Methods == nil {
 		cfg.Methods = ConfigDefault.Methods
+	} else {
+		// Normalize method names to uppercase (HTTP methods are case-sensitive
+		// and c.Method() returns uppercase, e.g. "GET" not "get").
+		// Copy first to avoid mutating the caller's slice.
+		normalized := make([]string, len(cfg.Methods))
+		for i, m := range cfg.Methods {
+			normalized[i] = utilsstrings.ToUpper(m)
+		}
+		cfg.Methods = normalized
+	}
+	if cfg.KeyGenerator == nil {
+		cfg.usesDefaultKeyGenerator = true
+		cfg.KeyGenerator = func(c fiber.Ctx) string {
+			return defaultKeyGenerator(c, &cfg)
+		}
+	} else {
+		// A Config the caller built may carry the flag from a copy of one this
+		// package filled in, while naming a generator of its own.
+		cfg.usesDefaultKeyGenerator = false
 	}
 	return cfg
+}
+
+// normalizeKeys normalizes the key's dimensions and works out which headers carry a credential.
+func (cfg *Config) normalizeKeys() {
+	cfg.KeyCredentialHeaders = normalizeHeaderDimensions(cfg.KeyCredentialHeaders, nil)
+	named := normalizeHeaderDimensions(cfg.KeyHeaders, ConfigDefault.KeyHeaders)
+	cfg.keyHeadersNameCredential = len(cfg.appendCredentials(nil, named)) > 0
+	cfg.KeyHeaders = normalizeHeaderDimensions(slices.Concat(named, cfg.KeyCredentialHeaders), nil)
+	cfg.credentialKeyHeaders = cfg.appendCredentials(nil, cfg.KeyHeaders)
+	cfg.KeyCookies = normalizeCookieDimensions(cfg.KeyCookies, nil)
+}
+
+// now returns the current time used for freshness decisions. Production uses
+// time.Now; tests can inject a deterministic clock via the unexported clock
+// field.
+func (cfg *Config) now() time.Time {
+	if cfg.clock != nil {
+		return cfg.clock()
+	}
+	return time.Now()
+}
+
+func normalizeHeaderDimensions(values, defaults []string) []string {
+	return normalizeKeyDimensions(values, defaults, utilsstrings.ToLower)
+}
+
+func normalizeCookieDimensions(values, defaults []string) []string {
+	return normalizeKeyDimensions(values, defaults, nil)
+}
+
+func normalizeKeyDimensions(values, defaults []string, normalize func(string) string) []string {
+	if values == nil {
+		if len(defaults) == 0 {
+			return nil
+		}
+		values = defaults
+	}
+
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := utils.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		normalized := trimmed
+		if normalize != nil {
+			normalized = normalize(trimmed)
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+
+	sort.Strings(out)
+	return out
 }

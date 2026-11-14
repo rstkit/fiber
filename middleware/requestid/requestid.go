@@ -1,8 +1,13 @@
 package requestid
 
 import (
+	"sync"
+
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/bytepolicy"
+	"github.com/gofiber/fiber/v3/middleware/logger"
 	"github.com/gofiber/utils/v2"
+	"github.com/gofiber/utils/v2/swar"
 )
 
 // The contextKey type is unexported to prevent collisions with context keys defined in
@@ -14,8 +19,12 @@ const (
 	requestIDKey contextKey = iota
 )
 
+var registerLogContextTagsOnce sync.Once
+
 // New creates a new middleware handler
 func New(config ...Config) fiber.Handler {
+	registerLogContextTagsOnce.Do(registerLogContextTags)
+
 	// Set default config
 	cfg := configDefault(config...)
 
@@ -31,11 +40,16 @@ func New(config ...Config) fiber.Handler {
 		c.Set(cfg.Header, rid)
 
 		// Add the request ID to locals
-		c.Locals(requestIDKey, rid)
+		fiber.StoreInContext(c, requestIDKey, rid)
 
 		// Continue stack
 		return c.Next()
 	}
+}
+
+func registerLogContextTags() {
+	logger.RegisterContextTag("requestid", FromContext)
+	logger.RegisterContextTag("request-id", FromContext)
 }
 
 // sanitizeRequestID returns the provided request ID when it is valid, otherwise
@@ -63,9 +77,23 @@ func isValidRequestID(rid string) bool {
 		return false
 	}
 
-	for i := 0; i < len(rid); i++ {
-		c := rid[i]
-		if c < 0x20 || c > 0x7e {
+	// Check eight bytes per iteration, finishing inputs of 8+ bytes with
+	// one overlapping word; shorter ones are checked byte-wise.
+	n := len(rid)
+	i := 0
+	for ; i+swar.WordLen <= n; i += swar.WordLen {
+		if bytepolicy.NonVisibleASCIIMask(swar.Load8(rid, i)) != 0 {
+			return false
+		}
+	}
+	if i == n {
+		return true
+	}
+	if n >= swar.WordLen {
+		return bytepolicy.NonVisibleASCIIMask(swar.Load8(rid, n-swar.WordLen)) == 0
+	}
+	for ; i < n; i++ {
+		if bytepolicy.IsNonVisibleASCII(rid[i]) {
 			return false
 		}
 	}
@@ -74,10 +102,12 @@ func isValidRequestID(rid string) bool {
 }
 
 // FromContext returns the request ID from context.
+// It accepts fiber.CustomCtx, fiber.Ctx, *fasthttp.RequestCtx, and context.Context.
 // If there is no request ID, an empty string is returned.
-func FromContext(c fiber.Ctx) string {
-	if rid, ok := c.Locals(requestIDKey).(string); ok {
+func FromContext(ctx any) string {
+	if rid, ok := fiber.ValueFromContext[string](ctx, requestIDKey); ok {
 		return rid
 	}
+
 	return ""
 }

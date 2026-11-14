@@ -1,7 +1,6 @@
 package csrf
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -91,7 +90,11 @@ type Config struct {
 	// CookieName as this defeats CSRF protection entirely.
 	Extractor extractors.Extractor
 
-	// IdleTimeout is the duration of time the CSRF token is valid.
+	// IdleTimeout is the duration of time the CSRF token is valid, counted from its
+	// last use. In session mode behind the session middleware, a token is renewed only
+	// when less than half of it is left, so there it stays valid for at least half of
+	// IdleTimeout and at most IdleTimeout after its last use; the cookie expires with
+	// it. Set twice the idle window you want.
 	//
 	// Optional. Default: 30 * time.Minute
 	IdleTimeout time.Duration
@@ -190,12 +193,13 @@ func validateExtractorSecurity(cfg *Config) {
 			"' used for token storage. This completely defeats CSRF protection.")
 	}
 
-	// Check chained extractors
-	for i, extractor := range cfg.Extractor.Chain {
-		if isInsecureCookieExtractor(extractor, cfg.CookieName) {
-			panic(fmt.Sprintf("CSRF: Chained extractor #%d reads from the same cookie '%s' "+
-				"used for token storage. This completely defeats CSRF protection.", i+1, cfg.CookieName))
-		}
+	// Check the full extractor tree so a nested chain cannot hide a fallback
+	// that reads from the CSRF storage cookie.
+	if cfg.Extractor.Contains(func(extractor extractors.Extractor) bool {
+		return isInsecureCookieExtractor(extractor, cfg.CookieName)
+	}) {
+		panic("CSRF: Chained extractor reads from the same cookie '" + cfg.CookieName +
+			"' used for token storage. This completely defeats CSRF protection.")
 	}
 
 	// Additional security warnings (non-fatal)

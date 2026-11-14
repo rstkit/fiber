@@ -12,22 +12,23 @@ type CookieBinding struct {
 
 // Name returns the binding name.
 func (*CookieBinding) Name() string {
-	return "cookie"
+	return bindingCookie
 }
 
 // Bind parses the request cookie and returns the result.
 func (b *CookieBinding) Bind(req *fasthttp.Request, out any) error {
-	data := make(map[string][]string)
+	data := acquireBindData(out, 0)
+	defer releaseBindData(data)
 
 	for key, val := range req.Header.Cookies() {
 		k := utils.UnsafeString(key)
 		v := utils.UnsafeString(val)
-		if err := formatBindData(b.Name(), out, data, k, v, b.EnableSplitting, false); err != nil {
+		if err := data.bind(b.Name(), out, k, v, b.EnableSplitting, false); err != nil {
 			return err
 		}
 	}
 
-	return parse(b.Name(), out, data)
+	return data.parse(b.Name(), out)
 }
 
 // Reset resets the CookieBinding binder.

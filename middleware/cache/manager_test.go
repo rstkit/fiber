@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v3/internal/redact"
+	"github.com/gofiber/fiber/v3/internal/storage/memory"
 	"github.com/gofiber/utils/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,10 +35,18 @@ func Test_manager_get(t *testing.T) {
 
 func Test_manager_logKey(t *testing.T) {
 	t.Parallel()
+	assert.Equal(t, redact.Placeholder, newManager(nil, true).logKey("secret"))
+	assert.Equal(t, "secret", newManager(nil, false).logKey("secret"))
+}
 
-	redactedManager := newManager(nil, true)
-	assert.Equal(t, redactedKey, redactedManager.logKey("secret"))
-
-	plainManager := newManager(nil, false)
-	assert.Equal(t, "secret", plainManager.logKey("secret"))
+// Test_manager_release_ResetsEveryField pins that an item handed back to the
+// pool carries nothing from its last use: a field left set would surface in
+// whatever entry the pooled item is reused for next.
+func Test_manager_release_ResetsEveryField(t *testing.T) {
+	t.Parallel()
+	m := newManager(memory.New(), true)
+	e := m.acquire()
+	*e = populatedItem()
+	m.release(e)
+	require.Equal(t, item{}, *e)
 }

@@ -1,23 +1,28 @@
 package etag
 
 import (
-	"bytes"
-	"hash/crc32"
 	"math"
 	"slices"
 
 	"github.com/gofiber/fiber/v3"
+	internaletag "github.com/gofiber/fiber/v3/internal/etag"
+	"github.com/gofiber/fiber/v3/internal/fieldname"
+	"github.com/gofiber/fiber/v3/internal/headerlist"
+	"github.com/gofiber/fiber/v3/internal/headerlookup"
+	"github.com/gofiber/fiber/v3/internal/mediatype"
+	"github.com/gofiber/fiber/v3/internal/sizedstream"
+	"github.com/gofiber/utils/v2"
 	"github.com/valyala/bytebufferpool"
 )
 
 var (
 	weakPrefix = []byte("W/")
-	crc32q     = crc32.MakeTable(0xD5828281)
+	crc32q     = newCRCTable(0xD5828281)
 )
 
 // Generate returns a strong ETag for body.
 func Generate(body []byte) []byte {
-	if len(body) > math.MaxUint32 {
+	if uint64(len(body)) > uint64(math.MaxUint32) {
 		return nil
 	}
 	bb := bytebufferpool.Get()
@@ -26,7 +31,7 @@ func Generate(body []byte) []byte {
 	b = append(b, '"')
 	b = appendUint(b, uint32(len(body))) // #nosec G115 -- length checked above
 	b = append(b, '-')
-	b = appendUint(b, crc32.Checksum(body, crc32q))
+	b = appendUint(b, crc32q.checksum(body))
 	b = append(b, '"')
 	return slices.Clone(b)
 }
@@ -59,8 +64,18 @@ func New(config ...Config) fiber.Handler {
 			return err
 		}
 
+		// Never generate ETags for Server-Sent Events or a stream of unknown length: hashing the
+		// body would materialize the stream and break real-time delivery.
+		if isEventStream(c) || (c.Response().IsBodyStream() && c.Response().Header.ContentLength() < 0) {
+			return nil
+		}
+
 		// Don't generate ETags for invalid responses
-		if c.Response().StatusCode() != fiber.StatusOK {
+		if c.Res().StatusCode() != fiber.StatusOK {
+			return nil
+		}
+		// Body keeps a read error as the body; a stream that fails or delivers other than it declares goes out untagged.
+		if c.Response().IsBodyStream() && !sizedstream.Read(c.Response(), c.Response().Header.ContentLength()) {
 			return nil
 		}
 		body := c.Response().Body()
@@ -68,13 +83,20 @@ func New(config ...Config) fiber.Handler {
 		if len(body) == 0 {
 			return nil
 		}
-		// Skip ETag if header is already present
-		if c.Response().Header.PeekBytes(normalizedHeaderETag) != nil {
+		// Skip ETag if any field line is already present, whatever case the
+		// handler spelled the name in — a second line would be a conflicting
+		// validator (RFC 9110 Section 8.8.3).
+		//
+		// Both halves of the guard are needed: fasthttp canonicalizes ETag to
+		// "Etag", so a store of canonical names still holds a spelling the
+		// byte-exact PeekAll(fiber.HeaderETag) misses while normalizing is off.
+		respHeader := &c.Response().Header
+		if len(fieldname.Lines(respHeader, fiber.HeaderETag, headerlookup.Canonical(c) && fieldname.Canonical(respHeader))) > 0 {
 			return nil
 		}
 
 		bodyLength := len(body)
-		if bodyLength > math.MaxUint32 {
+		if uint64(bodyLength) > uint64(math.MaxUint32) {
 			return c.SendStatus(fiber.StatusRequestEntityTooLarge)
 		}
 
@@ -85,35 +107,37 @@ func New(config ...Config) fiber.Handler {
 			etag = Generate(body)
 		}
 
-		// Get ETag header from request
-		clientEtag := c.Request().Header.Peek(fiber.HeaderIfNoneMatch)
+		// The ETag header is sent on both 200 and 304 responses (RFC 9110 §15.4.5).
+		c.Response().Header.SetCanonical(normalizedHeaderETag, etag)
 
-		// Check if client's ETag is weak
-		if bytes.HasPrefix(clientEtag, weakPrefix) {
-			// Check if server's ETag is weak
-			if bytes.Equal(clientEtag[2:], etag) || bytes.Equal(clientEtag[2:], etag[2:]) {
-				// W/1 == 1 || W/1 == W/1
-				c.RequestCtx().ResetBody()
-
-				return c.SendStatus(fiber.StatusNotModified)
-			}
-			// W/1 != W/2 || W/1 != 2
-			c.Response().Header.SetCanonical(normalizedHeaderETag, etag)
-
+		// 304 is defined for GET and HEAD only (RFC 9110 §13.1.2); other methods pass through.
+		if method := c.Method(); method != fiber.MethodGet && method != fiber.MethodHead {
 			return nil
 		}
 
-		if bytes.Contains(clientEtag, etag) {
-			// 1 == 1
-			c.RequestCtx().ResetBody()
+		// Get ETag header from request. If-None-Match is a list field: repeated
+		// lines are one combined list (RFC 9110 Section 5.2) and the name
+		// matches case-insensitively, agreeing with the core Fresh path.
+		clientEtag := headerlist.Join(fieldname.Lines(&c.Request().Header, fiber.HeaderIfNoneMatch, headerlookup.Canonical(c)))
+
+		// Both slices are only read for the duration of the comparison and
+		// neither is retained, so the unsafe views cannot outlive them.
+		if internaletag.AnyMatch(utils.UnsafeString(clientEtag), utils.UnsafeString(etag)) {
+			c.Res().ResetBody()
 
 			return c.SendStatus(fiber.StatusNotModified)
 		}
-		// 1 != 2
-		c.Response().Header.SetCanonical(normalizedHeaderETag, etag)
 
 		return nil
 	}
+}
+
+// isEventStream reports whether the response is a Server-Sent Events stream.
+// Such responses must be passed through untouched: buffering the body to hash
+// it would break real-time delivery.
+func isEventStream(c fiber.Ctx) bool {
+	ct := mediatype.StripParams(utils.UnsafeBytes(c.GetRespHeader(fiber.HeaderContentType)))
+	return utils.EqualFold(utils.UnsafeString(ct), fiber.MIMETextEventStream)
 }
 
 // appendUint appends n to dst and returns the extended dst.
@@ -125,7 +149,7 @@ func appendUint(dst []byte, n uint32) []byte {
 	for n >= 10 {
 		i--
 		q = n / 10
-		buf[i] = '0' + byte(n-q*10)
+		buf[i] = '0' + byte(n-q*10) //nolint:gosec // G115: integer overflow conversion uint32 -> byte
 		n = q
 	}
 	i--

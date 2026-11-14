@@ -1,17 +1,17 @@
 ---
 id: reverse-proxy
-title: 🔄 Reverse Proxy Configuration
+title: 🔄 Reverse Proxy
 description: >-
   Learn how to set up reverse proxies like Nginx or Traefik to enable modern
-  HTTP capabilities in your Fiber application, including HTTP/2 and 
+  HTTP capabilities in your Fiber application, including HTTP/2 and
   HTTP/3 (QUIC) support. This guide also covers basic reverse
   proxy configuration and links to external documentation.
-sidebar_position: 4
+sidebar_position: 8
 ---
 
-## Reverse Proxies
+## Proxies
 
-Running Fiber behind a reverse proxy is a common production setup.  
+Running Fiber behind a reverse proxy is a common production setup.
 Reverse proxies can handle:
 
 - **HTTPS/TLS termination** (offloading SSL certificates)
@@ -20,7 +20,7 @@ Reverse proxies can handle:
 - **Caching & compression**
 - **Security features** (rate limiting, WAF, DDoS mitigation)
 
-Some Fiber features (like [`SendEarlyHints`](../api/ctx.md#sendearlyhints)) require **HTTP/2 or newer**, which is easiest to enable using a reverse proxy.
+Some Fiber features (like [`SendEarlyHints`](../api/ctx.md#sendearlyhints)) work best with **HTTP/2 or newer**, which is easiest to enable using a reverse proxy.
 
 ### Popular Reverse Proxies
 
@@ -29,12 +29,102 @@ Some Fiber features (like [`SendEarlyHints`](../api/ctx.md#sendearlyhints)) requ
 - [HA PROXY](https://www.haproxy.com/)
 - [Caddy](https://caddyserver.com/)
 
-### Enabling HTTP/2
+## Getting the Real Client IP Address
 
-Popular choices include Nginx and Traefik.
+When your Fiber application is behind a reverse proxy, the TCP connection comes from the proxy server, not the actual client. To get the real client IP address, you need to configure Fiber to read it from proxy headers like `X-Forwarded-For`.
 
-<details>
-<summary>Nginx Example</summary>
+:::warning Security Warning
+Proxy headers can be easily spoofed by malicious clients. **Always** configure `TrustProxyConfig` to validate the proxy IP address, otherwise attackers can forge headers to bypass IP-based access controls, rate limiting, or geolocation features.
+
+In addition, your reverse proxy should be configured to **set or overwrite** the forwarding header you choose (for example, `X-Forwarded-For`) based on the real client connection, or to use its real IP / PROXY protocol features. Do not simply pass through client-supplied forwarding headers, or `c.IP()` may still be controlled by an attacker even when `TrustProxyConfig` is correct.
+:::
+
+:::info Chain parsing with `EnableIPValidation`
+`X-Forwarded-For` is a comma-separated chain that each proxy appends to. With `EnableIPValidation` enabled, `c.IP()` walks the chain from **right to left** and strips every IP that matches the configured `TrustProxyConfig`. The first non-trusted IP is returned as the client. An entry that is not an IP address, such as `203.0.113.50:51234` or `unknown`, ends the walk like a non-trusted IP, and `c.IP()` returns the last trusted proxy it passed or the TCP remote address; configure a proxy that appends `IP:port` entries to send the bare address. Repeated `X-Forwarded-For` lines are read in the order they were received. Trust only your proxies: blanket `Private`, `Loopback` or `LinkLocal` trust is unsafe when clients can also connect from those ranges, because such a client's own entry is skipped and the address it supplied is returned instead. This matches the [MDN guidance](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For#selecting_an_ip_address) and the convention used by Nginx (`set_real_ip_from` + `real_ip_recursive`), Apache `mod_remoteip`, Envoy (`xff_num_trusted_hops`), and most CDNs.
+
+If `TrustProxyConfig` names no proxy IPs or ranges (`Proxies`, `Loopback`, `Private` and `LinkLocal` are all unset), for example when only `UnixSocket` is set, there is nothing to skip: `c.IP()` returns the first valid IP from the left, which is the entry a client can supply itself unless your proxy overwrites the header.
+
+Without `EnableIPValidation`, `c.IP()` returns the raw header value (a comma-separated string), which is rarely what middleware like rate limiters or allowlists expect. Enable validation when you rely on `c.IP()` as a single client identifier.
+:::
+
+### Storage keys derived from client values
+
+Treat forwarded headers and other request values as untrusted when building keys for a custom store. With IP validation disabled, `c.IP()` can be the entire forwarded chain, not a bounded address. Configure proxy trust and validation as described above before using it as a client identifier.
+
+Bound each client-controlled key component before it reaches storage. Use a deterministic digest for oversized values rather than truncating them, which can make distinct clients share a key. If short values are stored verbatim, reserve the digest prefix so a supplied value cannot impersonate a hashed key. When combining components, escape separators or use an unambiguous encoding so different combinations cannot produce the same key.
+
+Fiber's [limiter](../middleware/limiter.md#config) already bounds its generated key, including a custom `KeyGenerator` result, to 192 bytes by hashing oversized values and values beginning with its reserved `sha256:` prefix. The [cache](../middleware/cache.md) bounds and escapes components of its default key; a custom cache `KeyGenerator` result is escaped but is not length-bounded by that default-key logic. A custom store used directly through `fiber.Storage` must apply its own key policy; the interface does not normalize keys for you.
+
+A length bound limits the size of one key, not the number of keys. Use expiration and capacity limits for storage that accepts client-selected identifiers. Hashing also does not establish that a forwarded address is trustworthy.
+
+### Configuration
+
+To enable reading the client IP from proxy headers, you must configure **three settings**:
+
+1. **`TrustProxy`** - Enable proxy header trust (must be `true`)
+2. **`ProxyHeader`** - Specify which header contains the client IP
+3. **`TrustProxyConfig`** - Define which proxy IPs to trust
+
+When the header is a chain your proxy appends to, such as `X-Forwarded-For`, also enable **`EnableIPValidation`** so that `c.IP()` resolves a single client IP instead of returning the raw chain. A proxy that overwrites the header with one address, or a single-IP header such as `X-Real-IP` or `CF-Connecting-IP`, does not need it.
+
+`TrustProxyConfig` defaults to an empty value (`fiber.DefaultTrustProxyConfig`), which trusts no peer. With `TrustProxy` enabled but no proxy listed, Fiber ignores every proxy header and `c.IP()` returns the address of the connecting proxy.
+
+```go title="Example - App Behind Nginx"
+app := fiber.New(fiber.Config{
+    // Enable proxy support
+    TrustProxy: true,
+
+    // Read client IP from X-Forwarded-For header
+    ProxyHeader: fiber.HeaderXForwardedFor,
+
+    // Resolve a single client IP from the X-Forwarded-For chain
+    EnableIPValidation: true,
+
+    // Trust requests from your Nginx proxy
+    TrustProxyConfig: fiber.TrustProxyConfig{
+        // Option 1: Trust specific proxy IPs
+        Proxies: []string{"10.10.0.58", "192.168.1.0/24"},
+
+        // Option 2: Or trust all private IPs (useful for internal load balancers,
+        // but only when clients never connect from private addresses)
+        // Private: true,
+    },
+})
+```
+
+### Common Proxy Headers
+
+Different proxies use different headers:
+
+| Proxy/Service | Recommended Header | Config Value |
+|---------------|-------------------|--------------|
+| Nginx, HAProxy, Apache | X-Forwarded-For | `fiber.HeaderXForwardedFor` |
+| Cloudflare | CF-Connecting-IP | `"CF-Connecting-IP"` |
+| Fastly | Fastly-Client-IP | `"Fastly-Client-IP"` |
+| Generic | X-Real-IP | `"X-Real-IP"` |
+
+### TrustProxyConfig Options
+
+The `TrustProxyConfig` struct provides multiple ways to specify trusted proxies:
+
+```go
+TrustProxyConfig: fiber.TrustProxyConfig{
+    // Specific IPs or CIDR ranges
+    Proxies: []string{
+        "10.10.0.58",           // Single IP
+        "192.168.0.0/24",       // CIDR range
+        "2001:db8::/32",        // IPv6 range
+    },
+
+    // Or use convenience flags:
+    Loopback:   true,  // Trust 127.0.0.0/8, ::1/128
+    LinkLocal:  true,  // Trust 169.254.0.0/16, fe80::/10
+    Private:    true,  // Trust 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7
+    UnixSocket: true,  // Trust Unix domain socket connections
+},
+```
+
+### Complete Example with Nginx
 
 ```nginx title="nginx.conf"
 server {
@@ -50,13 +140,81 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Overwrite untrusted inbound forwarding headers at the edge.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # Drop the other scheme headers so a client cannot send them.
+        proxy_set_header X-Forwarded-Protocol "";
+        proxy_set_header X-Forwarded-Ssl "";
+        proxy_set_header X-Url-Scheme "";
     }
 }
 ```
 
-This configuration enables HTTP/2 with TLS and proxies requests to your Fiber app on port 3000.
+```go title="main.go"
+package main
+
+import (
+    "log"
+
+    "github.com/gofiber/fiber/v3"
+)
+
+func main() {
+    app := fiber.New(fiber.Config{
+        TrustProxy:        true,
+        ProxyHeader:       fiber.HeaderXForwardedFor,
+        EnableIPValidation: true,
+        TrustProxyConfig: fiber.TrustProxyConfig{
+            // Trust localhost since Nginx is on the same machine
+            Loopback: true,
+        },
+    })
+
+    app.Get("/", func(c fiber.Ctx) error {
+        // This will now return the real client IP from X-Forwarded-For
+        // instead of 127.0.0.1
+        return c.SendString("Your IP: " + c.IP())
+    })
+
+    log.Fatal(app.Listen(":3000"))
+}
+```
+
+### Scheme and Host Behind a Proxy
+
+The same trust check guards the other values a proxy forwards. When the connecting peer is trusted:
+
+- `c.Scheme()` follows `X-Forwarded-Proto`, `X-Forwarded-Protocol`, `X-Forwarded-Ssl: on` or `X-Url-Scheme`, in that order of precedence whatever order they arrive in, and accepts only `http` or `https`. A proxy that sets `X-Forwarded-Proto` therefore decides the scheme even when it passes the other three through from the client. Have the proxy set `X-Forwarded-Proto` and drop the other three; a proxy that sets one of the others instead must drop every header ranked above it.
+- `c.Host()` and `c.Hostname()` use the first non-empty value of `X-Forwarded-Host`, and the `Host` header when it has none.
+- `c.BaseURL()` is built from those two.
+
+For an untrusted peer Fiber ignores these headers and uses the connection itself, and a TLS connection always reports `https`. `c.Protocol()` never comes from a header: it reports the HTTP version spoken between the proxy and Fiber, usually `HTTP/1.1`, not the one the client used.
+
+### Testing Your Configuration
+
+You can verify your configuration is working:
+
+```go
+app.Get("/debug", func(c fiber.Ctx) error {
+    return c.JSON(fiber.Map{
+        "c.IP()":           c.IP(),                    // Should show real client IP
+        "X-Forwarded-For":  c.Get("X-Forwarded-For"),  // Raw header value
+        "IsProxyTrusted":   c.IsProxyTrusted(),        // Should be true
+        "RemoteIP":         c.RequestCtx().RemoteIP().String(), // Proxy IP
+    })
+})
+```
+
+## Enabling HTTP/2
+
+Popular choices include Nginx and Traefik.
+
+<details>
+<summary>Nginx Example</summary>
+
+See the [Complete Example with Nginx](#complete-example-with-nginx) above for a full configuration with HTTP/2 enabled.
 </details>
 <details>
 <summary>Traefik Example</summary>
@@ -85,7 +243,7 @@ http:
 With this configuration, Traefik terminates TLS and serves your app over HTTP/2.
 </details>
 
-### HTTP/3 (QUIC) Support
+## HTTP/3 (QUIC) Support
 
 Early Hints (103 responses) are defined for HTTP and can be delivered over HTTP/1.1 and HTTP/2/3. In practice, browsers process 103 most reliably over HTTP/2/3. Many reverse proxies also support HTTP/3 (QUIC):
 

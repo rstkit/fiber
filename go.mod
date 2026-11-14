@@ -1,31 +1,32 @@
 module github.com/gofiber/fiber/v3
 
-go 1.25.0
+go 1.26.0
 
 require (
-	github.com/gofiber/schema v1.6.0
-	github.com/gofiber/utils/v2 v2.0.0
+	github.com/gofiber/schema v1.9.4
+	github.com/gofiber/utils/v2 v2.6.5
 	github.com/google/uuid v1.6.0
-	github.com/mattn/go-colorable v0.1.14
-	github.com/mattn/go-isatty v0.0.20
-	github.com/shamaton/msgpack/v3 v3.0.0
-	github.com/stretchr/testify v1.11.1
-	github.com/tinylib/msgp v1.6.3
+	github.com/mattn/go-colorable v0.1.16
+	github.com/mattn/go-isatty v0.0.24
+	github.com/shamaton/msgpack/v3 v3.2.7
+	github.com/stretchr/testify v1.12.1
+	github.com/tinylib/msgp v1.6.5
 	github.com/valyala/bytebufferpool v1.0.0
-	github.com/valyala/fasthttp v1.69.0
-	golang.org/x/crypto v0.47.0
+	github.com/valyala/fasthttp v1.78.0
+	golang.org/x/crypto v0.59.0
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.0 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/fxamacker/cbor/v2 v2.9.0 // direct
-	github.com/klauspost/compress v1.18.3 // indirect
-	github.com/philhofer/fwd v1.2.0 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/molecule-man/go-brrr v1.3.1 // indirect
+	go.yaml.in/yaml/v3 v3.0.6 // indirect
+)
+
+require (
+	github.com/fxamacker/cbor/v2 v2.10.0 // direct
+	github.com/klauspost/compress v1.20.4 // indirect
+	github.com/philhofer/fwd v1.2.1 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	golang.org/x/net v0.49.0
-	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/text v0.33.0
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	golang.org/x/net v0.62.0
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0
 )

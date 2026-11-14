@@ -4,11 +4,6 @@
 
 package fiber
 
-import (
-	"fmt"
-	"reflect"
-)
-
 // Group represents a collection of routes that share middleware and a common
 // path prefix.
 type Group struct {
@@ -16,8 +11,8 @@ type Group struct {
 	parentGroup *Group
 	name        string
 
-	Prefix          string
-	anyRouteDefined bool
+	Prefix      string
+	hasAnyRoute bool
 }
 
 // Name Assign name to specific route or group itself.
@@ -25,7 +20,7 @@ type Group struct {
 // If this method is used before any route added to group, it'll set group name and OnGroupNameHook will be used.
 // Otherwise, it'll set route name and OnName hook will be used.
 func (grp *Group) Name(name string) Router {
-	if grp.anyRouteDefined {
+	if grp.hasAnyRoute {
 		grp.app.Name(name)
 
 		return grp
@@ -68,42 +63,19 @@ func (grp *Group) Name(name string) Router {
 //
 // This method will match all HTTP verbs: GET, POST, PUT, HEAD etc...
 func (grp *Group) Use(args ...any) Router {
-	var subApp *App
-	var prefix string
-	var prefixes []string
-	var handlers []Handler
-
-	for i := range args {
-		switch arg := args[i].(type) {
-		case string:
-			prefix = arg
-		case *App:
-			subApp = arg
-		case []string:
-			prefixes = arg
-		default:
-			handler, ok := toFiberHandler(arg)
-			if !ok {
-				panic(fmt.Sprintf("use: invalid handler %v\n", reflect.TypeOf(arg)))
-			}
-			handlers = append(handlers, handler)
-		}
-	}
-
-	if len(prefixes) == 0 {
-		prefixes = append(prefixes, prefix)
-	}
+	prefixes, subApp, handlers := useArgs(args)
 
 	for _, prefix := range prefixes {
 		if subApp != nil {
-			return grp.mount(prefix, subApp)
+			grp.mount(prefix, subApp)
+			continue
 		}
 
 		grp.app.register([]string{methodUse}, getGroupPath(grp.Prefix, prefix), grp, handlers...)
 	}
 
-	if !grp.anyRouteDefined {
-		grp.anyRouteDefined = true
+	if !grp.hasAnyRoute {
+		grp.hasAnyRoute = true
 	}
 
 	return grp
@@ -162,13 +134,19 @@ func (grp *Group) Patch(path string, handler any, handlers ...any) Router {
 	return grp.Add([]string{MethodPatch}, path, handler, handlers...)
 }
 
+// Query registers a route for QUERY methods that performs a safe, idempotent
+// query with a request body.
+func (grp *Group) Query(path string, handler any, handlers ...any) Router {
+	return grp.Add([]string{MethodQuery}, path, handler, handlers...)
+}
+
 // Add allows you to specify multiple HTTP methods to register a route.
 // The provided handlers are executed in order, starting with `handler` and then the variadic `handlers`.
 func (grp *Group) Add(methods []string, path string, handler any, handlers ...any) Router {
 	converted := collectHandlers("group", append([]any{handler}, handlers...)...)
 	grp.app.register(methods, getGroupPath(grp.Prefix, path), grp, converted...)
-	if !grp.anyRouteDefined {
-		grp.anyRouteDefined = true
+	if !grp.hasAnyRoute {
+		grp.hasAnyRoute = true
 	}
 
 	return grp
@@ -198,6 +176,26 @@ func (grp *Group) Group(prefix string, handlers ...any) Router {
 	}
 
 	return newGrp
+}
+
+// Domain creates a new router scoped to the given hostname pattern within
+// this group. Routes registered through the returned Router inherit the
+// group prefix and only match requests whose hostname (from c.Hostname())
+// matches the pattern. When TrustProxy is enabled and the proxy is trusted,
+// the hostname may be derived from the X-Forwarded-Host header.
+//
+// To prevent header spoofing, configure both Config.TrustProxy and
+// Config.TrustProxyConfig (trusted proxy IPs/ranges). See:
+// https://docs.gofiber.io/api/fiber#trustproxy
+//
+//	api := app.Group("/api")
+//	api.Domain("api.example.com").Get("/users", listUsers)
+func (grp *Group) Domain(host string) Router {
+	return &domainRouter{
+		app:     grp.app,
+		group:   grp,
+		matcher: parseDomainPattern(host),
+	}
 }
 
 // RouteChain creates a Registering instance scoped to the group's prefix,

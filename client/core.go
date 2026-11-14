@@ -6,10 +6,10 @@ package client
 import (
 	"context"
 	"errors"
-	"net"
-	"strconv"
-	"strings"
+	"fmt"
+	"slices"
 	"sync"
+	"time"
 
 	"github.com/valyala/fasthttp"
 
@@ -20,53 +20,35 @@ import (
 const boundary = "FiberFormBoundary"
 
 // RequestHook is a function invoked before the request is sent.
-// It receives a Client and a Request, allowing you to modify the Request or Client data.
+// It receives a Client and a Request. Mutate the Request, not the shared Client
+// config: the Client is read concurrently by in-flight requests (see the Client
+// type's concurrency contract), so per-request changes belong on the Request.
 type RequestHook func(*Client, *Request) error
 
 // ResponseHook is a function invoked after a response is received.
-// It receives a Client, Response, and Request, allowing you to modify the Response data
-// or perform actions based on the response.
+// It receives a Client, Response, and Request. Mutate the Response or act on it;
+// do not mutate the shared Client config, which is read concurrently by other
+// in-flight requests (see the Client type's concurrency contract).
 type ResponseHook func(*Client, *Response, *Request) error
 
 // RetryConfig is an alias for the `retry.Config` type from the `addon/retry` package.
 type RetryConfig = retry.Config
-
-// addMissingPort appends the appropriate port number to the given address if it doesn't have one.
-// If isTLS is true, it uses port 443; otherwise, it uses port 80.
-func addMissingPort(addr string, isTLS bool) string { //revive:disable-line:flag-parameter
-	if strings.IndexByte(addr, ':') != -1 {
-		return addr
-	}
-	port := 80
-	if isTLS {
-		port = 443
-	}
-	return net.JoinHostPort(addr, strconv.Itoa(port))
-}
 
 // core stores middleware and plugin definitions and defines the request execution process.
 type core struct {
 	client *Client
 	req    *Request
 	ctx    context.Context //nolint:containedctx // Context is needed here.
+	// cancel is the watch the transport ends the exchange through, carried on the
+	// request while cancelable: the caller's own context can end before its
+	// deadline, which is all a deadline reaches fasthttp as (applyDeadline).
+	cancel     cancelContext
+	cancelable bool
 }
 
 // getRetryConfig returns a copy of the client's retry configuration.
 func (c *core) getRetryConfig() *RetryConfig {
-	c.client.mu.RLock()
-	defer c.client.mu.RUnlock()
-
-	cfg := c.client.RetryConfig()
-	if cfg == nil {
-		return nil
-	}
-
-	return &RetryConfig{
-		InitialInterval: cfg.InitialInterval,
-		MaxBackoffTime:  cfg.MaxBackoffTime,
-		Multiplier:      cfg.Multiplier,
-		MaxRetryCount:   cfg.MaxRetryCount,
-	}
+	return c.client.RetryConfig()
 }
 
 // execFunc is the core logic to send the request and receive the response.
@@ -77,12 +59,31 @@ func (c *core) execFunc() (*Response, error) {
 	respChan := acquireResponseChan()
 
 	cfg := c.getRetryConfig()
+
+	// Copy the request before the goroutine starts: a caller whose context is
+	// already done gets ErrTimeoutOrCancel at once and may release its request.
+	reqv := fasthttp.AcquireRequest()
+	c.req.RawRequest.CopyTo(reqv)
+	if bodyStream := c.req.RawRequest.BodyStream(); bodyStream != nil {
+		reqv.SetBodyStream(bodyStream, c.req.RawRequest.Header.ContentLength())
+	}
+	// Read what the goroutine needs now; only its own copy is safe to touch later.
+	// Ownership is included: once the caller times out, execute releases a
+	// client-owned request and the pool may hand it to another call while the
+	// transport is still finishing, so reading the flag from the goroutine races.
+	reqOwned := c.req.clientOwned
+	method := string(reqv.Header.Method())
+	var redirects *redirectOptions // nil: the request follows no redirects
+	if c.req.maxRedirects > 0 && (method == fiber.MethodGet || method == fiber.MethodHead || method == fiber.MethodQuery) {
+		opts := c.client.redirectOptionsFor(c.req.maxRedirects, c.req.redirectSensitiveHeaders)
+		redirects = &opts
+	}
+
 	go func() {
 		// retain both channels until they are drained
 		defer releaseErrChan(errChan)
 		defer releaseResponseChan(respChan)
 
-		reqv := fasthttp.AcquireRequest()
 		defer fasthttp.ReleaseRequest(reqv)
 
 		respv := fasthttp.AcquireResponse()
@@ -92,25 +93,58 @@ func (c *core) execFunc() (*Response, error) {
 			}
 		}()
 
-		c.req.RawRequest.CopyTo(reqv)
-		if bodyStream := c.req.RawRequest.BodyStream(); bodyStream != nil {
-			reqv.SetBodyStream(bodyStream, c.req.RawRequest.Header.ContentLength())
-		}
-
-		var err error
-		if cfg != nil {
-			// Use an exponential backoff retry strategy.
-			err = retry.NewExponentialBackoff(*cfg).Retry(func() error {
-				if c.req.maxRedirects > 0 && (string(reqv.Header.Method()) == fiber.MethodGet || string(reqv.Header.Method()) == fiber.MethodHead) {
-					return c.client.DoRedirects(reqv, respv, c.req.maxRedirects)
+		var resp *Response
+		defer func() {
+			if r := recover(); r != nil {
+				if resp != nil {
+					ReleaseResponse(resp)
 				}
-				return c.client.Do(reqv, respv)
+				errChan <- fmt.Errorf("client panic: %v", r)
+			}
+		}()
+
+		// Deadline and error handling stay outside the transport call: a frame live
+		// across it makes every retried redirect request grow its stack.
+		var err error
+		switch {
+		case cfg != nil:
+			// A failed chain rewrites reqv, so each attempt restarts from a copy; a body stream cannot be copied.
+			var sent *fasthttp.Request
+			if redirects != nil && !reqv.IsBodyStream() {
+				sent = fasthttp.AcquireRequest()
+				reqv.CopyTo(sent)
+				defer fasthttp.ReleaseRequest(sent)
+			}
+			// Retry stops early only on nil, so an attempt nobody waits for any more ends it that way.
+			var attemptErr error
+			err = retry.NewExponentialBackoff(*cfg).Retry(func() error {
+				if attemptErr = c.applyDeadline(reqv, redirects); attemptErr == nil {
+					if redirects == nil {
+						attemptErr = c.client.Do(reqv, respv)
+					} else {
+						attemptErr = c.client.transport.DoRedirects(reqv, respv, redirects)
+						if attemptErr != nil && sent != nil {
+							sent.CopyTo(reqv)
+						}
+					}
+					attemptErr = c.callErr(attemptErr)
+				}
+				if errors.Is(attemptErr, ErrTimeoutOrCancel) {
+					return nil
+				}
+				return attemptErr
 			})
-		} else {
-			if c.req.maxRedirects > 0 && (string(reqv.Header.Method()) == fiber.MethodGet || string(reqv.Header.Method()) == fiber.MethodHead) {
-				err = c.client.DoRedirects(reqv, respv, c.req.maxRedirects)
-			} else {
-				err = c.client.Do(reqv, respv)
+			if err == nil {
+				err = attemptErr
+			}
+		default:
+			if err = c.applyDeadline(reqv, redirects); err == nil {
+				if redirects != nil {
+					err = c.client.transport.DoRedirects(reqv, respv, redirects)
+				} else {
+					err = c.client.Do(reqv, respv)
+				}
+				err = c.callErr(err)
 			}
 		}
 
@@ -119,9 +153,16 @@ func (c *core) execFunc() (*Response, error) {
 			return
 		}
 
-		resp := AcquireResponse()
+		resp = AcquireResponse()
 		resp.setClient(c.client)
-		resp.setRequest(c.req)
+		resp.setRequest(c.req, reqOwned)
+		// reqv carries the URI of the hop that produced this response, which after a
+		// redirect is not c.req's. Record it before reqv is pooled so the response
+		// hooks can attribute cookies to its real origin — and only where a jar
+		// will read it, since the copy is otherwise pure cost on every request.
+		if c.client != nil && c.client.cookieJar != nil {
+			resp.setRespondedURI(reqv.URI())
+		}
 
 		// Swap the fasthttp response with the Fiber response's RawResponse field.
 		// This is required, as (*fasthttp.Response).CopyTo() explicitly does not
@@ -141,6 +182,8 @@ func (c *core) execFunc() (*Response, error) {
 	case resp := <-respChan:
 		return resp, nil
 	case <-c.ctx.Done():
+		// The exchange in flight ends with the call: its connection is closed.
+		c.cancel.end()
 		go func() { // drain the channels and release the response
 			select {
 			case resp := <-respChan:
@@ -152,16 +195,75 @@ func (c *core) execFunc() (*Response, error) {
 	}
 }
 
+// applyDeadline gives an attempt what is left of the caller's deadline, which fasthttp
+// turns into connection deadlines, so a call that timed out does not wait on the server.
+// A cancellation has no such path, so the watch rides on the request for the transport
+// to end the exchange through; per attempt, as a retried chain copies over req.
+func (c *core) applyDeadline(req *fasthttp.Request, redirects *redirectOptions) error {
+	if c.ctx.Err() != nil {
+		return ErrTimeoutOrCancel
+	}
+	if c.cancelable {
+		req.SetUserValue(cancelKey{}, &c.cancel)
+	}
+	deadline, ok := c.ctx.Deadline()
+	if !ok {
+		return nil
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 { // fasthttp reads a non-positive timeout as none
+		return ErrTimeoutOrCancel
+	}
+	req.SetTimeout(remaining)
+	if redirects != nil {
+		redirects.deadline = deadline
+	}
+	return nil
+}
+
+// callErr reports a failure seen once nobody waits for the call as ErrTimeoutOrCancel:
+// the transport may reach the deadline before the context does.
+func (c *core) callErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if deadline, ok := c.ctx.Deadline(); c.ctx.Err() != nil || ok && time.Until(deadline) <= 0 {
+		return ErrTimeoutOrCancel
+	}
+	return err
+}
+
 // preHooks runs all request hooks before sending the request.
 func (c *core) preHooks() error {
-	c.client.mu.Lock()
-	defer c.client.mu.Unlock()
+	c.client.mu.RLock()
+	userHooks := slices.Clone(c.client.userRequestHooks)
+	finalHooks := slices.Clone(c.client.finalRequestHooks)
+	c.client.mu.RUnlock()
 
-	for _, f := range c.client.userRequestHooks {
+	for _, f := range userHooks {
 		if err := f(c.client, c.req); err != nil {
 			return err
 		}
 	}
+
+	if err := c.runBuiltinRequestHooks(); err != nil {
+		return err
+	}
+
+	for _, f := range finalHooks {
+		if err := f(c.client, c.req); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// runBuiltinRequestHooks serializes the request under the client lock, as the
+// built-in hooks read client-level state while they fill in RawRequest.
+func (c *core) runBuiltinRequestHooks() error {
+	c.client.mu.Lock()
+	defer c.client.mu.Unlock()
 
 	for _, f := range c.client.builtinRequestHooks {
 		if err := f(c.client, c.req); err != nil {
@@ -175,15 +277,16 @@ func (c *core) preHooks() error {
 // afterHooks runs all response hooks after receiving the response.
 func (c *core) afterHooks(resp *Response) error {
 	c.client.mu.Lock()
-	defer c.client.mu.Unlock()
-
+	userHooks := slices.Clone(c.client.userResponseHooks)
 	for _, f := range c.client.builtinResponseHooks {
 		if err := f(c.client, resp, c.req); err != nil {
+			c.client.mu.Unlock()
 			return err
 		}
 	}
+	c.client.mu.Unlock()
 
-	for _, f := range c.client.userResponseHooks {
+	for _, f := range userHooks {
 		if err := f(c.client, resp, c.req); err != nil {
 			return err
 		}
@@ -198,8 +301,13 @@ func (c *core) timeout() context.CancelFunc {
 
 	if c.req.timeout > 0 {
 		c.ctx, cancel = context.WithTimeout(c.ctx, c.req.timeout)
-	} else if c.client.timeout > 0 {
-		c.ctx, cancel = context.WithTimeout(c.ctx, c.client.timeout)
+	} else {
+		c.client.mu.RLock()
+		timeout := c.client.timeout
+		c.client.mu.RUnlock()
+		if timeout > 0 {
+			c.ctx, cancel = context.WithTimeout(c.ctx, timeout)
+		}
 	}
 
 	return cancel
@@ -211,9 +319,17 @@ func (c *core) execute(ctx context.Context, client *Client, req *Request) (*Resp
 	c.ctx = ctx
 	c.client = client
 	c.req = req
+	// Decided before timeout() derives a deadline from it: only the caller's own
+	// context can end before its deadline would.
+	c.cancelable = ctx.Done() != nil
 
 	// Execute pre request hooks (user-defined and built-in).
 	if err := c.preHooks(); err != nil {
+		// Nothing has been dispatched yet, so a request the client created for
+		// this call goes back to the pool: no response will carry it there.
+		if req.clientOwned {
+			ReleaseRequest(req)
+		}
 		return nil, err
 	}
 
@@ -226,12 +342,24 @@ func (c *core) execute(ctx context.Context, client *Client, req *Request) (*Resp
 	// Perform the actual HTTP request.
 	resp, err := c.execFunc()
 	if err != nil {
+		// Nothing carries the request back to the pool: no response reaches the
+		// caller. A streamed body is the exception — the transport goroutine was
+		// handed that reader itself, so a canceled send may still be reading it
+		// and releasing here would close it mid-read.
+		if req.clientOwned && !req.RawRequest.IsBodyStream() {
+			ReleaseRequest(req)
+		}
 		return nil, err
 	}
 
 	// Execute after response hooks (built-in and then user-defined).
 	if err := c.afterHooks(resp); err != nil {
-		resp.Close()
+		// No response reaches the caller, so only what the client created is released.
+		resp.request = nil
+		ReleaseResponse(resp)
+		if req.clientOwned {
+			ReleaseRequest(req)
+		}
 		return nil, err
 	}
 
@@ -296,6 +424,8 @@ func newCore() *core {
 var (
 	ErrTimeoutOrCancel      = errors.New("timeout or cancel")
 	ErrURLFormat            = errors.New("the URL is incorrect")
+	ErrPathParamInHost      = errors.New("the path parameter value is not valid in a host")
+	ErrPathParamInPath      = errors.New("the path parameter value is not a single path segment")
 	ErrNotSupportSchema     = errors.New("protocol not supported; only http or https are allowed")
 	ErrFileNoName           = errors.New("the file should have a name")
 	ErrBodyType             = errors.New("the body type should be []byte")

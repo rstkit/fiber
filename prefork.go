@@ -2,127 +2,86 @@ package fiber
 
 import (
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"sync/atomic"
-	"time"
 
-	"github.com/valyala/fasthttp/reuseport"
-
-	"github.com/gofiber/fiber/v3/log"
+	"github.com/valyala/fasthttp/prefork"
 )
 
-const (
-	envPreforkChildKey = "FIBER_PREFORK_CHILD"
-	envPreforkChildVal = "1"
-	sleepDuration      = 100 * time.Millisecond
-	windowsOS          = "windows"
-)
-
+// Test seams for prefork testing - allows injecting dummy commands
 var (
 	testPreforkMaster = false
 	testOnPrefork     = false
+	dummyPid          = 1
+	dummyChildCmd     atomic.Value
 )
 
 // IsChild determines if the current process is a child of Prefork
 func IsChild() bool {
-	return os.Getenv(envPreforkChildKey) == envPreforkChildVal
+	return prefork.IsChild()
 }
 
-// prefork manages child processes to make use of the OS REUSEPORT or REUSEADDR feature
+// prefork manages child processes to make use of the OS REUSEPORT feature.
+// It delegates to fasthttp's prefork package to avoid duplicating process management logic.
 func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) error {
 	if cfg == nil {
 		cfg = &ListenConfig{}
 	}
-	var ln net.Listener
-	var err error
 
-	// 👶 child process 👶
-	if IsChild() {
-		// use 1 cpu core per child process
-		runtime.GOMAXPROCS(1)
-		// Linux will use SO_REUSEPORT and Windows falls back to SO_REUSEADDR
-		// Only tcp4 or tcp6 is supported when preforking, both are not supported
-		if ln, err = reuseport.Listen(cfg.ListenerNetwork, addr); err != nil {
-			if !cfg.DisableStartupMessage {
-				time.Sleep(sleepDuration) // avoid colliding with startup message
-			}
-			return fmt.Errorf("prefork: %w", err)
-		}
-		// wrap a tls config around the listener if provided
-		if tlsConfig != nil {
-			ln = tls.NewListener(ln, tlsConfig)
-		}
-
-		// kill current child proc when master exits
-		go watchMaster()
-
-		// prepare the server for the start
-		app.startupProcess()
-
-		if cfg.ListenerAddrFunc != nil {
-			cfg.ListenerAddrFunc(ln.Addr())
-		}
-
-		// listen for incoming connections
-		return app.server.Serve(ln)
+	// Determine RecoverThreshold
+	recoverThreshold := cfg.PreforkRecoverThreshold
+	if recoverThreshold == 0 {
+		recoverThreshold = max(1, runtime.GOMAXPROCS(0)/2)
 	}
 
-	// 👮 master process 👮
-	type child struct {
-		err error
-		pid int
+	// Use configured logger or default to Fiber's log package
+	var logger prefork.Logger
+	if cfg.PreforkLogger != nil {
+		logger = cfg.PreforkLogger
+	} else {
+		logger = preforkLogger{}
 	}
-	// create variables
-	maxProcs := runtime.GOMAXPROCS(0)
-	children := make(map[int]*exec.Cmd)
-	channel := make(chan child, maxProcs)
 
-	// kill child procs when master exits
-	defer func() {
-		for _, proc := range children {
-			if err = proc.Process.Kill(); err != nil {
-				if !errors.Is(err, os.ErrProcessDone) {
-					log.Errorf("prefork: failed to kill child: %v", err)
-				}
+	p := &prefork.Prefork{
+		Network:             cfg.ListenerNetwork,
+		Reuseport:           true,
+		RecoverThreshold:    recoverThreshold,
+		RecoverInterval:     cfg.PreforkRecoverInterval,
+		ShutdownGracePeriod: cfg.PreforkShutdownGracePeriod,
+		Logger:              logger,
+		OnMasterDeath:       func() { os.Exit(1) }, //nolint:revive // Exiting child process is intentional
+	}
+
+	// Use test command producer if in test mode
+	if testPreforkMaster {
+		p.CommandProducer = func(_ []*os.File) (*exec.Cmd, error) {
+			cmd := dummyCmd()
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Start(); err != nil {
+				return cmd, fmt.Errorf("prefork: failed to start test command: %w", err)
 			}
+			return cmd, nil
 		}
-	}()
+	}
 
-	// collect child pids
-	var childPIDs []int
+	// Each process watches GracefulContext on its own. The master never serves: it watches from
+	// the start, and canceling the context there only runs the master's shutdown hooks. A child
+	// starts to watch in preforkServe, once it has its listener.
+	if !IsChild() {
+		graceful := app.watchGracefulContext(cfg)
+		defer graceful.stopAndWait()
+	}
 
-	// launch child procs
-	for range maxProcs {
-		cmd := exec.Command(os.Args[0], os.Args[1:]...) //nolint:gosec // It's fine to launch the same process again
-		if testPreforkMaster {
-			// When test prefork master,
-			// just start the child process with a dummy cmd,
-			// which will exit soon
-			cmd = dummyCmd()
-		}
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+	// Child process: serve function wraps TLS, starts up process, etc.
+	p.ServeFunc = app.preforkServe(tlsConfig, cfg)
 
-		// add fiber prefork child flag into child proc env
-		cmd.Env = append(os.Environ(),
-			fmt.Sprintf("%s=%s", envPreforkChildKey, envPreforkChildVal),
-		)
-
-		if err = cmd.Start(); err != nil {
-			return fmt.Errorf("failed to start a child prefork process, error: %w", err)
-		}
-
-		// store child process
-		pid := cmd.Process.Pid
-		children[pid] = cmd
-		childPIDs = append(childPIDs, pid)
-
-		// execute fork hook
+	// Master callback: child spawned → execute OnFork hooks
+	p.OnChildSpawn = func(pid int) error {
 		if app.hooks != nil {
 			if testOnPrefork {
 				app.hooks.executeOnForkHooks(dummyPid)
@@ -130,54 +89,55 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 				app.hooks.executeOnForkHooks(pid)
 			}
 		}
-
-		// notify master if child crashes
-		go func() {
-			channel <- child{pid: pid, err: cmd.Wait()}
-		}()
+		return nil
 	}
 
-	// Run onListen hooks
-	// Hooks have to be run here as different as non-prefork mode due to they should run as child or master
-	listenData := app.prepareListenData(addr, tlsConfig != nil, cfg, childPIDs)
-
-	app.runOnListenHooks(listenData)
-
-	app.startupMessage(listenData, cfg)
-
-	if cfg.EnablePrintRoutes {
-		app.printRoutesMessage()
+	// Master callback: all children spawned → startup message & OnListen hooks
+	p.OnMasterReady = func(childPIDs []int) error {
+		listenData := app.prepareListenData(addr, tlsConfig != nil, cfg, childPIDs)
+		app.runOnListenHooks(listenData)
+		app.printMessages(cfg, listenData)
+		return nil
 	}
 
-	// return error if child crashes
-	return (<-channel).err
+	// Master callback: child recovered after crash
+	p.OnChildRecover = func(oldPID, newPID int) {
+		logger.Printf("prefork: child %d crashed, recovered with new PID %d", oldPID, newPID)
+	}
+
+	if err := p.ListenAndServe(addr); err != nil {
+		return fmt.Errorf("prefork: %w", err)
+	}
+
+	return nil
 }
 
-// watchMaster watches child procs
-func watchMaster() {
-	if runtime.GOOS == windowsOS {
-		// finds parent process,
-		// and waits for it to exit
-		p, err := os.FindProcess(os.Getppid())
-		if err == nil {
-			_, _ = p.Wait() //nolint:errcheck // It is fine to ignore the error here
+// preforkServe returns what a prefork child runs on the listener it has bound: it starts to
+// watch GracefulContext, wraps TLS around the listener, starts up the process and serves.
+func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln net.Listener) error {
+	return func(ln net.Listener) error {
+		// Watch the context only once the child has its listener, so that a bind that failed
+		// never ran the shutdown hooks, and wait out the shutdown before returning.
+		graceful := app.watchGracefulContext(cfg)
+		defer graceful.stopAndWait()
+
+		// wrap a tls config around the listener if provided
+		if tlsConfig != nil {
+			ln = tls.NewListener(ln, tlsConfig)
 		}
-		os.Exit(1) //nolint:revive // Calling os.Exit is fine here in the prefork
-	}
-	// if it is equal to 1 (init process ID),
-	// it indicates that the master process has exited
-	const watchInterval = 500 * time.Millisecond
-	for range time.NewTicker(watchInterval).C {
-		if os.Getppid() == 1 {
-			os.Exit(1) //nolint:revive // Calling os.Exit is fine here in the prefork
+
+		// prepare the server for the start
+		app.startupProcess()
+		app.hookHeaderReceived()
+
+		if cfg.ListenerAddrFunc != nil {
+			cfg.ListenerAddrFunc(ln.Addr())
 		}
+
+		// listen for incoming connections
+		return app.serve(graceful, ln)
 	}
 }
-
-var (
-	dummyPid      = 1
-	dummyChildCmd atomic.Value
-)
 
 // dummyCmd is for internal prefork testing
 func dummyCmd() *exec.Cmd {

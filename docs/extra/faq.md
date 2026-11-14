@@ -19,9 +19,9 @@ Routes and other application logic can live in any files or directories. For ins
 
 ## How do I handle custom 404 responses?
 
-If you're using v2.32.0 or later, implement a custom error handler as shown below or read more at [Error Handling](../guide/error-handling.md#custom-error-handler).
+A request that matches no route reaches your `ErrorHandler` as a `*fiber.Error` with status `404` (`fiber.ErrNotFound`), so a custom error handler can render the response. See [How do I set up an error handler?](#how-do-i-set-up-an-error-handler) below or read more at [Error Handling](../guide/error-handling.md#custom-error-handler).
 
-If you're using v2.31.0 or earlier, the error handler will not capture 404 errors. Instead, add a middleware function at the very bottom of the stack \(below all other functions\) to handle a 404 response:
+You can also add a middleware function at the very bottom of the stack \(below all other functions\) to handle a 404 response:
 
 ```go title="Example"
 app.Use(func(c fiber.Ctx) error {
@@ -100,7 +100,7 @@ If you have questions or just want to chat, join us via this [invite link](https
 
 ## Does Fiber support subdomain routing?
 
-Yes, we do. Here are some examples:
+Yes. The simplest way is [`app.Domain`](../api/app.md#domain), which scopes routes to a hostname pattern. You can also dispatch by hostname yourself by keeping one app per host, as in this example:
 
 <details>
 <summary>Example</summary>
@@ -159,11 +159,11 @@ func main() {
     // Server
     app := fiber.New()
     app.Use(func(c fiber.Ctx) error {
-        host := hosts[c.Hostname()]
+        host := hosts[c.Host()]
         if host == nil {
             return c.SendStatus(fiber.StatusNotFound)
         } else {
-            host.Fiber.Handler()(c.Context())
+            host.Fiber.Handler()(c.RequestCtx())
             return nil
         }
     })
@@ -198,3 +198,24 @@ For details on how to:
 * Convert `fiber.Ctx` to `http.Request`
 
 See the dedicated documentation: [Adaptor Documentation](../middleware/adaptor.md).
+
+## Troubleshooting common errors
+
+Crashes that surface in unrelated packages, with stack traces that never mention Fiber, usually trace back to a context value kept past the handler. The cases below name the symptom so a search for the panic text lands here.
+
+### Panic `id (N) <= evictCount (M)` (hpack / HTTP/2 / gRPC) {#panic-id-evictcount-hpack-grpc}
+
+This is not a bug in Fiber, gRPC, or `golang.org/x/net/http2`. It means a Fiber zero-copy context value (a header from `c.Get`, or `c.Query`, `c.Params`, `c.Cookies`, `c.Body`) was kept past the handler. Fiber reuses the request buffer on the next request, so the retained bytes change underneath whatever stored them. See [Zero Allocation](../intro.md#zero-allocation) for the underlying behavior.
+
+A common trigger is forwarding a header into a long-lived gRPC / HTTP/2 client's `metadata`. The value is held in the connection's HPACK dynamic table and later mutates, crashing the process inside the HPACK encoder, in a stack trace that never mentions Fiber:
+
+```text
+panic: id (N) <= evictCount (M)
+    golang.org/x/net/http2/hpack.(*headerFieldTable).idToIndex
+    ...
+    google.golang.org/grpc/internal/transport.(*loopyWriter).writeHeader
+```
+
+The crash is decoupled from your handler in both time and call stack, so ordinary tests and even the `-race` detector usually miss it.
+
+The fix is to detach the value before you keep it: copy it with `utils.CopyString` (or `strings.Clone`), or enable [`Immutable`](../api/fiber.md#immutable). A full reproduction is in [gofiber/fiber#4464](https://github.com/gofiber/fiber/issues/4464).

@@ -4,21 +4,39 @@
 package client
 
 import (
-	"bytes"
 	"crypto/tls"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/gofiber/fiber/v3/internal/crosshost"
+	"github.com/gofiber/fiber/v3/internal/redirectbody"
+	"github.com/gofiber/utils/v2"
 	"github.com/valyala/fasthttp"
 )
 
 // defaultRedirectLimit mirrors fasthttp's default when callers supply a negative redirect cap.
 const defaultRedirectLimit = 16
 
+// defaultMaxResponseBodySize bounds the buffer fasthttp allocates from a declared
+// Content-Length or chunk size before the body arrives; an unmappable size is a fatal error.
+const defaultMaxResponseBodySize = 100 << 20
+
 var (
 	// Pre-allocated byte slice for http/https scheme comparison
 	httpScheme  = []byte("http")
 	httpsScheme = []byte("https")
 )
+
+// redirectOptions is passed by pointer: by value it widens the frames of every transport.
+type redirectOptions struct {
+	deadline         time.Time // zero: each hop keeps the request's own timeout
+	sensitiveHeaders crosshost.HeaderNames
+	maxRedirects     int
+}
 
 // httpClientTransport unifies the operations exposed by the Fiber client across
 // the fasthttp.Client, fasthttp.HostClient, and fasthttp.LBClient adapters so
@@ -27,7 +45,7 @@ type httpClientTransport interface {
 	Do(req *fasthttp.Request, resp *fasthttp.Response) error
 	DoTimeout(req *fasthttp.Request, resp *fasthttp.Response, timeout time.Duration) error
 	DoDeadline(req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error
-	DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) error
+	DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, opts *redirectOptions) error
 	CloseIdleConnections()
 	TLSConfig() *tls.Config
 	SetTLSConfig(config *tls.Config)
@@ -35,32 +53,150 @@ type httpClientTransport interface {
 	Client() any
 	StreamResponseBody() bool
 	SetStreamResponseBody(enable bool)
+	MaxResponseBodySize() int
+	SetMaxResponseBodySize(size int)
 }
+
+// pathNormalizingTransport is implemented by the transports whose wrapped client
+// has a path normalizing setting that can be read and written. It is kept apart
+// from httpClientTransport so that a transport without one still satisfies that
+// interface; such a transport counts as one that normalizes.
+//
+// The setting that reaches the wire is the wrapped client's own field, which
+// fasthttp stamps on every request just before it writes it, whatever the URI
+// of the request said.
+type pathNormalizingTransport interface {
+	// DisablePathNormalizing reports whether the wrapped client writes the
+	// request path as built. A balancer that holds a client this cannot inspect,
+	// or none at all, reports false, and so does a fasthttp.Client handed over
+	// normalizing, which may have served hosts already.
+	DisablePathNormalizing() bool
+	// SetDisablePathNormalizing sets that field on the wrapped client, and on
+	// every host client behind a balancer.
+	SetDisablePathNormalizing(disable bool)
+}
+
+var (
+	_ pathNormalizingTransport = (*standardClientTransport)(nil)
+	_ pathNormalizingTransport = (*hostClientTransport)(nil)
+	_ pathNormalizingTransport = (*lbClientTransport)(nil)
+)
 
 // standardClientTransport adapts fasthttp.Client to the httpClientTransport
 // interface used by Fiber's client helpers.
 type standardClientTransport struct {
 	client *fasthttp.Client
+	// sentNormalized is set once a request has gone out while the client
+	// normalized paths. A fasthttp.Client gives each host the setting it has when
+	// that host's client is first created and never updates it, so after that
+	// turning normalizing off no longer reaches the hosts already served: the
+	// path would still be normalized for them.
+	sentNormalized atomic.Bool
+	// settingKnown is set when the transport can account for every host client
+	// the wrapped client has made: it is a client the Fiber client created
+	// itself, so no host client exists before this transport's first request, or
+	// it was handed over with the setting already on, so each host client took
+	// that value. A client handed over normalizing may have served hosts through
+	// someone else, and their host clients keep normalizing whatever its field
+	// says later; nothing public tells a fresh client from such a one.
+	settingKnown bool
 }
 
+// newStandardClientTransport wraps a fasthttp.Client the caller supplied. Its
+// path normalizing field counts only when the caller created it with the
+// setting on.
 func newStandardClientTransport(client *fasthttp.Client) *standardClientTransport {
-	return &standardClientTransport{client: client}
+	return &standardClientTransport{client: client, settingKnown: client.DisablePathNormalizing}
+}
+
+// newOwnedStandardClientTransport wraps a new fasthttp.Client that nothing else
+// holds yet: its exchanges end when a cancel-only context is canceled, and its TLS
+// handshakes are bounded.
+func newOwnedStandardClientTransport() *standardClientTransport {
+	return &standardClientTransport{
+		client: &fasthttp.Client{
+			MaxResponseBodySize: defaultMaxResponseBodySize,
+			// On the client, which fasthttp gives every host client before the hook
+			// runs, so a hook of the caller's own in place of this one does not lose it.
+			Transport:       cancelTransport{},
+			ConfigureClient: boundTLSHandshake,
+		},
+		settingKnown: true,
+	}
+}
+
+// boundTLSHandshake gives a new TLS connection a read deadline of the request timeout.
+// fasthttp handshakes inside the first write, where only a write deadline applies.
+func boundTLSHandshake(hc *fasthttp.HostClient) error {
+	if !hc.IsTLS || hc.WriteTimeout > 0 { // with WriteTimeout fasthttp handshakes at dial time, under a deadline
+		return nil
+	}
+	dial, dialTimeout, dualStack := hc.Dial, hc.DialTimeout, hc.DialDualStack
+	hc.DialTimeout = func(addr string, timeout time.Duration) (net.Conn, error) {
+		var conn net.Conn
+		var err error
+		// The dialer fasthttp's callDialFunc would pick; addr already carries the port.
+		switch {
+		case dialTimeout != nil:
+			conn, err = dialTimeout(addr, timeout)
+		case dial != nil:
+			conn, err = dial(addr)
+		case timeout <= 0 && dualStack:
+			conn, err = fasthttp.DialDualStack(addr)
+		case timeout <= 0:
+			conn, err = fasthttp.Dial(addr)
+		case dualStack:
+			conn, err = fasthttp.DialDualStackTimeout(addr, timeout)
+		default:
+			conn, err = fasthttp.DialTimeout(addr, timeout)
+		}
+		if err != nil || timeout <= 0 {
+			return conn, err
+		}
+		// The request sets its own read deadline after the handshake, replacing this one.
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return nil, errors.Join(err, conn.Close())
+		}
+		return conn, nil
+	}
+	return nil
+}
+
+// noteSend records a request about to be sent through a client that normalizes.
+// It stores once, so the common case of a client left as it is costs one load.
+func (s *standardClientTransport) noteSend() {
+	if !s.client.DisablePathNormalizing && !s.sentNormalized.Load() {
+		s.sentNormalized.Store(true)
+	}
 }
 
 func (s *standardClientTransport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
+	s.noteSend()
 	return s.client.Do(req, resp)
 }
 
 func (s *standardClientTransport) DoTimeout(req *fasthttp.Request, resp *fasthttp.Response, timeout time.Duration) error {
+	s.noteSend()
 	return s.client.DoTimeout(req, resp, timeout)
 }
 
 func (s *standardClientTransport) DoDeadline(req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
+	s.noteSend()
 	return s.client.DoDeadline(req, resp, deadline)
 }
 
-func (s *standardClientTransport) DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) error {
-	return s.client.DoRedirects(req, resp, maxRedirects)
+// DoRedirects follows redirects through doRedirectsWithClient rather than
+// fasthttp's own loop, so every transport applies the same target validation.
+// fasthttp's loop takes an HTTPS-to-HTTP hop; this one refuses it.
+func (s *standardClientTransport) DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, opts *redirectOptions) error {
+	s.noteSend()
+	// Before the loop serializes the URI, as fasthttp's own DoRedirects does:
+	// the setting has to reach req.URI() first or "/a//b" is normalized away on
+	// the very request the transport was configured to leave alone.
+	if s.client.DisablePathNormalizing {
+		req.URI().DisablePathNormalizing = true
+	}
+	return doRedirectsWithClient(req, resp, opts, s.client)
 }
 
 func (s *standardClientTransport) CloseIdleConnections() {
@@ -91,6 +227,27 @@ func (s *standardClientTransport) SetStreamResponseBody(enable bool) {
 	s.client.StreamResponseBody = enable
 }
 
+func (s *standardClientTransport) MaxResponseBodySize() int {
+	return s.client.MaxResponseBodySize
+}
+
+func (s *standardClientTransport) SetMaxResponseBodySize(size int) {
+	s.client.MaxResponseBodySize = size
+}
+
+// DisablePathNormalizing is false once a request has gone out while the client
+// normalized, because the host clients fasthttp created for it then keep doing
+// so whatever the field says now, and it is false for a client the transport
+// cannot vouch for, see settingKnown. Reporting true would let a path parameter
+// change the path for those hosts.
+func (s *standardClientTransport) DisablePathNormalizing() bool {
+	return s.settingKnown && s.client.DisablePathNormalizing && !s.sentNormalized.Load()
+}
+
+func (s *standardClientTransport) SetDisablePathNormalizing(disable bool) {
+	s.client.DisablePathNormalizing = disable
+}
+
 // hostClientTransport adapts fasthttp.HostClient to the httpClientTransport
 // interface used by Fiber's client helpers.
 type hostClientTransport struct {
@@ -113,8 +270,14 @@ func (h *hostClientTransport) DoDeadline(req *fasthttp.Request, resp *fasthttp.R
 	return h.client.DoDeadline(req, resp, deadline)
 }
 
-func (h *hostClientTransport) DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) error {
-	return h.client.DoRedirects(req, resp, maxRedirects)
+// DoRedirects uses the shared loop for the same reasons as
+// standardClientTransport.DoRedirects.
+func (h *hostClientTransport) DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, opts *redirectOptions) error {
+	// See standardClientTransport.DoRedirects.
+	if h.client.DisablePathNormalizing {
+		req.URI().DisablePathNormalizing = true
+	}
+	return doRedirectsWithClient(req, resp, opts, h.client)
 }
 
 func (h *hostClientTransport) CloseIdleConnections() {
@@ -145,6 +308,22 @@ func (h *hostClientTransport) SetStreamResponseBody(enable bool) {
 	h.client.StreamResponseBody = enable
 }
 
+func (h *hostClientTransport) MaxResponseBodySize() int {
+	return h.client.MaxResponseBodySize
+}
+
+func (h *hostClientTransport) SetMaxResponseBodySize(size int) {
+	h.client.MaxResponseBodySize = size
+}
+
+func (h *hostClientTransport) DisablePathNormalizing() bool {
+	return h.client.DisablePathNormalizing
+}
+
+func (h *hostClientTransport) SetDisablePathNormalizing(disable bool) {
+	h.client.DisablePathNormalizing = disable
+}
+
 // lbClientTransport adapts fasthttp.LBClient to the httpClientTransport
 // interface used by Fiber's client helpers.
 type lbClientTransport struct {
@@ -170,8 +349,8 @@ func (l *lbClientTransport) DoDeadline(req *fasthttp.Request, resp *fasthttp.Res
 // DoRedirects proxies redirect handling through doRedirectsWithClient so the
 // load-balanced transport mirrors fasthttp.Client semantics despite
 // fasthttp.LBClient not exposing DoRedirects directly.
-func (l *lbClientTransport) DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) error {
-	return doRedirectsWithClient(req, resp, maxRedirects, l.client)
+func (l *lbClientTransport) DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, opts *redirectOptions) error {
+	return doRedirectsWithClient(req, resp, opts, l.client)
 }
 
 func (l *lbClientTransport) CloseIdleConnections() {
@@ -224,6 +403,67 @@ func (l *lbClientTransport) SetStreamResponseBody(enable bool) {
 	forEachHostClient(l.client, func(hc *fasthttp.HostClient) {
 		hc.StreamResponseBody = enable
 	})
+}
+
+// MaxResponseBodySize returns the limit of the first host client, as StreamResponseBody does.
+func (l *lbClientTransport) MaxResponseBodySize() int {
+	var size int
+	for _, c := range l.client.Clients {
+		if walkBalancingClientWithBreak(c, func(hc *fasthttp.HostClient) bool {
+			size = hc.MaxResponseBodySize
+			return true
+		}) {
+			break
+		}
+	}
+	return size
+}
+
+func (l *lbClientTransport) SetMaxResponseBodySize(size int) {
+	forEachHostClient(l.client, func(hc *fasthttp.HostClient) {
+		hc.MaxResponseBodySize = size
+	})
+}
+
+func (l *lbClientTransport) DisablePathNormalizing() bool {
+	return balancerLeavesPathAlone(l.client.Clients)
+}
+
+func (l *lbClientTransport) SetDisablePathNormalizing(disable bool) {
+	forEachHostClient(l.client, func(hc *fasthttp.HostClient) {
+		hc.DisablePathNormalizing = disable
+	})
+}
+
+// balancerLeavesPathAlone reports whether every client in clients is a host
+// client that writes the path as built, looking through nested balancers. One
+// that normalizes decides for the whole balancer, since any request may be
+// routed to it, and so does a client of a kind that cannot be inspected.
+func balancerLeavesPathAlone(clients []fasthttp.BalancingClient) bool {
+	if len(clients) == 0 {
+		return false
+	}
+	for _, c := range clients {
+		if !balancingClientLeavesPathAlone(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// balancingClientLeavesPathAlone is balancerLeavesPathAlone for one client: a
+// host client, or a wrapper that exposes a nested balancer through LBClient,
+// the two kinds walkBalancingClientWithBreak looks through as well.
+func balancingClientLeavesPathAlone(client fasthttp.BalancingClient) bool {
+	switch c := client.(type) {
+	case *fasthttp.HostClient:
+		return c.DisablePathNormalizing
+	case interface{ LBClient() *fasthttp.LBClient }:
+		nested := c.LBClient()
+		return nested != nil && balancerLeavesPathAlone(nested.Clients)
+	default:
+		return false
+	}
 }
 
 // forEachHostClient applies fn to every host client reachable from the provided
@@ -286,28 +526,62 @@ func walkBalancingClientWithBreak(client any, fn func(*fasthttp.HostClient) bool
 }
 
 // redirectClient describes the minimal Do-capable surface needed by
-// doRedirectsWithClient so transports that do not expose DoRedirects (such as
-// fasthttp.LBClient) can participate in redirect handling.
+// doRedirectsWithClient, which every transport satisfies including
+// fasthttp.LBClient, the one that exposes no DoRedirects of its own.
 type redirectClient interface {
 	Do(req *fasthttp.Request, resp *fasthttp.Response) error
 }
 
-// doRedirectsWithClient mirrors fasthttp's redirect loop for transports that do
-// not expose DoRedirects (e.g. fasthttp.LBClient). The helper always issues the
-// initial request, respects zero redirect limits, falls back to the default cap
-// for negative values, and validates redirect targets before following them.
-func doRedirectsWithClient(req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int, client redirectClient) error {
-	currentURL := req.URI().String()
-	redirects := 0
-	singleRequestOnly := maxRedirects <= 0
+// doRedirectsWithClient is the redirect loop behind every transport, so target
+// validation does not depend on which one a caller built. It always issues the
+// initial request, falls back to the default cap for a negative limit, and
+// validates a redirect target before following one.
+//
+// A limit of zero is counted the way fasthttp counts it — the first redirect is
+// the first one counted, so it returns ErrTooManyRedirects. Returning the
+// redirect response instead left a caller unable to tell a request that finished
+// from one that stopped at a hop, and it is what the DoRedirects this stands in
+// for does.
+func doRedirectsWithClient(req *fasthttp.Request, resp *fasthttp.Response, opts *redirectOptions, client redirectClient) error {
+	if resp == nil {
+		// "Response is ignored if resp is nil", per fasthttp's own DoRedirects
+		// doc. Its loop reads resp.Header regardless and panics, so honor the
+		// documented contract here rather than inherit that.
+		resp = fasthttp.AcquireResponse()
+		defer fasthttp.ReleaseResponse(resp)
+	}
 
+	currentURL := req.URI().String()
+	initialHostname := hostnameWithoutPort(string(req.URI().Host()))
+	redirects := 0
+
+	maxRedirects := opts.maxRedirects
 	if maxRedirects < 0 {
 		maxRedirects = defaultRedirectLimit
-		singleRequestOnly = false
 	}
 
 	for {
 		req.SetRequestURI(currentURL)
+
+		// Where fasthttp's own loop calls the error-returning req.parseURI, and
+		// for the same reason: Request.URI swallows the error and hands back a
+		// half-parsed URI, so "http://example.com:abc/x" keeps the malformed
+		// authority as its host and loses the path. A HostClient dials its fixed
+		// Addr regardless, so that host went out as the Host header of a request
+		// the caller never wrote. The redirect targets below are checked as they
+		// are composed; this is the same check for the URI the caller supplied.
+		if err := parsesAsURI([]byte(currentURL)); err != nil {
+			return err
+		}
+
+		// One deadline for the chain, or every hop would get the full timeout again.
+		if !opts.deadline.IsZero() {
+			remaining := time.Until(opts.deadline)
+			if remaining <= 0 {
+				return fasthttp.ErrTimeout
+			}
+			req.SetTimeout(remaining)
+		}
 
 		if err := client.Do(req, resp); err != nil {
 			return err
@@ -315,10 +589,6 @@ func doRedirectsWithClient(req *fasthttp.Request, resp *fasthttp.Response, maxRe
 
 		statusCode := resp.Header.StatusCode()
 		if !fasthttp.StatusCodeIsRedirect(statusCode) {
-			return nil
-		}
-
-		if singleRequestOnly {
 			return nil
 		}
 
@@ -332,46 +602,139 @@ func doRedirectsWithClient(req *fasthttp.Request, resp *fasthttp.Response, maxRe
 			return fasthttp.ErrMissingLocation
 		}
 
-		nextURL, err := composeRedirectURL(currentURL, location, req.DisableRedirectPathNormalizing)
+		nextURL, nextHost, err := composeRedirectURL(currentURL, location, req.DisableRedirectPathNormalizing)
 		if err != nil {
 			return err
 		}
 		currentURL = nextURL
 
-		if req.Header.IsPost() && (statusCode == fasthttp.StatusMovedPermanently || statusCode == fasthttp.StatusFound || statusCode == fasthttp.StatusSeeOther) {
-			req.Header.SetMethod(fasthttp.MethodGet)
-			req.SetBody(nil)
-			req.Header.Del(fasthttp.HeaderContentType)
-			req.Header.Del(fasthttp.HeaderContentLength)
+		// 301, 302 and 303 retry as a GET without the body: net/http's
+		// redirectBehavior. The body goes even when the method already was GET or
+		// HEAD, or it would be replayed to the target, possibly a different host.
+		switch statusCode {
+		case fasthttp.StatusMovedPermanently, fasthttp.StatusFound, fasthttp.StatusSeeOther:
+			if !req.Header.IsGet() && !req.Header.IsHead() {
+				req.Header.SetMethod(fasthttp.MethodGet)
+			}
+			if !redirectbody.Drop(req) {
+				return ErrRedirectTrailers
+			}
+		}
+
+		// Credentials are scoped to the origin that issued them, so drop them once
+		// the chain leaves it. net/http's boundary, which fasthttp also implements:
+		// against the initial host, ignoring the port, subdomains still trusted.
+		// In place, so dropped headers stay gone if a later hop returns to the initial host.
+		if !trustedRedirectTarget(nextHost, initialHostname) {
+			crosshost.Strip(&req.Header, opts.sensitiveHeaders)
 		}
 	}
+}
+
+// hostnameWithoutPort strips the port from a host[:port] value, leaving a
+// bracketed IPv6 literal's own colons alone.
+func hostnameWithoutPort(host string) string {
+	// More than one colon without brackets is a bare IPv6 literal, where the last
+	// colon belongs to the address: truncating there folds "fe80::1" and
+	// "fe80::2" to one name, and a hop between them would keep its credentials.
+	if strings.HasPrefix(host, "[") || strings.Count(host, ":") <= 1 {
+		if i := strings.LastIndexByte(host, ':'); i >= 0 && strings.IndexByte(host[i:], ']') < 0 {
+			host = host[:i]
+		}
+	}
+	// Exactly one matched pair, not every bracket (strings.Trim folds "[[x]]"
+	// to "x"). Two spellings must never fold to one name here.
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return host
+}
+
+// trustedRedirectTarget reports whether credentials issued for initialHostname
+// may still be sent to host, which may carry a port: trusted when it is that
+// host or a subdomain — net/http's rule for forwarding sensitive headers.
+func trustedRedirectTarget(host, initialHostname string) bool {
+	target := hostnameWithoutPort(host)
+	if utils.EqualFold(target, initialHostname) {
+		return true
+	}
+	// No initial hostname means no origin to be a subdomain of, and the suffix
+	// test degenerates: every host matches "", so a name ending in '.' would
+	// back trusted and keep the credentials.
+	if initialHostname == "" {
+		return false
+	}
+	// The same bail-out net/http's isDomainOrSubdomain makes: a ':' or '%' means
+	// this is no hostname, and the suffix test would match inside an IPv6 zone
+	// identifier — "[::1%.example.com]" would come back a subdomain of it.
+	if utils.IndexAny2(target, ':', '%') != -1 {
+		return false
+	}
+	return len(target) > len(initialHostname) &&
+		target[len(target)-len(initialHostname)-1] == '.' &&
+		utils.HasSuffixFold(target, initialHostname)
 }
 
 // composeRedirectURL resolves a redirect target relative to the current request
 // URL while rejecting suspicious payloads (e.g. control characters) and
 // restricting schemes to HTTP/S so caller-provided Location headers cannot
-// trigger arbitrary transports.
-func composeRedirectURL(base string, location []byte, disablePathNormalizing bool) (string, error) {
-	for _, b := range location {
-		if b < 0x20 || b == 0x7f {
-			return "", fasthttp.ErrorInvalidURI
-		}
+// trigger arbitrary transports. Redirects from HTTPS to plaintext HTTP are
+// rejected to prevent credentials from leaking after a TLS handshake.
+//
+// It returns the resolved URL along with its host, which the caller compares
+// against the previous hop to decide whether origin-scoped credentials still
+// apply.
+// parsesAsURI reports whether fasthttp reads full as a URI at all, returning the
+// reason it does not. Only Parse surfaces that; Update and UpdateBytes discard it.
+func parsesAsURI(full []byte) error {
+	check := fasthttp.AcquireURI()
+	defer fasthttp.ReleaseURI(check)
+
+	if err := check.Parse(nil, full); err != nil {
+		return fmt.Errorf("%w: %w", fasthttp.ErrorInvalidURI, err)
+	}
+	return nil
+}
+
+func composeRedirectURL(base string, location []byte, disablePathNormalizing bool) (redirectURL, host string, err error) { //nolint:nonamedreturns // names document the two string results
+	// Control bytes (C0 including HTAB, plus DEL) in a Location value are a
+	// header-injection vector; utils.IndexControl scans for exactly that set
+	// two words per branch instead of one byte at a time.
+	if utils.IndexControl(location) != -1 {
+		return "", "", fasthttp.ErrorInvalidURI
 	}
 
 	uri := fasthttp.AcquireURI()
 	defer fasthttp.ReleaseURI(uri)
 
 	uri.Update(base)
+	wasHTTPS := utils.EqualFold(uri.Scheme(), httpsScheme)
 	uri.UpdateBytes(location)
 	uri.DisablePathNormalizing = disablePathNormalizing
 
-	if scheme := uri.Scheme(); len(scheme) > 0 && !bytes.EqualFold(scheme, httpScheme) && !bytes.EqualFold(scheme, httpsScheme) {
-		return "", fasthttp.ErrorInvalidURI
+	// UpdateBytes resolves the reference but discards the parse error, leaving
+	// whatever it had read behind: "http://example.com:abc/x" keeps the host
+	// "example.com:abc" and loses the path. fasthttp's own redirect loop returned
+	// that error rather than sending a second request, and a HostClient connects
+	// to its fixed Addr, so following one carries the malformed Host to a server
+	// that would otherwise never have been asked. Parse reports what UpdateBytes
+	// swallowed, so ask it of the result.
+	if err := parsesAsURI(uri.FullURI()); err != nil {
+		return "", "", err
 	}
 
-	if len(uri.Scheme()) > 0 && len(uri.Host()) == 0 {
-		return "", fasthttp.ErrorInvalidURI
+	scheme := uri.Scheme()
+	if len(scheme) > 0 && !utils.EqualFold(scheme, httpScheme) && !utils.EqualFold(scheme, httpsScheme) {
+		return "", "", fasthttp.ErrorInvalidURI
 	}
 
-	return uri.String(), nil
+	if len(scheme) > 0 && len(uri.Host()) == 0 {
+		return "", "", fasthttp.ErrorInvalidURI
+	}
+
+	if wasHTTPS && utils.EqualFold(scheme, httpScheme) {
+		return "", "", ErrRedirectDowngrade
+	}
+
+	return uri.String(), string(uri.Host()), nil
 }

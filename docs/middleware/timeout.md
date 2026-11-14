@@ -6,7 +6,7 @@ id: timeout
 
 The timeout middleware enforces a deadline on handler execution. It wraps handlers with
 `context.WithTimeout`, exposes the derived context through `c.Context()`, and
-returns `408 Request Timeout` when the deadline is exceeded.
+returns `503 Service Unavailable` when the deadline is exceeded.
 
 ## How It Works
 
@@ -14,28 +14,55 @@ When a timeout occurs, the middleware **returns immediately** without waiting fo
 handler to finish. This is achieved through Fiber's **Abandon mechanism**:
 
 1. The handler runs in a goroutine with a timeout context
-2. On timeout, the middleware marks the context as "abandoned" and returns `408` immediately
+2. On timeout, the middleware marks the context as "abandoned" and returns `503` immediately
 3. The handler goroutine can continue safely (e.g., for cleanup) without blocking the response
 4. A background cleanup goroutine waits for the handler to finish and performs context cleanup
 
 Handlers can detect the timeout by listening on `c.Context().Done()` and return early.
 This is the recommended pattern for cooperative cancellation.
 
-If a handler panics, the middleware catches it and returns `500 Internal Server Error`.
+The timeout response to a `HEAD` request carries no body, on the default path and the `OnTimeout` path alike.
+
+If a handler panics, the middleware catches it and returns `500 Internal Server Error`. So does a panic in `OnTimeout` once the deadline has passed.
+
+When an enclosing timeout middleware already guards the request with a deadline that comes no later than the configured one, such as a shorter timeout registered with `app.Use`, the middleware runs the handler on the calling goroutine and leaves the timeout to the enclosing one. Its `OnTimeout` then runs only for a timeout error the handler returns before the enclosing deadline passes; after that, the enclosing middleware answers the request. When nested timeouts fire at the same time, only the first to answer writes the timeout response. A shorter deadline set any other way, such as with `c.SetContext`, does not count: the middleware times the request out when it passes.
+
+## Why 503
+
+A handler that outlives its deadline is slow on the server's side: the request arrived complete. `408 Request Timeout` means the server did not receive a complete request in time ([RFC 9110 §15.5.9](https://www.rfc-editor.org/rfc/rfc9110#section-15.5.9)), and it tells the client that it may send the request again, while the timed-out handler can still be running and may finish its work. The default is therefore `503 Service Unavailable` ([§15.6.4](https://www.rfc-editor.org/rfc/rfc9110#section-15.6.4)). Use `504 Gateway Timeout` ([§15.6.5](https://www.rfc-editor.org/rfc/rfc9110#section-15.6.5)) when the handler stands in front of an upstream that did not answer in time, and return it from `OnTimeout`:
+
+```go
+timeout.Config{
+    Timeout: 5 * time.Second,
+    OnTimeout: func(c fiber.Ctx) error {
+        return fiber.ErrGatewayTimeout
+    },
+}
+```
 
 ## Known limitations
 
+- The timed-out handler keeps running in its own goroutine while the middleware returns `fiber.ErrServiceUnavailable` (or runs `OnTimeout`). A handler must stop using the context once `c.Context()` is done: the client never receives what it writes after that, and middleware registered before the timeout that uses the request or the response after `c.Next()` races with it, since even fasthttp's reads change state the two share. `c.IsAbandoned()` reports such a request.
+
+- When the deadline passes while the handler still runs, `OnTimeout` runs on a context of its own, so the timed-out handler cannot change the response it writes. That context carries the request, its locals, `c.Context()` and the response headers as they were when the handler started, but neither the request body nor the matched route: `c.Body()` is empty, `c.Params` returns the default value, and `c.Next()` is not available there (calling it answers `500`).
+
+- When `OnTimeout` writes the response and returns `nil` while the handler still runs, the middleware returns `fiber.ErrServiceUnavailable` instead, so middleware registered before it that skips its work on an error, such as `compress`, `etag` or `cache`, leaves the response to the timed-out handler. The client receives the response `OnTimeout` wrote.
+
+- The error is returned to the outer middleware, but the app's `ErrorHandler` is not run for a timed-out request: fasthttp already holds the response it will send, so the handler could not change it, and the timed-out handler may still be writing to the context.
+
 - Timed-out requests abandon their `fiber.Ctx` to avoid data races with the core
-  request handler (including the `ErrorHandler`). These contexts are **not**
-  returned to the pool, so each timed-out request leaks a context. Calling
-  `ForceRelease` is only safe if you can guarantee that no goroutine (including
-  Fiber internals) will touch the context anymore; the timeout middleware
-  intentionally does not call it.
+  request handler. A `*fiber.DefaultCtx` is reclaimed once both the timed-out
+  handler has finished and Fiber has released the context, so it does return to
+  the pool. A **custom `Ctx` implementation** has no such wiring: its context
+  stays out of the pool, and each timed-out request leaks one. Calling
+  `ForceRelease` yourself is only safe if you can guarantee that no goroutine
+  (including Fiber internals) will touch the context anymore.
 
 :::caution
-`timeout.New` wraps your final handler and can't be added with `app.Use` or
-used in a middleware chain. Register it per route and avoid calling
-`c.Next()` inside the wrapped handler—doing so will panic.
+`timeout.New` wraps your final handler, so register it per route rather than
+with `app.Use`. The handler runs in its own goroutine: if it calls `c.Next()`,
+the rest of the chain runs in that goroutine too and keeps running after the
+timeout response has been sent.
 :::
 
 ## Signatures
@@ -97,7 +124,7 @@ Use these requests to see the middleware in action:
 
 ```bash
 curl -i http://localhost:3000/sleep/1000   # finishes within the timeout
-curl -i http://localhost:3000/sleep/3000   # returns 408 Request Timeout
+curl -i http://localhost:3000/sleep/3000   # returns 503 Service Unavailable
 ```
 
 ## Config
@@ -106,8 +133,8 @@ curl -i http://localhost:3000/sleep/3000   # returns 408 Request Timeout
 |:------------|:-------------------|:---------------------------------------------------------------------|:-------|
 | Next        | `func(fiber.Ctx) bool` | Function to skip this middleware when it returns `true`.            | `nil`  |
 | Timeout     | `time.Duration`    | Timeout duration for requests. `0` or a negative value disables the timeout. | `0`    |
-| OnTimeout   | `fiber.Handler`    | Handler executed when a timeout occurs. Defaults to returning `fiber.ErrRequestTimeout`. | `nil`  |
-| Errors      | `[]error`          | Custom errors treated as timeout errors.                            | `nil`  |
+| OnTimeout   | `fiber.Handler`    | Handler executed when a timeout occurs. It may write the response itself or return a `*fiber.Error`, whose status and message then form the response; otherwise the default 503 is sent. After the deadline it runs on a context of its own, see [Known limitations](#known-limitations). Defaults to returning `fiber.ErrServiceUnavailable`. | `nil`  |
+| Errors      | `[]error`          | Custom errors treated as timeout errors, in addition to `context.DeadlineExceeded`. A handler that returns one of them (checked with `errors.Is`) gets the timeout response. | `nil`  |
 
 ### Use with a custom error
 
@@ -165,5 +192,18 @@ func main() {
 
     app.Get("/foo", timeout.New(handler, timeout.Config{Timeout: 10 * time.Second}))
     log.Fatal(app.Listen(":3000"))
+}
+```
+
+## Default Config
+
+With the default config, `Timeout` is `0`, so the wrapped handler runs without a deadline until you set one.
+
+```go
+var ConfigDefault = Config{
+    Next:      nil,
+    Timeout:   0,
+    OnTimeout: nil,
+    Errors:    nil,
 }
 ```

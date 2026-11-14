@@ -5,6 +5,15 @@ import (
 	"sync"
 )
 
+const (
+	bindingURI        = "uri"
+	bindingForm       = "form"
+	bindingQuery      = "query"
+	bindingHeader     = "header"
+	bindingRespHeader = "respHeader"
+	bindingCookie     = "cookie"
+)
+
 // Binder errors
 var (
 	ErrSuitableContentNotFound = errors.New("binder: suitable content not found to parse body")
@@ -12,6 +21,8 @@ var (
 	ErrMapNilDestination       = errors.New("binder: map destination is nil and cannot be initialized")
 	ErrInvalidDestinationValue = errors.New("binder: invalid destination value")
 	ErrUnmatchedBrackets       = errors.New("unmatched brackets")
+	ErrKeyTooDeep              = errors.New("binder: key is nested too deeply")
+	ErrTooManyElements         = errors.New("binder: keys index too many nested slice elements")
 )
 
 var errPoolTypeAssertion = errors.New("failed to type-assert to T")

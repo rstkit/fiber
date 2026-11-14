@@ -11,53 +11,168 @@ toc_max_heading_level: 4
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 import RoutingHandler from './../partials/routing/handler.md';
+import RoutingUse from './../partials/routing/use.md';
+import RoutingHandlerTypes from './../partials/routing/handler-types.md';
+import RouteAnatomy from '@site/src/components/route-anatomy';
+import MiddlewareVisualizer from '@site/src/components/middleware-visualizer';
 
-## Handlers
+## Anatomy of a route
+
+A route ties together an HTTP method, a path, and one or more handlers. Hover or click any colored part to jump to the section that explains it:
+
+<RouteAnatomy />
+
+`Get` is the [routing method](#route-handlers), `"/users/:id"` is the [route path](#paths) (the resource, in REST terms) with `:id` a [route parameter](#parameters), and `func(c fiber.Ctx) error` is the [handler](#handler-types) (or [middleware](#middleware)) run when the route matches.
+
+Want to see matching happen? Fire requests at your own route table in the interactive [Route Matcher](../extra/route-matcher.md).
+
+## Route Handlers
 
 <RoutingHandler />
 
-## Automatic HEAD routes
+Here is a complete, runnable app for context:
 
-Fiber automatically registers a `HEAD` route for every `GET` route you add. The generated handler chain mirrors the `GET` chain, so `HEAD` requests reuse middleware, status codes, and headers while the response body is suppressed.
+```go title="A minimal Fiber app"
+package main
 
-```go title="GET handlers automatically expose HEAD"
-app := fiber.New()
+import "github.com/gofiber/fiber/v3"
 
-app.Get("/users/:id", func(c fiber.Ctx) error {
-    c.Set("X-User", c.Params("id"))
-    return c.SendStatus(fiber.StatusOK)
-})
+func main() {
+    app := fiber.New()
 
-// HEAD /users/:id now returns the same headers and status without a body.
-```
+    app.Get("/", func(c fiber.Ctx) error {
+        return c.SendString("Hello, World!")
+    })
 
-You can still register dedicated `HEAD` handlers—even with auto-registration enabled—and Fiber replaces the generated route so your implementation wins:
-
-```go title="Override the generated HEAD handler"
-app.Head("/users/:id", func(c fiber.Ctx) error {
-    return c.SendStatus(fiber.StatusNoContent)
-})
-```
-
-To opt out globally, start the app with `DisableHeadAutoRegister`:
-
-```go title="Disable automatic HEAD registration"
-handler := func(c fiber.Ctx) error {
-    c.Set("X-User", c.Params("id"))
-    return c.SendStatus(fiber.StatusOK)
+    app.Listen(":3000")
 }
-
-app := fiber.New(fiber.Config{DisableHeadAutoRegister: true})
-app.Get("/users/:id", handler) // HEAD /users/:id now returns 405 unless you add it manually.
 ```
 
-Auto-generated `HEAD` routes participate in every router scope, including `Group` hierarchies, mounted sub-apps, parameterized and wildcard paths, and static file helpers. They also appear in route listings such as `app.Stack()` so tooling sees both the `GET` and `HEAD` entries.
+In the shorter examples throughout this guide, `app` is the `*fiber.App` returned by `fiber.New()`, and `handler`/`middleware` stand in for any `func(c fiber.Ctx) error`. Snippets that call `fmt.Println` or `fmt.Fprintf` also need `import "fmt"`.
+
+Beyond the native `func(fiber.Ctx)` forms, Fiber also adapts Express-style, `net/http`, and `fasthttp` handlers. See [Handler types](#handler-types) at the end of this guide for the full list of supported shapes.
+
+## Get vs Use vs All
+
+`Get` (and the other method helpers like `Post` and `Put`) match a **single HTTP method** at an **exact path**. `All` matches an **exact path** across **every** HTTP method. `Use` registers **middleware** that matches by **prefix** and runs in **declaration order**, calling [`c.Next()`](../api/ctx.md#next) to continue the chain.
+
+<Tabs>
+<TabItem value="get" label="Get (one method)">
+
+```go
+app.Get("/users", func(c fiber.Ctx) error {
+    return c.SendString("GET /users")
+})
+
+// GET    /users      -> "GET /users"
+// POST   /users      -> 405 Method Not Allowed
+// GET    /users/42   -> 404 Not Found  (exact match only)
+```
+
+</TabItem>
+<TabItem value="all" label="All (every method)">
+
+```go
+app.All("/ping", func(c fiber.Ctx) error {
+    return c.SendString(c.Method() + " /ping")
+})
+
+// GET    /ping        -> "GET /ping"
+// POST   /ping        -> "POST /ping"
+// DELETE /ping        -> "DELETE /ping"
+// GET    /ping/extra  -> 404 Not Found  (still exact path)
+```
+
+</TabItem>
+<TabItem value="use" label="Use (prefix middleware)">
+
+```go
+// Empty Use: no path -> matches every request, any method, any path
+app.Use(func(c fiber.Ctx) error {
+    c.Set("X-Powered-By", "Fiber")
+    return c.Next()
+})
+
+// Prefixed Use: matches the prefix and anything below a slash boundary
+app.Use("/api", func(c fiber.Ctx) error {
+    return c.Next()
+})
+
+// The empty Use above runs for ALL of these. The notes below show which
+// requests ALSO match the prefixed "/api" Use:
+// /api        -> also matches "/api" Use   (exact prefix)
+// /api/users  -> also matches "/api" Use   (slash boundary)
+// /apiv2      -> empty Use only             (no slash boundary)
+// /anything   -> empty Use only
+```
+
+</TabItem>
+<TabItem value="chain" label="Ordered chain">
+
+Multiple handlers that match the same request run in the order you declare them. Each must call `c.Next()` to pass control to the next; if one returns without calling it, the rest of the chain is skipped.
+
+```go
+app.Use("/api", func(c fiber.Ctx) error {
+    fmt.Println("1: auth check")
+    return c.Next()
+})
+
+app.Use("/api", func(c fiber.Ctx) error {
+    fmt.Println("2: logging")
+    return c.Next()
+})
+
+app.Get("/api/users", func(c fiber.Ctx) error {
+    fmt.Println("3: handler")
+    return c.SendString("users")
+})
+
+// GET /api/users prints, in order:
+//   1: auth check
+//   2: logging
+//   3: handler
+```
+
+</TabItem>
+<TabItem value="multi" label="Multiple handlers in one call">
+
+Attach several handlers in a single registration: list the route-specific middleware before the business handler.
+
+```go
+app.Get("/users/:id",
+    func(c fiber.Ctx) error { // 1: require authentication
+        if c.Get("Authorization") == "" {
+            return c.SendStatus(fiber.StatusUnauthorized) // returns without c.Next(): stops here
+        }
+        return c.Next()
+    },
+    func(c fiber.Ctx) error { // 2: stash data for downstream handlers
+        c.Locals("userID", c.Params("id"))
+        return c.Next()
+    },
+    func(c fiber.Ctx) error { // 3: business handler reads the stashed value
+        return c.SendString("user " + c.Locals("userID").(string))
+    },
+)
+
+// GET /users/42 (no Authorization header) -> 401, handlers 2 and 3 never run
+// GET /users/42 (with Authorization)      -> "user 42"
+```
+
+</TabItem>
+</Tabs>
+
+| Helper         | Methods matched | Path matching                              | Typical use                   |
+| -------------- | --------------- | ------------------------------------------ | ----------------------------- |
+| `Get`/`Post`/… | one             | exact                                      | a specific endpoint           |
+| `All`          | every method    | exact                                      | one path, any verb            |
+| `Use`          | every method    | prefix (slash boundary); all paths if none given | middleware, mounting sub-apps |
+
+A path that exists only for a different method returns **405 Method Not Allowed** with an `Allow` header that lists the methods it does answer; a path that matches no route at all (including one rejected by a [constraint](#constraints)) returns **404 Not Found**. Middleware registered with `Use` runs for these requests too, unless [`SkipUnmatchedRoutes`](../api/fiber.md#skipunmatchedroutes) is enabled, which answers them before the middleware chain runs, except for CORS preflight requests, which still go through it.
 
 ## Paths
 
 A route path paired with an HTTP method defines an endpoint. It can be a plain **string** or a **pattern**.
-
-### Examples of route paths based on strings
 
 ```go
 // This route path will match requests to the root route, "/":
@@ -76,60 +191,66 @@ app.Get("/random.txt", func(c fiber.Ctx) error {
 })
 ```
 
-As with the Express.js framework, the order in which routes are declared matters.
-Routes are evaluated sequentially, so more specific paths should appear before those with variables.
+The order in which you declare routes matters: like Express.js, routes are matched in registration order (first match wins), so declare more specific paths before those that contain parameters. Note that method helpers such as `Get` match the exact path only.
 
 :::info
 Place routes with variable parameters after fixed paths to avoid unintended matches.
 :::
 
+By default the router ignores letter case and a trailing slash, so a route registered as `/about` also answers `/About` and `/about/`, and parameter values keep the case the client sent. Set [`CaseSensitive`](../api/fiber.md#casesensitive) and [`StrictRouting`](../api/fiber.md#strictrouting) in `fiber.Config` to tell these spellings apart. Without `StrictRouting`, a path of slashes alone, such as `//`, is matched as `/`, the way `/about//` is matched as `/about`. Middleware registered with `Use` on `/about/` runs for `/about` in either mode.
+
+### Path normalization
+
+Before a request is matched, Fiber normalizes its path as [RFC 3986 Section 6.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-6.2.2) describes:
+
+- Percent-encoded unreserved characters (letters, digits, `-`, `.`, `_` and `~`) are decoded, so `/%70rivate` is matched as `/private`. Every other escape stays encoded with uppercase hex digits, so an encoded slash (`%2F`) never splits a segment and `/a%2fb` is matched as `/a%2Fb`. A stray `%` that begins no escape is kept as sent, so `/a%zzb` is matched as `/a%zzb` and `/files/./100%` as `/files/100%`, whatever else the path holds. The one exception is a stray `%` that an escape decoded after it would complete into a new escape: it is written as `%25`, so `/%%370rivate` is matched as `/%2570rivate`, never as `/%70rivate`. With [`UnescapePath`](../api/fiber.md#config) enabled, every escape is decoded instead and a malformed escape stays as sent.
+- `.` and `..` segments are resolved, so `/static/x/../private` and `/static/./private` are both matched as `/static/private`. A `..` never climbs above the root. Empty segments are kept: `/static//private` is a different path from `/static/private`.
+
+Middleware mounted on a prefix therefore sees these spellings of a path under it, and [`c.Path()`](../api/ctx.md#path) returns the normalized path. Decoding happens exactly once: `/%2570rivate` is matched as `/%2570rivate` by default and as `/%70rivate` with `UnescapePath`, and neither becomes `/private`. Nor can a stray `%` forge an escape out of the bytes after it, so by default `c.Path()` never holds an escape of an unreserved character: the router decoded the genuine ones, and `/%%370rivate` is matched as `/%2570rivate`, never as `/%70rivate` or `/private`. Since that `%25` appears only next to a decoded escape, a route parameter holding a stray `%` comes out the same however the rest of the path is spelled: `/files/100%` and `/files/./100%` both give `c.Params("name")` the value `100%`. It is still not a path to percent-decode again: an escape the router kept, such as `%2F`, is meant to stay one, and decoding it would make `/private%2Fsecret` into `/private/secret`. [`c.OriginalURL()`](../api/ctx.md#originalurl) still returns the request target as the client sent it.
+
 ## Parameters
 
 Route parameters are dynamic segments in a path, either named or unnamed, used to capture values from the URL. Retrieve them with the [Params](../api/ctx.md#params) function using the parameter name or, for unnamed parameters, the wildcard (`*`) or plus (`+`) symbol with an index.
 
-The characters `:`, `+`, and `*` introduce parameters.
+The characters `:`, `+`, and `*` introduce parameters. Append `?` to a named parameter to make it optional. `+` is a greedy, required wildcard (it must match at least one character); `*` is a greedy, optional wildcard (it can match nothing).
 
-Use `*` or `+` to capture segments greedily.
+An optional parameter makes only its value optional, never the text around it: literal characters after it must still be present. `/user/:name?/books` matches `/user/john/books` and `/user//books`, but not `/user/books`, so register a second route for the shorter form. At the end of a path the slash before the parameter can be left out as well: `/user/:name?` matches `/user`, `/user/` and `/user/john`. An optional parameter followed by a single character stays within its path segment: `/file/:name?.:ext` matches `/file/b.txt` but not `/file/a/b.txt`.
 
-You can define optional parameters by appending `?` to a named segment. The `+` sign is greedy and required, while `*` acts as an optional greedy wildcard.
+If an optional parameter sits directly before another parameter and the value it consumed makes the rest of the pattern fail, Fiber retries it as empty: `/:a?:b` matches `/x` with `a` empty and `b` set to `x`. Matching allows at most 16 such retries per route to bound the work for adjacent optional parameters. A route that needs more retries does not match, even if a valid assignment exists. Greedy wildcards do not participate in these retries, and a value that fails its constraint is not retried as empty.
 
-### Example of defining routes with route parameters
+A `Use`, `Group` or mount prefix whose only wildcard is followed only by literal text, such as `/api/*/admin`, covers every path in which that text ends a path segment, such as `/api/acme/admin/admins`, and so does a prefix without wildcards whose last segment holds one named parameter, without a constraint or `?`, followed by literal text, such as `/files/:name.json` for `/files/a.json.json/raw`; an optional or constrained parameter, or two parameters in one segment, still end at the first copy of the text. In other prefix shapes, such as `/api/*/admin/:id` or `/*/+/admin`, a wildcard ends where the router guesses and can miss paths that a route below the prefix answers, and with `StrictRouting` such a prefix keeps its trailing slash. Use a named parameter there, in the prefix and in the routes below it, as in `/api/:tenant/admin/:id`.
+
+<Tabs>
+<TabItem value="named" label="Named, optional, greedy">
 
 ```go
-// Parameters
+// Named parameters
 app.Get("/user/:name/books/:title", func(c fiber.Ctx) error {
     fmt.Fprintf(c, "%s\n", c.Params("name"))
     fmt.Fprintf(c, "%s\n", c.Params("title"))
     return nil
 })
-// Plus - greedy - not optional
+
+// Plus - greedy, required (matches at least one character)
 app.Get("/user/+", func(c fiber.Ctx) error {
     return c.SendString(c.Params("+"))
 })
 
-// Optional parameter
+// Optional named parameter
 app.Get("/user/:name?", func(c fiber.Ctx) error {
     return c.SendString(c.Params("name"))
 })
 
-// Wildcard - greedy - optional
+// Wildcard - greedy, optional (may match nothing)
 app.Get("/user/*", func(c fiber.Ctx) error {
     return c.SendString(c.Params("*"))
 })
-
-// This route path will match requests to "/v1/some/resource/name:customVerb", since the parameter character is escaped
-app.Get(`/v1/some/resource/name\:customVerb`, func(c fiber.Ctx) error {
-    return c.SendString("Hello, Community")
-})
 ```
 
-:::info
-The hyphen \(`-`\) and dot \(`.`\) are treated literally, so you can combine them with route parameters.
-:::
+</TabItem>
+<TabItem value="literal" label="Literal separators">
 
-:::info
-Escape special parameter characters with `\\` to treat them literally. This technique is useful for custom methods like those in the [Google API Design Guide](https://cloud.google.com/apis/design/custom_methods). Wrap routes in backticks to keep escape sequences clear.
-:::
+The hyphen (`-`), dot (`.`), and colon (`:`) are treated literally between parameters, so you can combine them with route parameters. Fiber's router detects when these characters belong to the literal path.
 
 ```go
 // http://localhost:3000/plantae/prunus.persica
@@ -137,19 +258,13 @@ app.Get("/plantae/:genus.:species", func(c fiber.Ctx) error {
     fmt.Fprintf(c, "%s.%s\n", c.Params("genus"), c.Params("species"))
     return nil // prunus.persica
 })
-```
 
-```go
 // http://localhost:3000/flights/LAX-SFO
 app.Get("/flights/:from-:to", func(c fiber.Ctx) error {
     fmt.Fprintf(c, "%s-%s\n", c.Params("from"), c.Params("to"))
     return nil // LAX-SFO
 })
-```
 
-Fiber's router detects when these characters belong to the literal path and handles them accordingly.
-
-```go
 // http://localhost:3000/shop/product/color:blue/size:xs
 app.Get("/shop/product/color::color/size::size", func(c fiber.Ctx) error {
     fmt.Fprintf(c, "%s:%s\n", c.Params("color"), c.Params("size"))
@@ -157,7 +272,27 @@ app.Get("/shop/product/color::color/size::size", func(c fiber.Ctx) error {
 })
 ```
 
-You can chain multiple named or unnamed parameters—including wildcard and plus segments—giving the router greater flexibility.
+</TabItem>
+<TabItem value="escaped" label="Escaped characters">
+
+Escape special parameter characters with `\\` to treat them literally. This is useful for custom methods like those in the [Google API Design Guide](https://cloud.google.com/apis/design/custom_methods). Wrap routes in backticks to keep escape sequences clear.
+
+```go
+// Matches "/v1/some/resource/name:customVerb" because the colon is escaped
+app.Get(`/v1/some/resource/name\:customVerb`, func(c fiber.Ctx) error {
+    return c.SendString("Hello, Community")
+})
+
+// Matches only the literal path "/*"; an escaped star is not the catch-all route
+app.Get(`/\*`, func(c fiber.Ctx) error {
+    return c.SendString("literal star")
+})
+```
+
+</TabItem>
+<TabItem value="multi" label="Multiple params per segment">
+
+You can chain multiple named or unnamed parameters, including wildcard and plus segments, within a single segment.
 
 ```go
 // GET /@v1
@@ -177,31 +312,53 @@ app.Get("/*v1*/proxy", handler)
 app.Get("/v1/*/shop/*", handler)
 ```
 
-Fiber's routing is inspired by Express but intentionally omits regular expression routes due to their performance cost. You can try similar patterns using the Express route tester (v0.1.7).
+:::info
+Fiber lets multiple parameters share a single path segment, unlike routers such as Express, Gin, and Echo where `:param` always consumes a whole segment. When named parameters are adjacent **with no literal separator between them**, the router cannot know where one parameter ends and the next begins: there is no delimiter in the pattern to split on.
+
+To keep matching deterministic, Fiber assigns every adjacent named parameter except the last a fixed length of **one character**, and the **last** parameter takes the remainder of the segment (up to the next delimiter or end of path). This is why `/:sign:param` against `/@v1` yields `sign=@` and `param=v1`, not `sign=@v` and `param=1`.
+
+If you need a multi-character split, put a literal delimiter between parameters, for example `/:sign-:param` matching `/@v-1`.
+:::
+
+</TabItem>
+</Tabs>
+
+When a route has several wildcard (`*`) or plus (`+`) segments, retrieve them positionally with a 1-based index matching the symbol: `c.Params("*1")` and `c.Params("*2")` for wildcards, `c.Params("+1")` and `c.Params("+2")` for plus segments. A single wildcard or plus is just `c.Params("*")` or `c.Params("+")`.
+
+Fiber's routing is inspired by Express but intentionally omits regex route patterns due to their performance cost. To validate a parameter against a regular expression, use the [`regex()` constraint](#constraints) described below.
 
 ### Constraints
 
 Route constraints execute when a match has occurred to the incoming URL and the URL path is tokenized into route values by parameters. The feature was introduced in `v2.37.0` and inspired by [.NET Core](https://docs.microsoft.com/en-us/aspnet/core/fundamentals/routing?view=aspnetcore-6.0#route-constraints).
 
 :::caution
-Constraints aren't validation for parameters. If constraints aren't valid for a parameter value, Fiber returns **404 handler**.
+Constraints are matching rules, not input validation: if a value fails a constraint, the route simply does not match and Fiber returns **404 Not Found**.
 :::
 
 | Constraint        | Example                          | Example matches                                                                             |
 | ----------------- | -------------------------------- | ------------------------------------------------------------------------------------------- |
 | int               | `:id<int>`                       | 123456789, -123456789                                                                       |
-| bool              | `:active<bool>`                  | true,false                                                                                  |
+| bool              | `:active<bool>`                  | true, false (and the other values `strconv.ParseBool` reads, such as 1 and 0)               |
 | guid              | `:id<guid>`                      | CD2C1638-1638-72D5-1638-DEADBEEF1638                                                        |
-| float             | `:weight<float>`                 | 1.234, -1,001.01e8                                                                          |
-| minLen(value)     | `:username<minLen(4)>`           | Test (must be at least 4 characters)                                                        |
-| maxLen(value)     | `:filename<maxLen(8)>`           | MyFile (must be no more than 8 characters                                                   |
-| len(length)       | `:filename<len(12)>`             | somefile.txt (exactly 12 characters)                                                        |
+| float             | `:weight<float>`                 | 1.234, -1001.01e8, 3.14                                                                     |
+| minLen(value)     | `:username<minLen(4)>`           | Test (must be at least 4 bytes)                                                             |
+| maxLen(value)     | `:filename<maxLen(8)>`           | MyFile (must be no more than 8 bytes)                                                       |
+| len(length)       | `:filename<len(12)>`             | somefile.txt (exactly 12 bytes)                                                             |
+| betweenLen(min,max) | `:name<betweenLen(3,8)>`       | MyFile (must be at least 3 and no more than 8 bytes)                                        |
 | min(value)        | `:age<min(18)>`                  | 19 (Integer value must be at least 18)                                                      |
 | max(value)        | `:age<max(120)>`                 | 91 (Integer value must be no more than 120)                                                 |
 | range(min,max)    | `:age<range(18,120)>`            | 91 (Integer value must be at least 18 but no more than 120)                                 |
-| alpha             | `:name<alpha>`                   | Rick (String must consist of one or more alphabetical characters, a-z and case-insensitive) |
+| alpha             | `:name<alpha>`                   | Rick (String must consist of one or more letters: a-z in either case, and other Unicode letters when the path reaches the router as UTF-8, which a percent-encoded path does only with [`UnescapePath`](../api/fiber.md#unescapepath) enabled) |
 | datetime          | `:dob<datetime(2006\\-01\\-02)>` | 2005-11-01                                                                                  |
 | regex(expression) | `:date<regex(\d{4}-\d{2}-\d{2})>` | 2022-08-27 (Must match regular expression)                                                  |
+
+The length constraints (`minLen`, `maxLen`, `len` and `betweenLen`) count bytes, not characters, of the value the router matched: a non-ASCII character counts as its UTF-8 bytes, or as its longer `%XX` form while the path keeps it percent-encoded, which is the default (see [`UnescapePath`](../api/fiber.md#unescapepath)).
+
+Constraint names and arguments are always taken from the pattern as written, even with the default case-insensitive routing: `:code<regex([A-Z]{2})>` keeps matching uppercase codes only, a `datetime` layout keeps its `T` and `Z`, and a custom constraint registered under a mixed-case name is found. A built-in name matches in any letter case (`minLen(4)` and `MinLen(4)` are the same constraint), while a custom constraint name must match exactly.
+
+:::note
+A constraint with a missing or malformed argument (`:id<min>` or `:id<min(abc)>`) never matches, so the route answers **404** for every request. A name that is neither built in nor a registered [custom constraint](#custom-constraint) is ignored and leaves the parameter unconstrained, so a misspelled constraint does not reject anything. Only `regex(...)` expressions are checked when the route is registered: an invalid one panics.
+:::
 
 #### Examples
 
@@ -243,7 +400,7 @@ app.Get("/:test<min(100);maxLen(5)>", func(c fiber.Ctx) error {
 </TabItem>
 <TabItem value="regex-constraint" label="Regex Constraint">
 
-Fiber precompiles the regex when registering routes, so regex constraints add no runtime overhead.
+Fiber precompiles the regex when registering routes, so the pattern is matched (not recompiled) on each request. To compile patterns with another regex engine, set [`RegexHandler`](../api/fiber.md#regexhandler); see [Make Fiber Faster](./faster-fiber.md#alternative-regex-engines-for-regex-constraints).
 
 ```go
 app.Get(`/:date<regex(\d{4}-\d{2}-\d{2})>`, func(c fiber.Ctx) error {
@@ -264,7 +421,7 @@ app.Get(`/:date<regex(\d{4}-\d{2}-\d{2})>`, func(c fiber.Ctx) error {
 </Tabs>
 
 :::caution
-Prefix routing characters with `\\` when using the datetime constraint (`*`, `+`, `?`, `:`, `/`, `<`, `>`, `;`, `(`, `)`), to avoid misparsing.
+When using the datetime constraint, prefix routing characters (`*`, `+`, `?`, `:`, `/`, `<`, `>`, `;`, `(`, `)`) with `\\` to avoid misparsing.
 :::
 
 #### Optional Parameter Example
@@ -288,10 +445,12 @@ app.Get("/:test<int>?", func(c fiber.Ctx) error {
 Custom constraints can be added to Fiber using the `app.RegisterCustomConstraint` method. Your constraints have to be compatible with the `CustomConstraint` interface.
 
 :::caution
-Attention, custom constraints can now override built-in constraints. If a custom constraint has the same name as a built-in constraint, the custom constraint will be used instead. This allows for more flexibility in defining route parameter constraints.
+Attention, custom constraints can now override built-in constraints. If a custom constraint has the same name as a built-in constraint, the custom constraint will be used instead. This allows for more flexibility in defining route parameter constraints. The built-in names are available as constants, for example `fiber.ConstraintInt`, `fiber.ConstraintMinLen` and `fiber.ConstraintRegex`.
 :::
 
 Add external constraints when you need stricter rules, such as verifying that a parameter is a valid ULID.
+
+Register a custom constraint before the routes that use it: a route is parsed when it is registered, so a route registered earlier is left without the constraint. Custom constraints registered on a sub-app keep applying to its routes once the sub-app is mounted, and the app that mounts it can use its own constraints in the mount prefix. A parameter in the prefix of a plain mount routes as usual, but the sub-app's own `ErrorHandler` and `Views` are found only under a literal prefix (see [Mounting](../api/app.md#mounting)).
 
 ```go
 // CustomConstraint is an interface for custom constraints
@@ -339,13 +498,46 @@ func main() {
 }
 ```
 
-## Middleware
+#### ConstraintHandler Interface
 
-Functions that are designed to make changes to the request or response are called **middleware functions**. The [Next](../api/ctx.md#next) is a **Fiber** router function, when called, executes the **next** function that **matches** the current route.
-
-### Example of a middleware function
+Behind the scenes, Fiber evaluates every constraint through the `ConstraintHandler` interface, which separates the work done once at route registration from the check made on each request. All built-in constraints implement it.
 
 ```go
+// ConstraintHandler is the interface that all constraints must implement.
+type ConstraintHandler interface {
+    // Name returns the constraint identifier used in route patterns.
+    Name() string
+
+    // Execute validates a request parameter value against the constraint.
+    // data contains the pre-typed constraint data produced by Analyze().
+    Execute(param string, data []any) bool
+}
+```
+
+Built-in constraints that take arguments (`min`, `range`, `datetime`, `regex` and so on) also implement `ConstraintAnalyzer`, which parses the arguments once at registration time and avoids repeated parsing on every request:
+
+```go
+// ConstraintAnalyzer is an optional interface for registration-time precomputation.
+type ConstraintAnalyzer interface {
+    // Analyze preprocesses constraint data at route registration time.
+    // Returns pre-typed values that will be stored in Constraint.Data.
+    Analyze(args []string) ([]any, error)
+}
+```
+
+:::note
+`app.RegisterCustomConstraint` accepts `CustomConstraint` values only, so a `ConstraintHandler` cannot be registered directly. Fiber wraps each `CustomConstraint` in a `ConstraintHandler` and passes the arguments from the pattern to its `Execute` method as strings, split on unescaped commas. If your custom constraint also implements `ConstraintAnalyzer`, Fiber calls its `Analyze` method with those arguments when the route is registered, but the values it returns are not handed to `Execute`.
+:::
+
+:::tip Try it live
+Test route patterns, registration order, and constraints against real requests in the interactive [Route Matcher](../extra/route-matcher.md) tool.
+:::
+
+## Middleware
+
+Functions that are designed to make changes to the request or response are called **middleware functions**. [`c.Next()`](../api/ctx.md#next) passes control to the next handler in the matched chain (middleware or route handler); if a handler returns without calling it, the remaining handlers are skipped.
+
+```go title="Example of a middleware function"
 app.Use(func(c fiber.Ctx) error {
     // Set a custom header on all responses:
     c.Set("X-Custom-Header", "Hello, World")
@@ -359,16 +551,20 @@ app.Get("/", func(c fiber.Ctx) error {
 })
 ```
 
-`Use` method path is a **mount**, or **prefix** path, and limits middleware to only apply to any paths requested that begin with it.
+Once a route matches, its handlers run as one chain in registration order; each handler decides with `c.Next()` whether the rest of the chain runs. Step through the chain yourself, including what happens when a middleware short-circuits instead of calling `c.Next()`:
 
-:::note
-Prefix matches must now end at a slash boundary (or be an exact match). For example, `/api` runs for `/api` and `/api/users` but no longer for `/apiv2`. Parameter tokens such as `:name`, `:name?`, `*`, and `+` are still expanded before this boundary check runs.
-:::
+<MiddlewareVisualizer />
 
-### Constraints on Adding Routes Dynamically
+See [Get vs Use vs All](#get-vs-use-vs-all) for how `Use` prefix matching differs from exact route matching, and how multiple handlers run in order.
+
+### Use
+
+<RoutingUse />
+
+### Adding or removing routes at runtime
 
 :::caution
-Adding routes dynamically after the application has started is not supported due to design and performance considerations. Make sure to define all your routes before the application starts.
+Defining all routes before the app starts is strongly recommended. You can still change them at runtime with [`RebuildTree`](../api/app.md#rebuildtree), [`RemoveRoute`](../api/app.md#removeroute), [`RemoveRouteByName`](../api/app.md#removeroutebyname), and [`RemoveRouteFunc`](../api/app.md#removeroutefunc), but these operations are not thread-safe and are performance-intensive, so use them sparingly and only in development.
 :::
 
 ## Grouping
@@ -393,4 +589,77 @@ func main() {
 }
 ```
 
-More information about this in our [Grouping Guide](./grouping.md)
+More information about this in our [Grouping Guide](./grouping.md).
+
+### Route
+
+[`Route`](../api/app.md#route) is shorthand for [`Group`](#grouping): it scopes a set of routes under a common prefix declared inside a single callback, with an optional name prefix.
+
+```go
+app.Route("/api/v1", func(r fiber.Router) {
+    r.Get("/users", handler).Name("users")   // /api/v1/users  (name: v1.users)
+    r.Post("/users", handler).Name("create") // /api/v1/users  (name: v1.create)
+}, "v1.")
+```
+
+### RouteChain
+
+When several HTTP methods share the **same path**, [`RouteChain`](../api/app.md#routechain) lets you declare the path once and chain the verb handlers. Handlers run in the order you declare them, so an `All` declared before the verb handlers runs ahead of them on that path, acting as route-specific middleware.
+
+```go
+app.RouteChain("/events").
+    All(func(c fiber.Ctx) error { return c.Next() }). // route-local middleware
+    Get(func(c fiber.Ctx) error { return c.SendString("GET /events") }).
+    Post(func(c fiber.Ctx) error { return c.SendString("POST /events") })
+```
+
+:::note
+Within a chain, `All` registers prefix-matched middleware (like [`Use`](#use)), not the exact-path `App.All`, so it also runs for sub-paths of the chain path.
+:::
+
+Pick the helper that fits: a single endpoint uses `Get`/`Post`/…; a fixed set of methods on one path uses [`Add`](#route-handlers); one path with many methods (fluently) uses `RouteChain`; many paths under a shared prefix use [`Group`](#grouping) or `Route`; routes that must answer only for certain hostnames use [`Domain`](../api/app.md#domain).
+
+## Automatic HEAD routes
+
+Fiber automatically registers a `HEAD` route for every `GET` route you add. The generated handler chain mirrors the `GET` chain, so `HEAD` requests reuse middleware, status codes, and headers while the response body is suppressed. Each generated route runs at the position of its `GET` route, so a guard registered with `Get` covers `HEAD` as well. This covers the routes of mounted sub-apps at any nesting depth, and routes added at runtime get their `HEAD` companion when [`RebuildTree`](../api/app.md#rebuildtree) publishes them.
+
+```go title="GET handlers automatically expose HEAD"
+app := fiber.New()
+
+app.Get("/users/:id", func(c fiber.Ctx) error {
+    c.Set("X-User", c.Params("id"))
+    return c.SendStatus(fiber.StatusOK)
+})
+
+// HEAD /users/:id now returns the same headers and status without a body.
+```
+
+You can still register dedicated `HEAD` handlers, even with auto-registration enabled, and Fiber replaces the generated routes of that path so your implementation wins:
+
+```go title="Override the generated HEAD handler"
+app.Head("/users/:id", func(c fiber.Ctx) error {
+    return c.SendStatus(fiber.StatusNoContent)
+})
+```
+
+The replacement covers the `GET` routes of the same app registered with the same [`Domain`](../api/app.md#domain) pattern, or with none. A `HEAD` route on another `Domain` pattern, or in a mounted sub-app, keeps its place in the route order instead: the generated route of a `GET` route registered before it runs first, so register or mount it ahead of that `GET` route when it has to answer first.
+
+To opt out globally, start the app with `DisableHeadAutoRegister`:
+
+```go title="Disable automatic HEAD registration"
+handler := func(c fiber.Ctx) error {
+    c.Set("X-User", c.Params("id"))
+    return c.SendStatus(fiber.StatusOK)
+}
+
+app := fiber.New(fiber.Config{DisableHeadAutoRegister: true})
+app.Get("/users/:id", handler) // HEAD /users/:id now returns 405 unless you add it manually.
+```
+
+Each app decides for its own routes. A mounted sub-app that sets `DisableHeadAutoRegister`, or that leaves `HEAD` out of its `RequestMethods`, gets no automatic `HEAD` routes when it is mounted, so a `HEAD` request for its routes answers **405** even though the app it is mounted in registers them for its own routes. A sub-app that does not serve `HEAD` registers its middleware only for the methods it serves, so a synthesized `HEAD` route would run its handlers without that middleware. A sub-app mounted on a [`Domain`](../api/app.md#domain) follows the same rule. The app mounted on decides as well: one that sets `DisableHeadAutoRegister` takes no automatic `HEAD` routes from the apps mounted into it, whether or not they would register their own, since a guard it registered with `Get`, such as `app.Get("/admin/*", auth)`, has no `HEAD` companion to run in front of them. Register such a guard with `Use`, or add the `HEAD` routes yourself.
+
+Auto-generated `HEAD` routes participate in every router scope, including `Group` hierarchies, mounted sub-apps, parameterized and wildcard paths, and static file helpers. They also appear in route listings such as `app.Stack()` so tooling sees both the `GET` and `HEAD` entries.
+
+## Handler types
+
+<RoutingHandlerTypes />

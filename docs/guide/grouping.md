@@ -81,3 +81,38 @@ func main() {
     log.Fatal(app.Listen(":3000"))
 }
 ```
+
+## Route
+
+[`Route`](../api/app.md#route) groups routes under a common prefix declared inside a single callback, with an optional name prefix. It is shorthand for nesting with `Group`.
+
+```go
+app.Route("/api/v1", func(r fiber.Router) {
+    r.Get("/users", handler).Name("users")   // /api/v1/users  (name: v1.users)
+    r.Post("/users", handler).Name("create") // /api/v1/users  (name: v1.create)
+}, "v1.")
+```
+
+## RouteChain
+
+When several HTTP methods share the **same path**, [`RouteChain`](../api/app.md#routechain) lets you declare the path once and chain the verb handlers. Handlers run in the order you declare them, so an `All` declared before the verb handlers runs ahead of them on that path, acting as route-specific middleware.
+
+```go
+app.RouteChain("/events").
+    All(func(c fiber.Ctx) error { return c.Next() }). // route-local middleware
+    Get(func(c fiber.Ctx) error { return c.SendString("GET /events") }).
+    Post(func(c fiber.Ctx) error { return c.SendString("POST /events") })
+```
+
+:::note
+Within a chain, `All` registers prefix-matched middleware (like [`app.Use`](../api/app.md#use)), not the exact-path `App.All`, so it also runs for sub-paths of the chain path.
+:::
+
+## Domain
+
+[`Domain`](../api/app.md#domain) scopes routes to a hostname. Called on a group, it keeps the group's prefix: only requests whose hostname matches the pattern reach the routes you register on the returned router.
+
+```go
+api := app.Group("/api")
+api.Domain("api.example.com").Get("/users", handler) // GET api.example.com/api/users only
+```

@@ -3,38 +3,28 @@ package csrf
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
+
+	"github.com/gofiber/fiber/v3/internal/redact"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/internal/memory"
 )
 
-// msgp -file="storage_manager.go" -o="storage_manager_msgp.go" -tests=true -unexported
-//
-//go:generate msgp -o=storage_manager_msgp.go -tests=true -unexported
-type item struct{}
+// storagePrefix keeps tokens apart from other middleware sharing the Storage, as the client
+// names the token; the concatenation also gives the Storage a key that outlives the request.
+const storagePrefix = "csrf:"
 
-const redactedKey = "[redacted]"
-
-//msgp:ignore manager
-//msgp:ignore storageManager
 type storageManager struct {
-	pool       sync.Pool       `msg:"-"` //nolint:revive // Ignore unexported type
-	memory     *memory.Storage `msg:"-"` //nolint:revive // Ignore unexported type
-	storage    fiber.Storage   `msg:"-"` //nolint:revive // Ignore unexported type
-	redactKeys bool
+	memory           *memory.Storage
+	storage          fiber.Storage
+	shouldRedactKeys bool
 }
 
-func newStorageManager(storage fiber.Storage, redactKeys bool) *storageManager {
+func newStorageManager(storage fiber.Storage, shouldRedactKeys bool) *storageManager {
 	// Create new storage handler
 	storageManager := &storageManager{
-		pool: sync.Pool{
-			New: func() any {
-				return new(item)
-			},
-		},
-		redactKeys: redactKeys,
+		shouldRedactKeys: shouldRedactKeys,
 	}
 	if storage != nil {
 		// Use provided storage if provided
@@ -49,7 +39,7 @@ func newStorageManager(storage fiber.Storage, redactKeys bool) *storageManager {
 // get raw data from storage or memory
 func (m *storageManager) getRaw(ctx context.Context, key string) ([]byte, error) {
 	if m.storage != nil {
-		raw, err := m.storage.GetWithContext(ctx, key)
+		raw, err := m.storage.GetWithContext(ctx, storagePrefix+key)
 		if err != nil {
 			return nil, fmt.Errorf("csrf: failed to get value from storage: %w", err)
 		}
@@ -70,7 +60,7 @@ func (m *storageManager) getRaw(ctx context.Context, key string) ([]byte, error)
 // set data to storage or memory
 func (m *storageManager) setRaw(ctx context.Context, key string, raw []byte, exp time.Duration) error {
 	if m.storage != nil {
-		if err := m.storage.SetWithContext(ctx, key, raw, exp); err != nil {
+		if err := m.storage.SetWithContext(ctx, storagePrefix+key, raw, exp); err != nil {
 			return fmt.Errorf("csrf: failed to store key %q: %w", m.logKey(key), err)
 		}
 		return nil
@@ -83,7 +73,7 @@ func (m *storageManager) setRaw(ctx context.Context, key string, raw []byte, exp
 // delete data from storage or memory
 func (m *storageManager) delRaw(ctx context.Context, key string) error {
 	if m.storage != nil {
-		if err := m.storage.DeleteWithContext(ctx, key); err != nil {
+		if err := m.storage.DeleteWithContext(ctx, storagePrefix+key); err != nil {
 			return fmt.Errorf("csrf: failed to delete key %q: %w", m.logKey(key), err)
 		}
 		return nil
@@ -94,8 +84,5 @@ func (m *storageManager) delRaw(ctx context.Context, key string) error {
 }
 
 func (m *storageManager) logKey(key string) string {
-	if m.redactKeys {
-		return redactedKey
-	}
-	return key
+	return redact.Value(key, m.shouldRedactKeys)
 }

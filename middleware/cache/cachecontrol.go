@@ -1,0 +1,201 @@
+package cache
+
+import (
+	"github.com/gofiber/fiber/v3/internal/headerlist"
+	"github.com/gofiber/fiber/v3/internal/mediatype"
+	"github.com/gofiber/utils/v2"
+	"github.com/valyala/fasthttp"
+)
+
+// hasDirective checks if a cache directive header value contains a directive (case-insensitive).
+// A directive is considered matched when followed by end-of-string, ',', ' ', '\t', or '='
+// per RFC 9111 §5.2. An empty directive never matches.
+func hasDirective(cc, directive string) bool {
+	dirLen := len(directive)
+	if dirLen == 0 {
+		return false
+	}
+	// Cheap first-byte fold filter before the full compare, the shape that
+	// beat an IndexFold skip-scan for isNoCache on typical short values;
+	// a rare false candidate (the fold is exact only for letters) just
+	// costs one EqualFold.
+	first := directive[0] | 0x20
+	n := len(cc)
+	for i := 0; i <= n-dirLen; i++ {
+		if cc[i]|0x20 != first {
+			continue
+		}
+		if !utils.EqualFold(cc[i:i+dirLen], directive) {
+			continue
+		}
+		if i > 0 {
+			prev := cc[i-1]
+			if prev != ' ' && prev != ',' && prev != '\t' {
+				continue
+			}
+		}
+		end := i + dirLen
+		if end == n {
+			return true
+		}
+		next := cc[end]
+		if next == ',' || next == ' ' || next == '\t' || next == '=' {
+			return true
+		}
+	}
+	return false
+}
+
+func parseUintDirective(val []byte) (uint64, bool) {
+	if len(val) == 0 {
+		return 0, false
+	}
+	parsed, err := fasthttp.ParseUint(val)
+	if err != nil || parsed < 0 {
+		return 0, false
+	}
+	return uint64(parsed), true
+}
+
+func parseCacheControlDirectives(cc []byte, fn func(key, value []byte)) {
+	for start := 0; start < len(cc); {
+		// Skip empty elements and leading OWS without invoking the scanner for
+		// every separator. Only SP and HTAB are OWS (RFC 9110 Section 5.6.3).
+		for start < len(cc) && (cc[start] == ' ' || cc[start] == '\t' || cc[start] == ',') {
+			start++
+		}
+		if start >= len(cc) {
+			break
+		}
+		// A directive value may be a quoted-string (RFC 9111 §5.2), and a comma
+		// inside one is data rather than the end of the directive. Scanning past
+		// it read the tokens in an extension value as directives of their own,
+		// so `ext="a, public, b"` said public and authorized sharing.
+		// Unterminated quotes swallow the rest of the field, which is the safe
+		// way round: what follows is read as one value rather than as directives
+		// a sender never separated.
+		var part []byte
+		part, start = headerlist.NextQuoted(cc, start)
+		part = headerlist.TrimOWS(part)
+
+		// A directive without "=" reports a nil value, one with an empty
+		// argument an empty value.
+		key, value, hasValue := utils.CutByte(part, '=')
+		if hasValue {
+			value = headerlist.TrimOWS(value)
+			// Handle quoted-string values per RFC 9111 Section 5.2
+			if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+				value, _ = mediatype.Unescape(value[1 : len(value)-1])
+			}
+		}
+
+		fn(headerlist.TrimOWS(key), value)
+	}
+}
+
+type responseCacheControl struct {
+	maxAge          uint64
+	sMaxAge         uint64
+	maxAgeSet       bool
+	sMaxAgeSet      bool
+	hasNoCache      bool
+	hasNoStore      bool
+	hasPrivate      bool
+	hasPublic       bool
+	mustRevalidate  bool
+	proxyRevalidate bool
+}
+
+func parseResponseCacheControl(cc []byte) responseCacheControl {
+	parsed := responseCacheControl{}
+	parseCacheControlDirectives(cc, func(key, value []byte) {
+		switch {
+		case utils.EqualFold(utils.UnsafeString(key), noStore):
+			parsed.hasNoStore = true
+		case utils.EqualFold(utils.UnsafeString(key), noCache):
+			parsed.hasNoCache = true
+		case utils.EqualFold(utils.UnsafeString(key), privateDirective):
+			parsed.hasPrivate = true
+		case utils.EqualFold(utils.UnsafeString(key), "public"):
+			parsed.hasPublic = true
+		case utils.EqualFold(utils.UnsafeString(key), "max-age"):
+			if v, ok := parseUintDirective(value); ok {
+				parsed.maxAgeSet = true
+				parsed.maxAge = v
+			}
+		case utils.EqualFold(utils.UnsafeString(key), "s-maxage"):
+			if v, ok := parseUintDirective(value); ok {
+				parsed.sMaxAgeSet = true
+				parsed.sMaxAge = v
+			}
+		case utils.EqualFold(utils.UnsafeString(key), "must-revalidate"):
+			parsed.mustRevalidate = true
+		case utils.EqualFold(utils.UnsafeString(key), "proxy-revalidate"):
+			parsed.proxyRevalidate = true
+		default:
+			// ignore unknown directives
+		}
+	})
+	return parsed
+}
+
+func parseRequestCacheControl(cc []byte) requestCacheDirectives {
+	directives := requestCacheDirectives{}
+	parseCacheControlDirectives(cc, func(key, value []byte) {
+		switch {
+		case utils.EqualFold(utils.UnsafeString(key), noStore):
+			directives.noStore = true
+		case utils.EqualFold(utils.UnsafeString(key), noCache):
+			directives.noCache = true
+		case utils.EqualFold(utils.UnsafeString(key), "only-if-cached"):
+			directives.onlyIfCached = true
+		case utils.EqualFold(utils.UnsafeString(key), "max-age"):
+			if sec, ok := parseUintDirective(value); ok {
+				directives.maxAgeSet = true
+				directives.maxAge = sec
+			}
+		case utils.EqualFold(utils.UnsafeString(key), "max-stale"):
+			directives.maxStaleSet = true
+			directives.maxStaleAny = len(value) == 0
+			if !directives.maxStaleAny {
+				if sec, ok := parseUintDirective(value); ok {
+					directives.maxStale = sec
+				}
+			}
+		case utils.EqualFold(utils.UnsafeString(key), "min-fresh"):
+			if sec, ok := parseUintDirective(value); ok {
+				directives.minFreshSet = true
+				directives.minFresh = sec
+			}
+		default:
+			// ignore unknown directives
+		}
+	})
+	return directives
+}
+
+func allowsSharedCacheDirectives(cc responseCacheControl) bool {
+	if cc.hasPrivate {
+		return false
+	}
+	if cc.hasPublic || cc.sMaxAgeSet || cc.mustRevalidate || cc.proxyRevalidate {
+		return true
+	}
+
+	// RFC 9111 §4.2.2 permits Expires as an absolute expiry for cacheable responses, but for
+	// authenticated requests §3.6 requires an explicit shared-cache directive. Therefore,
+	// an Expires header alone MUST NOT allow sharing when Authorization is present.
+	return false
+}
+
+// allowsSharedCacheStorage reports whether a response says outright that a
+// shared cache may hold it. Stricter than allowsSharedCacheDirectives, which
+// accepts must-revalidate on a bargain this middleware never keeps.
+func allowsSharedCacheStorage(cc responseCacheControl) bool {
+	// The store path rejects private long before the cookie gate; this arm just
+	// keeps the predicate self-contained.
+	if cc.hasPrivate {
+		return false
+	}
+	return cc.hasPublic || cc.sMaxAgeSet
+}

@@ -2,7 +2,7 @@
 id: extractors
 title: 🔬 Extractors
 description: Learn how to use extractors in Fiber middleware
-sidebar_position: 8.5
+sidebar_position: 7
 toc_max_heading_level: 4
 ---
 
@@ -32,26 +32,105 @@ Extractors are utilities that middleware uses to get values from different parts
 - `FromQuery(param string)`: Extract from URL query parameters
 - `FromCustom(key string, fn func(fiber.Ctx) (string, error))`: Define custom extraction logic with metadata
 - `Chain(extractors ...Extractor)`: Chain multiple extractors with fallback logic
+- `Resolve(e Extractor, c fiber.Ctx) (Result, error)`: Return the value and which extractor supplied it — `Result.Value`, `Result.Key`, `Result.Source` (preferred for security decisions on chains)
+- `Extractor.Walk(fn func(Extractor) bool)`: Visit this extractor and every nested chained extractor, depth first and in chain order, stopping early when `fn` returns false
+- `Extractor.Contains(pred func(Extractor) bool)`: Check whether this extractor, or any nested chained extractor, matches a predicate
+
+### Sources and Errors
+
+Each extractor declares where it reads from in its `Source` field and which name it reads in `Key`:
+
+| Extractor        | `Source`                                    | `Key`                                                                                     |
+| ---------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `FromHeader`     | `SourceHeader` (the zero value of `Source`) | The header name                                                                           |
+| `FromAuthHeader` | `SourceAuthHeader`                          | `Authorization`; the scheme you pass is kept in `AuthScheme`                              |
+| `FromCookie`     | `SourceCookie`                              | The cookie name                                                                           |
+| `FromParam`      | `SourceParam`                               | The route parameter name                                                                  |
+| `FromForm`       | `SourceForm`                                | The form field name                                                                       |
+| `FromQuery`      | `SourceQuery`                               | The query parameter name                                                                  |
+| `FromCustom`     | `SourceCustom`                              | The `key` you pass                                                                        |
+| `Chain`          | That of the first child                     | That of the first child (`SourceCustom` and an empty `Key` for a chain without children) |
+
+An extractor fails with `ErrNotFound` when its value is missing or empty, and a chain that re-enters itself fails with `ErrChainCycle`. A custom `Extract` function may return any other error. A chain moves on to the next child after an error and returns the last error if no child succeeds.
+
+### Extractor Behavior
+
+An empty value counts as missing for every extractor. A few more details matter when the value is a credential:
+
+- **`FromHeader`** matches the header name case-insensitively, also when `DisableHeaderNormalizing` is on. A header sent on several lines is joined into one value, with a comma and a space between the lines (RFC 9110 Section 5.3), so a repeated token does not equal the token that was issued.
+- **`FromAuthHeader`** returns `ErrNotFound` when the request carries more than one `Authorization` line, however each one is spelled, because the credential would be ambiguous. The accepted format is described under [Standards Compliance](#standards-compliance).
+- **`FromParam`** returns the parameter percent-decoded exactly once, whatever the [`UnescapePath`](../api/fiber.md#unescapepath) setting is: a literal `%20` sent as `%2520` comes back as `%20`. With `UnescapePath` off, a value that cannot be decoded returns `ErrNotFound`; with it on, the router has already decoded the path, so a malformed escape such as `100%` comes back as sent. `Ctx.Params` returns the raw value when `UnescapePath` is off.
+- **`FromForm`** reads through [`Ctx.FormValue`](../api/ctx.md#formvalue), which looks in the query string first, then in the url-encoded body, then in the multipart fields. A value in the URL therefore satisfies `FromForm`, and `Resolve` still reports `SourceForm` for it. Do not rely on `FromForm` alone to keep a value out of URLs.
 
 ### Extractor Structure
 
-Each `Extractor` contains:
+Each `Extractor` contains the fields below (order matches the Go struct). Prefer **keyed** composite literals when constructing `Extractor` values. Source-aware extraction is provided by the package function `Resolve` — it is **not** a field on `Extractor`, so existing unkeyed literals keep compiling.
 
 ```go
 type Extractor struct {
-    Extract    func(fiber.Ctx) (string, error)  // Extraction function
-    Key        string                           // Parameter/header name
-    Source     Source                           // Source type for inspection
-    AuthScheme string                           // Auth scheme (FromAuthHeader)
-    Chain      []Extractor                      // Chained extractors
+    Extract    func(fiber.Ctx) (string, error) // Extraction callback
+    Key        string                          // Parameter/header name
+    AuthScheme string                          // Auth scheme (FromAuthHeader)
+    Chain      []Extractor                     // Chained extractors (introspection copy)
+    Source     Source                          // Declared/static source metadata
 }
 ```
+
+`Resolve` reports provenance as a `Result`, which carries metadata only:
+
+```go
+type Result struct {
+    Value    string // The extracted value
+    Key      string // The parameter/header/cookie name the winning extractor read
+    Source   Source // The kind of source the winning extractor read from
+    Resolved bool   // Whether Key and Source name the extractor that actually produced Value
+}
+```
+
+`Resolved` is false when a chain's own `Extract` answered without any child being
+observed to win. `Key` and `Source` are then the chain's declared metadata (its
+first child) and say nothing about where the value came from, so a security
+decision — such as writing a value back to where it was read from — must refuse
+rather than trust them.
 
 - **Headers**: `Authorization`, `X-API-Key`, custom headers
 - **Cookies**: Session cookies, authentication tokens
 - **Query Parameters**: URL parameters like `?token=abc123`
-- **Form Data**: POST body form fields
+- **Form Data**: Form fields of a url-encoded or multipart body (`FromForm` also checks the query string, see [Extractor Behavior](#extractor-behavior))
 - **URL Parameters**: Route parameters like `/users/:id`
+
+### Source-Aware Extraction
+
+`Extractor.Source` is **declared/static metadata**, not an authoritative origin signal by itself:
+
+- For a chain, static `Source` is the **first** child.
+- `SourceHeader` is the zero value of `Source`. A legacy `Extract`-only callback that omits `Source` therefore reports `SourceHeader` via `Resolve`.
+- Error paths may return static or last-child source metadata even when no value was supplied. Use the returned source for security decisions **only when `err == nil`**, and only when that source metadata is known to be accurate for your extractor.
+
+When middleware needs to know which extractor actually produced the value — to apply a stricter policy, or to write the value back to where it came from — call the package function `Resolve`:
+
+```go
+tokenExtractor := extractors.Chain(
+    extractors.FromHeader("X-API-Key"),
+    extractors.FromQuery("api_key"),
+)
+
+res, err := extractors.Resolve(tokenExtractor, c)
+if err != nil {
+    return err
+}
+// res.Value is the extracted value.
+// res.Source is SourceHeader or SourceQuery depending on which child won — do
+// not assume tokenExtractor.Source (always SourceHeader for this chain).
+// res.Key is the header or query parameter name that child read.
+if res.Source == extractors.SourceQuery {
+    // e.g. apply stricter policy or audit logging for query-sourced secrets
+}
+```
+
+`Resolve` always uses the public `Extract` callback when set (so leaf and chain-level `Extract` overrides for validation/normalization are honored). For a built-in `Chain`, that single `Extract` pass records the winning child and `Resolve` reads the capture — children are not extracted a second time. If `Extract` is fully replaced without delegating to the original (no capture), the declared static metadata is returned rather than re-walking `Chain` children. Leaves return `Extract`'s result with the static metadata. There is no second callback field to clear or re-point.
+
+When `Extract` is `nil`, `Resolve` walks the extractor's own `Chain` instead, nested chains included. An extractor with neither returns `ErrNotFound`.
 
 ### Chain Behavior
 
@@ -59,9 +138,40 @@ The `Chain` function creates extractors that try multiple sources in order:
 
 - Returns the first successful extraction (non-empty value with no error)
 - If all extractors fail, returns the last error encountered or `ErrNotFound`
-- **Robust error handling**: Skips extractors with `nil` Extract functions
-- Preserves the source and key from the first extractor for metadata
-- Stores a defensive copy of all chained extractors for introspection via the `Chain` field
+- **Robust error handling**: Skips children with a `nil` `Extract` (and zero-value trailing children)
+- **Cycle prevention**: Detects recursive chain re-entry and returns `ErrChainCycle` (shared across `Extract` and `Resolve`)
+- Preserves `Source` and `Key` from the first extractor for static metadata (not `AuthScheme`)
+- On success with `Resolved` true, `Resolve` reports the winning child's `Key` and `Source` at runtime
+- On failure, the returned source is fallback metadata only — do not treat it as the origin of an extracted value
+- Exposes a **defensive copy** of children via the `Chain` field for introspection; mutating that slice does not change which children `Extract` runs
+- An empty `Chain()` always fails with `ErrNotFound`
+
+### Chain Introspection
+
+Use `Contains` to inspect an extractor tree with a predicate:
+
+```go
+chain := extractors.Chain(
+    extractors.FromHeader("X-CSRF-Token"),
+    extractors.FromCookie("CSRF"),
+)
+
+hasCSRFCookie := chain.Contains(func(e extractors.Extractor) bool {
+    return e.Source == extractors.SourceCookie && e.Key == "CSRF"
+})
+```
+
+`Walk` visits every extractor in the tree, depth first and in chain order, starting with the extractor itself. Prefer `Walk` and `Contains` to ranging over the `Chain` field, which lists only direct children and judges a nested chain by its declared metadata (its first child) instead of by what is inside it. A chain is visited too, so skip entries with a non-empty `Chain` when you are looking for the extractors that actually read a value:
+
+```go
+var cookies []extractors.Extractor
+chain.Walk(func(e extractors.Extractor) bool {
+    if len(e.Chain) == 0 && e.Source == extractors.SourceCookie {
+        cookies = append(cookies, e)
+    }
+    return true // keep walking; return false to stop early
+})
+```
 
 ## Why Middleware Uses Extractors
 
@@ -76,10 +186,36 @@ Middleware needs to extract values from requests for authentication, authorizati
 
 ### Basic Usage
 
+`keyauth.New` requires a `Validator` and panics at startup without one. The `keyauth` snippets in this guide use this validator:
+
+```go
+import (
+    "crypto/sha256"
+    "crypto/subtle"
+
+    "github.com/gofiber/fiber/v3"
+    "github.com/gofiber/fiber/v3/middleware/keyauth"
+)
+
+var apiKey = "correct-horse-battery-staple"
+
+func validateAPIKey(c fiber.Ctx, key string) (bool, error) {
+    // Hash both values so the comparison takes the same time whatever their length
+    hashedAPIKey := sha256.Sum256([]byte(apiKey))
+    hashedKey := sha256.Sum256([]byte(key))
+
+    if subtle.ConstantTimeCompare(hashedAPIKey[:], hashedKey[:]) == 1 {
+        return true, nil
+    }
+    return false, keyauth.ErrMissingOrMalformedAPIKey
+}
+```
+
 ```go
 // KeyAuth middleware extracts key from header
 app.Use(keyauth.New(keyauth.Config{
     Extractor: extractors.FromHeader("Middleware-Key"),
+    Validator: validateAPIKey,
 }))
 ```
 
@@ -95,6 +231,7 @@ tokenExtractor := extractors.Chain(
 
 app.Use(keyauth.New(keyauth.Config{
     Extractor: tokenExtractor,
+    Validator: validateAPIKey,
 }))
 ```
 
@@ -107,11 +244,13 @@ app.Use(keyauth.New(keyauth.Config{
 app.Use(keyauth.New(keyauth.Config{
     // Default extracts from Authorization header
     // Extractor: extractors.FromAuthHeader("Bearer"),
+    Validator: validateAPIKey,
 }))
 
 // Custom header extraction
 app.Use(keyauth.New(keyauth.Config{
     Extractor: extractors.FromHeader("X-API-Key"),
+    Validator: validateAPIKey,
 }))
 
 // Multiple sources with secure fallback
@@ -121,6 +260,7 @@ app.Use(keyauth.New(keyauth.Config{
         extractors.FromHeader("X-API-Key"),   // Then custom header
         extractors.FromQuery("api_key"),      // Least secure last
     ),
+    Validator: validateAPIKey,
 }))
 ```
 
@@ -185,6 +325,7 @@ Different extraction sources have different security properties and use cases:
 
 - **POST Bodies**: Suitable for form submissions and API requests
 - **Considerations**: Avoid putting sensitive data in query strings; ensure request bodies aren’t logged and use the correct content type
+- **Query string fallback**: `FromForm` also accepts the field from the query string, so a value in the URL satisfies it, and the query string wins when both carry the field
 - **Best for**: User-generated content, file uploads
 
 ### Security Best Practices
@@ -219,11 +360,13 @@ The "best" source depends on your specific use case, security requirements, and 
 // ❌ DON'T: API keys in URLs (visible in logs, history, bookmarks)
 app.Use(keyauth.New(keyauth.Config{
     Extractor: extractors.FromQuery("api_key"), // PROBLEMATIC
+    Validator: validateAPIKey,
 }))
 
 // ✅ DO: API keys in headers (not visible in URLs)
 app.Use(keyauth.New(keyauth.Config{
     Extractor: extractors.FromHeader("X-API-Key"), // BETTER
+    Validator: validateAPIKey,
 }))
 ```
 
@@ -276,14 +419,15 @@ Choose extractors based on your specific use case and security needs, not blanke
 
 ### Authorization Header (RFC 9110 & RFC 7235)
 
-The `FromAuthHeader` extractor provides comprehensive RFC compliance with strict security validation:
+The `FromAuthHeader` extractor validates the Authorization header format described below with strict security checks, and keeps to the RFCs except for one documented restriction:
 
 #### RFC 9110 Compliance (Authorization Header Format)
 
-- **Section 11.6.2 Format**: Enforces `credentials = auth-scheme 1*SP token68` structure
-- **1*SP Requirement**: Validates exactly one or more spaces between auth-scheme and token
+- **Section 11.6.2 Format**: Enforces `credentials = auth-scheme SP token68` structure
+- **Single space (intentional deviation)**: RFC 9110 allows `1*SP` between the auth-scheme and the token. The extractor requires exactly one space, which is what clients send, and rejects anything else, so the parse stays unambiguous
 - **Case-insensitive scheme matching**: `Bearer`, `bearer`, `BEARER` all work correctly
-- **Proper whitespace handling**: Rejects tabs between scheme and token (only spaces allowed)
+- **Proper whitespace handling**: Rejects tabs between scheme and token (only a single space is allowed)
+- **token68 credentials only**: When a scheme is given, credentials made of `auth-param` lists (such as `Digest`) are rejected. Use `FromAuthHeader("")` to read the raw header value instead
 
 #### RFC 7235 Token68 Validation
 
@@ -328,7 +472,7 @@ rawExtractor := extractors.FromAuthHeader("")
 
 #### Benefits
 
-- **Standards Compliance**: Full adherence to HTTP authentication RFCs
+- **Standards Compliance**: Follows RFC 9110 and RFC 7235 for the supported format, with the single-space restriction above as its one intentional deviation
 - **Security Hardening**: Prevents common authentication bypass vulnerabilities
 - **Consistent Behavior**: Reliable parsing across different client implementations
 - **Developer Confidence**: Clear validation rules reduce authentication bugs
@@ -422,6 +566,7 @@ When using multiple middleware that extract values, ensure they don't conflict:
 // Good: Different sources for different purposes
 app.Use(keyauth.New(keyauth.Config{
     Extractor: extractors.FromHeader("X-API-Key"),
+    Validator: validateAPIKey,
 }))
 app.Use(session.New(session.Config{
     Extractor: extractors.FromCookie("session_id"),
@@ -430,6 +575,7 @@ app.Use(session.New(session.Config{
 // Avoid: Same source for different middleware
 app.Use(keyauth.New(keyauth.Config{
     Extractor: extractors.FromCookie("token"), // API auth
+    Validator: validateAPIKey,
 }))
 app.Use(session.New(session.Config{
     Extractor: extractors.FromCookie("token"), // Session - CONFLICT!

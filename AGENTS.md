@@ -6,11 +6,40 @@
 
 ### General coding practices
 
-- When adding Go tests, always invoke `t.Parallel()` at the start of each test and subtest to maximize concurrency.
+- When adding Go tests, always invoke `t.Parallel()` at the start of each test and subtest to maximize concurrency. The exceptions are a test that calls `testing.AllocsPerRun`, which panics with `AllocsPerRun called during parallel test`, and one that installs package-level state every other test reads, such as the proxy policy `withSecurityPolicyForTest` installs: leave those sequential and say why in a comment, as `Test_Chain_NoAllocations`, `Test_Combined_DoesNotAllocate` and `Test_Security_Do_BlocksDNSRebinding` do.
+- Do not hand-write the plumbing that nearly every test repeats; `internal/apptest` has helpers for it. `apptest.Do`, `apptest.Expect` and `apptest.ExpectBody` send a request through an app and check the transport error, the status and the body (a string target is a GET, anything else is built with `apptest.Req`, which takes options such as `apptest.WithHeader`, `apptest.WithHeaderIf` for a header that may be empty, and `apptest.WithHost`); `apptest.Body` reads a response body; `apptest.Ctx`, `apptest.CtxAs` and `apptest.CtxFor` borrow a request context and release it when the test ends; `apptest.Recv` waits on a channel with a deadline instead of a hand-written `select` with `time.After`; `apptest.Pairs` reads the name and value pairs of a variadic `...string`. Fold tests that differ only in their data into one table-driven test with a subtest per row instead of copying the test, and give a helper that three or more tests share a name and a doc comment.
+- Take fakes from the shared test packages instead of writing another one: `internal/storagetest` has `Memory`, a storage whose errors are configured with `SetErr` and which logs the calls it served (`Calls`, `CallKeys`; `Marked` puts a label on a context so the log shows which one reached the storage), and `Failing`; `internal/clocktest` has `Clock`, a clock the test moves, and `SleepPast` for the cached second clock; `internal/loggertest` and `internal/tlstest` cover the logger output and TLS configs. A helper that two or more packages need belongs in one of these packages (or in `internal/apptest` when it is about requests, contexts or waiting); a helper only one package uses stays in that package's tests.
+- Keep test files compact: no blank line right after `t.Parallel()`; a function literal whose body is a single statement goes on one line (`app.Get("/", func(c fiber.Ctx) error { return c.SendString("ok") })`); table rows and short literals or calls go on one line when it stays within 120 columns (tabs count 4); assert `require.NoError(t, f())` instead of going through an `err` variable that is not used again; and do not add `// go test -run ...` hint comments. Benchmarks keep their names (CI charts them by name) and their timed loops; share only their setup.
+- `internal/testconventions` checks these conventions on every `_test.go` file (`go test ./internal/testconventions`): `t.Parallel()` first in every test and subtest, no blank line after it, no `// go test -run` hints, response bodies read through `apptest.Body`, no hand-written `fiber.Storage` fakes, and no timed loop in a benchmark helper. A justified exception takes a `// conventions:ignore <rule>: <reason>` comment on the line above the test, benchmark helper or statement (rules: `parallel`, `blank-line`, `run-hint`, `body-read`, `storage-fake`, `bench-loop`); the reason is required, and a marker above a test also covers its subtests. A marker that silences nothing fails the check, so delete it when the exception goes away. Tests that were sequential before the rule carry a `legacy` marker: make such a test parallel and delete its marker, and never write a new `legacy` one.
 - Prefer `github.com/gofiber/utils/v2` helpers (for example, `utils.Trim`) when performing common operations such as string manipulation, whenever it is practical and appropriate for the surrounding code.
 - Keep all protocol behavior RFC-compliant (e.g., HTTP/1.1 requirements) and document any intentional deviations.
 - Protect hot paths from regressions: profile changes.
 - Apply secure-by-default choices (validation, timeouts, sanitization) and ensure new code hardens attack surfaces.
+
+### Linter pitfalls (run `make lint` before every push)
+
+The linter is the most common reason CI fails for generated changes. Always run
+`make lint` locally and fix every finding *before* committing — do not rely on
+CI to surface them. The `golangci-lint` config (`.golangci.yml`) enables strict
+`errcheck` settings (`check-type-assertions: true` and `check-blank: true`),
+which trip up the patterns below:
+
+- **Never discard a type-assertion result with `_`.** `v, _ := x.(T)` fails
+  `errcheck`. Use the comma-ok form and act on it instead:
+
+  ```go
+  v, ok := x.(T)
+  if !ok {
+      v = T{} // explicit fallback; the zero value is fine when that's intended
+  }
+  ```
+
+- **Never discard a returned `error` with `_`** (`check-blank`). Handle it, or
+  if it is genuinely safe to ignore, call the function without assignment or add
+  a justified `//nolint:errcheck // reason` comment.
+
+- When in doubt, run `make lint` (or `golangci-lint run ./<pkg>/...`) and treat a
+  non-zero exit as a blocker.
 
 ---
 
@@ -31,7 +60,6 @@
   go install github.com/tinylib/msgp@latest                # msgp codegen
   go install github.com/vburenin/ifacemaker@f30b6f9bdbed4b5c4804ec9ba4a04a999525c202  # interface impls
   go install github.com/dkorunic/betteralign/cmd/betteralign@latest  # struct alignment
-  go install golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest
   go mod tidy                                              # clean up go.mod & go.sum
   ```
 
@@ -48,8 +76,9 @@ Use `make help` to list all available commands. Common targets include:
 - **longtest**: run the test suite 15 times with shuffling enabled.
 - **tidy**: clean and tidy dependencies.
 - **betteralign**: optimize struct field alignment.
-- **generate**: run `go generate` after installing msgp and ifacemaker.
-- **modernize**: run golps modernize
+- **generate**: run `go generate` after installing msgp and ifacemaker. On a pull request a maintainer
+  can get the same result without a local toolchain by commenting `/generate`, which runs the target
+  and pushes the regenerated files onto the branch.
 
 These targets can be invoked via `make <target>` as needed during development and testing.
 
@@ -68,7 +97,6 @@ final response to confirm they were executed:
 make audit
 make generate
 make betteralign
-make modernize
 make format
 make lint
 make test

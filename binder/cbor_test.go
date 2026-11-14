@@ -9,10 +9,7 @@ import (
 
 func Test_CBORBinder_Bind(t *testing.T) {
 	t.Parallel()
-
-	b := &CBORBinding{
-		CBORDecoder: cbor.Unmarshal,
-	}
+	b := &CBORBinding{CBORDecoder: cbor.Unmarshal}
 	require.Equal(t, "cbor", b.Name())
 
 	type Post struct {
@@ -28,33 +25,17 @@ func Test_CBORBinder_Bind(t *testing.T) {
 	var user User
 
 	wantedUser := User{
-		Name: "john",
-		Names: []string{
-			"john",
-			"doe",
-		},
-		Age: 42,
-		Posts: []Post{
-			{Title: "post1"},
-			{Title: "post2"},
-			{Title: "post3"},
-		},
+		Name:  "john",
+		Names: []string{"john", "doe"},
+		Age:   42,
+		Posts: []Post{{Title: "post1"}, {Title: "post2"}, {Title: "post3"}},
 	}
 
 	body, err := cbor.Marshal(wantedUser)
 	require.NoError(t, err)
 
-	err = b.Bind(body, &user)
-
-	require.NoError(t, err)
-	require.Equal(t, "john", user.Name)
-	require.Equal(t, 42, user.Age)
-	require.Len(t, user.Posts, 3)
-	require.Equal(t, "post1", user.Posts[0].Title)
-	require.Equal(t, "post2", user.Posts[1].Title)
-	require.Equal(t, "post3", user.Posts[2].Title)
-	require.Contains(t, user.Names, "john")
-	require.Contains(t, user.Names, "doe")
+	require.NoError(t, b.Bind(body, &user))
+	require.Equal(t, wantedUser, user)
 
 	b.Reset()
 	require.Nil(t, b.CBORDecoder)
@@ -63,9 +44,7 @@ func Test_CBORBinder_Bind(t *testing.T) {
 func Benchmark_CBORBinder_Bind(b *testing.B) {
 	b.ReportAllocs()
 
-	binder := &CBORBinding{
-		CBORDecoder: cbor.Unmarshal,
-	}
+	binder := &CBORBinding{CBORDecoder: cbor.Unmarshal}
 
 	type User struct {
 		Name string `cbor:"name"`
@@ -73,10 +52,7 @@ func Benchmark_CBORBinder_Bind(b *testing.B) {
 	}
 
 	var user User
-	wantedUser := User{
-		Name: "john",
-		Age:  42,
-	}
+	wantedUser := User{Name: "john", Age: 42}
 
 	body, err := cbor.Marshal(wantedUser)
 	require.NoError(b, err)
@@ -88,44 +64,4 @@ func Benchmark_CBORBinder_Bind(b *testing.B) {
 	require.NoError(b, err)
 	require.Equal(b, "john", user.Name)
 	require.Equal(b, 42, user.Age)
-}
-
-func Test_UnimplementedCborMarshal_Panics(t *testing.T) {
-	t.Parallel()
-
-	require.Panics(t, func() {
-		_, _ = UnimplementedCborMarshal(struct{ Name string }{Name: "test"}) //nolint:errcheck // this is just a test to trigger the panic
-	})
-}
-
-func Test_UnimplementedCborUnmarshal_Panics(t *testing.T) {
-	t.Parallel()
-
-	require.Panics(t, func() {
-		var out any
-		_ = UnimplementedCborUnmarshal([]byte{0xa0}, &out) //nolint:errcheck // this is just a test to trigger the panic
-	})
-}
-
-func Test_UnimplementedCborMarshal_PanicMessage(t *testing.T) {
-	t.Parallel()
-
-	defer func() {
-		if r := recover(); r != nil {
-			require.Contains(t, r, "Must explicitly setup CBOR")
-		}
-	}()
-	_, _ = UnimplementedCborMarshal(struct{ Name string }{Name: "test"}) //nolint:errcheck // this is just a test to trigger the panic
-}
-
-func Test_UnimplementedCborUnmarshal_PanicMessage(t *testing.T) {
-	t.Parallel()
-
-	defer func() {
-		if r := recover(); r != nil {
-			require.Contains(t, r, "Must explicitly setup CBOR")
-		}
-	}()
-	var out any
-	_ = UnimplementedCborUnmarshal([]byte{0xa0}, &out) //nolint:errcheck // this is just a test to trigger the panic
 }

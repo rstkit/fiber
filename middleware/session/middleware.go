@@ -3,19 +3,32 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/ctxlocal"
+	"github.com/gofiber/fiber/v3/internal/redact"
+	"github.com/gofiber/fiber/v3/middleware/logger"
 )
 
 // Middleware holds session data and configuration.
+// Middleware serializes access to its internal state with a mutex, but it is
+// request-scoped and must not be used after the request lifecycle ends.
 type Middleware struct {
-	Session   *Session
-	ctx       fiber.Ctx
-	config    Config
-	mu        sync.RWMutex
-	destroyed bool
+	Session *Session
+	ctx     fiber.Ctx
+	config  Config
+	mu      sync.RWMutex
+	// released is set when the request is over and the middleware was published
+	// to the request context, so FromContext stops returning it.
+	released    atomic.Bool
+	isDestroyed bool
+	// escaped marks a middleware the request context holds, which releaseMiddleware
+	// must not recycle.
+	escaped bool
 }
 
 // Context key for session middleware lookup.
@@ -75,6 +88,8 @@ func New(config ...Config) fiber.Handler {
 //
 //	handler, store := session.NewWithStore()
 func NewWithStore(config ...Config) (fiber.Handler, *Store) {
+	registerLogContextTagsOnce.Do(registerLogContextTags)
+
 	cfg := configDefault(config...)
 
 	if cfg.Store == nil {
@@ -88,16 +103,30 @@ func NewWithStore(config ...Config) (fiber.Handler, *Store) {
 
 		// Acquire session middleware
 		m := acquireMiddleware()
-		m.initialize(c, &cfg)
+		if err := m.initialize(c, &cfg); err != nil {
+			releaseMiddleware(m)
+			handleSessionError(c, cfg.ErrorHandler, err)
+			return nil
+		}
 
 		stackErr := c.Next()
 
+		// A handler timeout.New gave up on may still use m: neither save nor pool it or its session.
+		// IsAbandoned goes first: its atomic load orders the read after the timeout middleware's write.
+		if c.IsAbandoned() && c.RequestCtx().LastTimeoutErrorResponse() != nil {
+			return stackErr
+		}
+
 		m.mu.RLock()
-		destroyed := m.destroyed
+		isDestroyed := m.isDestroyed
 		m.mu.RUnlock()
 
-		if !destroyed {
+		if !isDestroyed {
 			m.saveSession()
+		} else {
+			// saveSession is skipped for destroyed sessions, so the session must
+			// be returned to the pool here.
+			releaseSession(m.Session)
 		}
 
 		releaseMiddleware(m)
@@ -107,26 +136,72 @@ func NewWithStore(config ...Config) (fiber.Handler, *Store) {
 	return handler, cfg.Store
 }
 
-// initialize sets up middleware for the request.
-func (m *Middleware) initialize(c fiber.Ctx, cfg *Config) {
+var registerLogContextTagsOnce sync.Once
+
+func handleSessionError(c fiber.Ctx, handler func(fiber.Ctx, error), err error) {
+	if handler != nil {
+		handler(c, err)
+		return
+	}
+	DefaultErrorHandler(c, err)
+}
+
+func registerLogContextTags() {
+	logger.RegisterContextTag("session-id", func(ctx any) string {
+		id, ok := fiber.ValueFromContext[string](ctx, sessionIDContextKey)
+		if !ok || id == "" {
+			return ""
+		}
+
+		return redact.Prefix(id)
+	})
+}
+
+// storeMiddlewareContext publishes the session ID and the middleware to the
+// Fiber locals and, with PassLocalsToContext, to the request context. It
+// reports whether the request context now holds m. Unlike the locals, which are
+// cleared when the request ends, that context can be kept by a goroutine, so a
+// middleware it holds must never go back to the pool.
+func storeMiddlewareContext(c fiber.Ctx, session *Session, m *Middleware) bool {
+	fiber.StoreInContext(c, sessionIDContextKey, session.ID())
+	fiber.StoreInContext(c, middlewareContextKey, m)
+
+	held, ok := c.Context().Value(middlewareContextKey).(*Middleware)
+	return ok && held == m
+}
+
+// clearMiddlewareContext clears both Fiber locals and the request context
+// because session middleware stores these values in both layers.
+func clearMiddlewareContext(c fiber.Ctx) {
+	ctxlocal.Set(c, sessionIDContextKey, "")
+	ctxlocal.Set(c, middlewareContextKey, nil)
+	ctx := context.WithValue(c.Context(), sessionIDContextKey, "")
+	c.SetContext(context.WithValue(ctx, middlewareContextKey, (*Middleware)(nil)))
+}
+
+// initialize sets up middleware for the request. It returns an error when the
+// session cannot be loaded from the store (e.g. the backing storage is down)
+// so the request can fail gracefully instead of crashing the server.
+func (m *Middleware) initialize(c fiber.Ctx, cfg *Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	session, err := cfg.Store.getSession(c)
 	if err != nil {
-		panic(err) // handle or log this error appropriately in production
+		return err
 	}
 
 	m.config = *cfg
 	m.Session = session
 	m.ctx = c
 
-	c.Locals(middlewareContextKey, m)
+	m.escaped = storeMiddlewareContext(c, session, m)
+	return nil
 }
 
 // saveSession handles session saving and error management after the response.
 func (m *Middleware) saveSession() {
-	if err := m.Session.saveSession(); err != nil {
+	if err := m.Session.saveSessionWithContext(m.resolveContext()); err != nil {
 		if m.config.ErrorHandler != nil {
 			m.config.ErrorHandler(m.ctx, err)
 		} else {
@@ -135,6 +210,16 @@ func (m *Middleware) saveSession() {
 	}
 
 	releaseSession(m.Session)
+}
+
+// resolveContext returns the middleware's stored fiber context if available,
+// otherwise returns context.Background().
+// fiber.Ctx implements context.Context directly, so no allocation is needed.
+func (m *Middleware) resolveContext() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
 }
 
 // acquireMiddleware retrieves a middleware instance from the pool.
@@ -146,7 +231,13 @@ func acquireMiddleware() *Middleware {
 	return m
 }
 
-// releaseMiddleware resets and returns middleware to the pool.
+// releaseMiddleware resets the middleware and returns it to the pool.
+//
+// A middleware the request context holds is reset and marked released but not
+// pooled. A goroutine can keep that context, and with it the pointer, past the
+// end of the request; if the object were reused, the next request's session
+// would be reachable through the old context. Dropping it leaves the old
+// pointer pointing at a finished, empty middleware that nothing else uses.
 //
 // Parameters:
 //   - m: The middleware object to release.
@@ -156,30 +247,49 @@ func acquireMiddleware() *Middleware {
 //	releaseMiddleware(m)
 func releaseMiddleware(m *Middleware) {
 	m.mu.Lock()
+	escaped := m.escaped
+	if escaped {
+		// First, so a lookup that races the release finds a middleware that is
+		// visibly gone instead of one that is half reset.
+		m.released.Store(true)
+	}
+	if m.ctx != nil {
+		clearMiddlewareContext(m.ctx)
+	}
 	m.config = Config{}
 	m.Session = nil
 	m.ctx = nil
-	m.destroyed = false
+	m.isDestroyed = false
 	m.mu.Unlock()
-	middlewarePool.Put(m)
+
+	if !escaped {
+		middlewarePool.Put(m)
+	}
 }
 
 // FromContext returns the Middleware from the Fiber context.
+// It accepts fiber.CustomCtx, fiber.Ctx, *fasthttp.RequestCtx, and context.Context.
+//
+// A context kept from c.Context() (with PassLocalsToContext enabled) stops
+// resolving when the request ends: FromContext returns nil for it afterwards,
+// never another request's session.
 //
 // Parameters:
 //   - c: The Fiber context.
 //
 // Returns:
-//   - *Middleware: The middleware object if found; otherwise, nil.
+//   - *Middleware: The middleware object if found and its request is still being
+//     handled; otherwise, nil.
 //
 // Usage:
 //
 //	m := session.FromContext(c)
-func FromContext(c fiber.Ctx) *Middleware {
-	m, ok := c.Locals(middlewareContextKey).(*Middleware)
-	if !ok {
+func FromContext(ctx any) *Middleware {
+	m, ok := fiber.ValueFromContext[*Middleware](ctx, middlewareContextKey)
+	if !ok || m == nil || m.released.Load() {
 		return nil
 	}
+
 	return m
 }
 
@@ -256,11 +366,26 @@ func (m *Middleware) Keys() []any {
 //
 //	err := m.Destroy()
 func (m *Middleware) Destroy() error {
+	return m.DestroyWithContext(m.resolveContext())
+}
+
+// DestroyWithContext destroys the session using the provided context for cancellation and timeout control.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the destruction fails.
+//
+// Usage:
+//
+//	err := m.DestroyWithContext(ctx)
+func (m *Middleware) DestroyWithContext(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	err := m.Session.Destroy()
-	m.destroyed = true
+	err := m.Session.DestroyWithContext(ctx)
+	m.isDestroyed = true
 	return err
 }
 
@@ -297,10 +422,25 @@ func (m *Middleware) ID() string {
 //
 //	err := m.Reset()
 func (m *Middleware) Reset() error {
+	return m.ResetWithContext(m.resolveContext())
+}
+
+// ResetWithContext resets the session using the provided context for cancellation and timeout control.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the reset fails.
+//
+// Usage:
+//
+//	err := m.ResetWithContext(ctx)
+func (m *Middleware) ResetWithContext(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.Session.Reset()
+	return m.Session.ResetWithContext(ctx)
 }
 
 // Regenerate generates a new session ID while preserving session data.
@@ -315,10 +455,29 @@ func (m *Middleware) Reset() error {
 //
 //	err := m.Regenerate()
 func (m *Middleware) Regenerate() error {
+	return m.RegenerateWithContext(m.resolveContext())
+}
+
+// RegenerateWithContext generates a new session ID while preserving session data,
+// using the provided context for cancellation and timeout control.
+//
+// This method is commonly used after authentication to prevent session fixation attacks.
+// Unlike ResetWithContext(), this method preserves all existing session data.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the regeneration fails.
+//
+// Usage:
+//
+//	err := m.RegenerateWithContext(ctx)
+func (m *Middleware) RegenerateWithContext(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.Session.Regenerate()
+	return m.Session.RegenerateWithContext(ctx)
 }
 
 // Store returns the session store.

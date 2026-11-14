@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/crosshost"
 	"github.com/gofiber/utils/v2"
 	"github.com/valyala/fasthttp"
 )
@@ -64,12 +64,15 @@ type Request struct {
 	referer    string
 	files      []*File
 
+	redirectSensitiveHeaders crosshost.HeaderNames
+
 	timeout      time.Duration
 	maxRedirects int
 
 	bodyType bodyType
 
-	disablePathNormalizing bool
+	isPathNormalizingDisabled bool
+	clientOwned               bool
 }
 
 // Method returns the HTTP method set in the Request.
@@ -119,8 +122,13 @@ func (r *Request) Context() context.Context {
 	return r.ctx
 }
 
-// SetContext sets the context for the Request, allowing request cancellation if ctx is done.
-// See https://blog.golang.org/context article and the "context" package documentation.
+// SetContext sets the context for the Request. Its deadline bounds the exchange at the
+// transport, and its cancellation ends the exchange of a client made by New as well, which
+// closes the connection it was using once the connection is open; a dial still in progress
+// runs to its end first, and a response read with SetStreamResponseBody is not reached. A
+// wrapped fasthttp client returns the caller at once while its exchange ends on its own, when
+// the server answers or its timeouts pass. See https://blog.golang.org/context article and
+// the "context" package documentation.
 func (r *Request) SetContext(ctx context.Context) *Request {
 	r.ctx = ctx
 	return r
@@ -162,9 +170,12 @@ func (r *Request) Headers() iter.Seq2[string, []string] {
 		peekKeys := r.header.PeekKeys()
 
 		// Copy keys to immutable strings to decouple from fasthttp's internal buffers.
-		keys := make([]string, len(peekKeys))
-		for i, key := range peekKeys {
-			keys[i] = utils.UnsafeString(key)
+		// PeekKeys lists a key once per header line; keep the first occurrence only.
+		keys := make([]string, 0, len(peekKeys))
+		for _, key := range peekKeys {
+			if k := utils.UnsafeString(key); !slices.Contains(keys, k) {
+				keys = append(keys, k)
+			}
 		}
 
 		for _, key := range keys {
@@ -236,7 +247,7 @@ func (r *Request) Params() iter.Seq2[string, []string] {
 			p.k = append(p.k, utils.UnsafeString(k))
 			p.v = append(p.v, utils.UnsafeString(v))
 		}
-		sort.Sort(&p)
+		sort.Stable(&p)
 
 		j := 0
 		for i := range vals {
@@ -475,7 +486,7 @@ func (r *Request) AllFormData() iter.Seq2[string, []string] {
 			p.k = append(p.k, utils.UnsafeString(k))
 			p.v = append(p.v, utils.UnsafeString(v))
 		}
-		sort.Sort(&p)
+		sort.Stable(&p)
 
 		j := 0
 		for i := range vals {
@@ -610,22 +621,34 @@ func (r *Request) SetMaxRedirects(count int) *Request {
 	return r
 }
 
+// RedirectSensitiveHeaders returns a copy of this Request's names.
+func (r *Request) RedirectSensitiveHeaders() []string {
+	return r.redirectSensitiveHeaders.List()
+}
+
+// SetRedirectSensitiveHeaders names headers to drop when a redirect leaves the host, in addition to
+// the client's list and the built-in set. It replaces this Request's previous names.
+func (r *Request) SetRedirectSensitiveHeaders(names ...string) *Request {
+	r.redirectSensitiveHeaders = crosshost.NewHeaderNames(names)
+	return r
+}
+
 // DisablePathNormalizing reports whether path normalizing is disabled for the Request.
 func (r *Request) DisablePathNormalizing() bool {
-	return r.disablePathNormalizing
+	return r.isPathNormalizingDisabled
 }
 
 // SetDisablePathNormalizing configures the Request to disable or enable path normalizing.
 func (r *Request) SetDisablePathNormalizing(disable bool) *Request {
-	r.disablePathNormalizing = disable
+	r.isPathNormalizingDisabled = disable
 	r.RawRequest.URI().DisablePathNormalizing = disable
 	return r
 }
 
-// checkClient ensures that a Client is set. If none is set, it defaults to the global defaultClient.
+// checkClient ensures that a Client is set. If none is set, it defaults to the package default client via C().
 func (r *Request) checkClient() {
 	if r.client == nil {
-		r.SetClient(defaultClient)
+		r.SetClient(C())
 	}
 }
 
@@ -664,6 +687,11 @@ func (r *Request) Patch(url string) (*Response, error) {
 	return r.SetURL(url).SetMethod(fiber.MethodPatch).Send()
 }
 
+// Query sends a QUERY request to the given URL.
+func (r *Request) Query(url string) (*Response, error) {
+	return r.SetURL(url).SetMethod(fiber.MethodQuery).Send()
+}
+
 // Custom sends a request with a custom HTTP method to the given URL.
 func (r *Request) Custom(url, method string) (*Response, error) {
 	return r.SetURL(url).SetMethod(method).Send()
@@ -678,6 +706,8 @@ func (r *Request) Send() (*Response, error) {
 // Reset clears the Request object, returning it to its default state.
 // Used by ReleaseRequest to recycle the object.
 func (r *Request) Reset() {
+	r.client = nil
+	r.clientOwned = false
 	r.url = ""
 	r.method = fiber.MethodGet
 	r.userAgent = ""
@@ -686,9 +716,10 @@ func (r *Request) Reset() {
 	r.body = nil
 	r.timeout = 0
 	r.maxRedirects = 0
+	r.redirectSensitiveHeaders = crosshost.HeaderNames{}
 	r.bodyType = noBody
 	r.boundary = boundary
-	r.disablePathNormalizing = false
+	r.isPathNormalizingDisabled = false
 
 	for len(r.files) != 0 {
 		t := r.files[0]
@@ -714,7 +745,7 @@ func (h *Header) PeekMultiple(key string) []string {
 	var res []string
 	byteKey := []byte(key)
 	for k, value := range h.All() {
-		if bytes.EqualFold(k, byteKey) {
+		if utils.EqualFold(k, byteKey) {
 			res = append(res, utils.UnsafeString(value))
 		}
 	}
@@ -745,11 +776,28 @@ type QueryParam struct {
 
 // Keys returns all keys from the query parameters.
 func (p *QueryParam) Keys() []string {
-	keys := make([]string, 0, p.Len())
-	for key := range p.All() {
-		keys = append(keys, utils.UnsafeString(key))
+	return uniqueKeys(p.All(), p.Len())
+}
+
+// uniqueKeys returns each key once, in order of first appearance.
+func uniqueKeys(all iter.Seq2[[]byte, []byte], n int) []string {
+	keys := make([]string, 0, n)
+	seen := make(map[string]struct{}, n)
+	for key := range all {
+		k := utils.UnsafeString(key)
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
 	}
-	return slices.Compact(keys)
+	return keys
+}
+
+// Set sets a single parameter, overriding previously set values.
+// It shadows Args.Set, which replaces only the first pair with that key.
+func (p *QueryParam) Set(key, val string) {
+	p.Del(key)
+	p.Args.Set(key, val)
 }
 
 // AddParams adds multiple parameters from a map.
@@ -877,11 +925,7 @@ type FormData struct {
 
 // Keys returns all keys from the form data.
 func (f *FormData) Keys() []string {
-	keys := make([]string, 0, f.Len())
-	for key := range f.All() {
-		keys = append(keys, utils.UnsafeString(key))
-	}
-	return slices.Compact(keys)
+	return uniqueKeys(f.All(), f.Len())
 }
 
 // Add adds a single form field.
@@ -891,6 +935,7 @@ func (f *FormData) Add(key, val string) {
 
 // Set sets a single form field, overriding previously set values.
 func (f *FormData) Set(key, val string) {
+	f.Del(key)
 	f.Args.Set(key, val)
 }
 
@@ -1080,9 +1125,9 @@ func SetValWithStruct(p WithStruct, tagName string, v any) {
 	setVal = func(name string, val reflect.Value) {
 		switch val.Kind() {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			p.Add(name, strconv.Itoa(int(val.Int())))
+			p.Add(name, utils.FormatInt(val.Int()))
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			p.Add(name, strconv.FormatUint(val.Uint(), 10))
+			p.Add(name, utils.FormatUint(val.Uint()))
 		case reflect.Float32, reflect.Float64:
 			p.Add(name, strconv.FormatFloat(val.Float(), 'f', -1, 64))
 		case reflect.Complex64, reflect.Complex128:

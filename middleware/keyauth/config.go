@@ -1,12 +1,12 @@
 package keyauth
 
 import (
-	"fmt"
 	"net/url"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/extractors"
+	"github.com/gofiber/fiber/v3/internal/quotedstring"
 )
 
 const (
@@ -30,7 +30,7 @@ type Config struct {
 	// ErrorHandler defines a function which is executed for an invalid key.
 	// It may be used to define a custom error.
 	//
-	// Optional. Default: 401 Missing or invalid API Key
+	// Optional. Default: 401 with the body "missing or invalid API Key" (ErrMissingOrMalformedAPIKey)
 	ErrorHandler fiber.ErrorHandler
 
 	// Validator is a function to validate the key.
@@ -55,6 +55,9 @@ type Config struct {
 	// Error is the RFC 6750 `error` parameter appended to Bearer
 	// `WWW-Authenticate` challenges when validation fails. Allowed values
 	// are `invalid_request`, `invalid_token`, or `insufficient_scope`.
+	// It is omitted, together with ErrorDescription, ErrorURI and Scope,
+	// when the request carried no credentials or used an Authorization
+	// scheme other than Bearer, as RFC 6750 section 3 asks.
 	//
 	// Optional. Default: "".
 	Error string
@@ -126,7 +129,7 @@ func configDefault(config ...Config) Config {
 	}
 
 	if len(getAuthSchemes(cfg.Extractor)) == 0 && cfg.Challenge == "" {
-		cfg.Challenge = fmt.Sprintf("ApiKey realm=%q", cfg.Realm)
+		cfg.Challenge = `ApiKey realm="` + quotedstring.Escape(cfg.Realm) + `"`
 	}
 
 	if cfg.Error != "" {

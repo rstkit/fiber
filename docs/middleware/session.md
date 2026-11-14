@@ -52,7 +52,7 @@ app.Get("/", func(c fiber.Ctx) error {
 import (
     "time"
     "github.com/gofiber/fiber/v3/extractors"
-    "github.com/gofiber/storage/redis"
+    "github.com/gofiber/storage/redis/v3"
 )
 
 storage := redis.New(redis.Config{
@@ -69,12 +69,14 @@ app.Use(session.New(session.Config{
     AbsoluteTimeout:   24 * time.Hour,    // Maximum session life
     Extractor:         extractors.FromCookie("__Host-session_id"),
 }))
+```
 
 Notes:
 
 - AbsoluteTimeout must be greater than or equal to IdleTimeout; otherwise, the middleware panics during configuration.
-- If CookieSameSite is set to "None", the middleware automatically forces CookieSecure=true when setting the cookie.
-```
+- CookieSameSite accepts `"Disabled"`, `"Lax"`, `"Strict"`, or `"None"` case-insensitively; other values panic during configuration.
+- If CookieSameSite is set to `"Disabled"`, the cookie omits the SameSite attribute and preserves `CookieSecure`.
+- If CookieSameSite is set to `"None"`, the middleware automatically forces `CookieSecure=true` when setting the cookie.
 
 ## Usage Patterns
 
@@ -94,7 +96,7 @@ app.Post("/login", func(c fiber.Ctx) error {
     sess.Set("user_id", 123)
     sess.Set("authenticated", true)
 
-    return c.Redirect("/dashboard")
+    return c.Redirect().To("/dashboard")
 })
 ```
 
@@ -127,7 +129,7 @@ func backgroundTask(sessionID string) {
     defer sess.Release() // Important: Manual cleanup required
 
     // Modify session
-    sess.Set("last_task", time.Now())
+    sess.Set("last_task", time.Now().Unix())
 
     // Manual save required
     if err := sess.Save(); err != nil {
@@ -169,7 +171,7 @@ app.Post("/login", func(c fiber.Ctx) error {
         sess.Set("user_id", 1)
         sess.Set("authenticated", true)
 
-        return c.Redirect("/dashboard")
+        return c.Redirect().To("/dashboard")
     }
 
     return c.Status(401).SendString("Invalid credentials")
@@ -183,7 +185,7 @@ app.Post("/logout", func(c fiber.Ctx) error {
         return c.Status(500).SendString("Session error")
     }
 
-    return c.Redirect("/")
+    return c.Redirect().To("/")
 })
 ```
 
@@ -209,7 +211,7 @@ app.Post("/login", func(c fiber.Ctx) error {
     // Add authentication data to existing session
     sess.Set("user_id", getUserID(email))
     sess.Set("authenticated", true)
-    sess.Set("login_time", time.Now())
+    sess.Set("login_time", time.Now().Unix())
 
     return c.JSON(fiber.Map{"status": "logged in"})
 })
@@ -221,7 +223,9 @@ app.Post("/login", func(c fiber.Ctx) error {
 |--------|------------|--------------|----------|
 | `Regenerate()` | ✅ Changes | ✅ Preserved | Login, privilege escalation |
 | `Reset()` | ✅ Changes | ❌ Cleared | Logout, security breach |
-| `Destroy()` | ⚪ Unchanged | ❌ Cleared | Clear data only |
+| `Destroy()` | ⚪ Unchanged, cookie expired | ❌ Cleared | End the session without issuing a new ID |
+
+These methods, `store.Delete` and `store.Reset` also hold against other requests of the same session that are still running: a request that loaded the session before its ID was deleted neither stores it again nor sends its cookie when it finishes, and its changes to the session are dropped. This holds when that request calls `Regenerate()` as well: the ID still changes, so the old one is never written again, but the new one is neither stored nor sent. Of two requests that rotate one session at the same time, only the first stores and sends a new ID, and a login that rotates a session a parallel logout just ended is dropped too. A request that left the session unchanged does not write it back over a change another request stored meanwhile, so a role taken away while it ran stays taken away; reading a value, also one it could change in place such as a slice or a map, does not count as a change, and neither does the CSRF middleware behind the session middleware finding its token still fresh. That holds when such a request calls `Regenerate()` too: the rotated session carries the change the other request stored, not the snapshot this one loaded. Of two requests that both change the session with `Set`, `Delete` or `Reset`, the one that saves last stores its whole session. This is guaranteed within one process. Processes that share an external `Storage` are not coordinated, because `fiber.Storage` has no conditional write, so a request still running on another instance can store a session it loaded before the delete. Where a logout must hold across instances, also keep a server-side revocation marker (for example, a per-user "sessions valid after" timestamp) that every request checks.
 
 ### Common Security Mistakes
 
@@ -233,7 +237,7 @@ app.Post("/login", func(c fiber.Ctx) error {
     sess := session.FromContext(c)
     // Validate user...
     sess.Set("user_id", userID) // Attacker can hijack this session!
-    return c.Redirect("/dashboard")
+    return c.Redirect().To("/dashboard")
 })
 ```
 
@@ -248,7 +252,7 @@ app.Post("/login", func(c fiber.Ctx) error {
         return err
     }
     sess.Set("user_id", userID)
-    return c.Redirect("/dashboard")
+    return c.Redirect().To("/dashboard")
 })
 ```
 
@@ -261,12 +265,12 @@ This is a basic example of an authentication middleware that checks if a user is
 func RequireAuth(c fiber.Ctx) error {
     sess := session.FromContext(c)
     if sess == nil {
-        return c.Redirect("/login")
+        return c.Redirect().To("/login")
     }
 
     // Check if user is authenticated
     if sess.Get("authenticated") != true {
-        return c.Redirect("/login")
+        return c.Redirect().To("/login")
     }
 
     return c.Next()
@@ -349,23 +353,25 @@ Only cookie and non-Authorization header extractors contribute to response setti
 - Only Header (non-Auth) extractors: only header is set
 - Any mix that includes Authorization/Query/Form/Param/Custom: those sources are read-only
 
+These rules describe a request that carries no session ID, for example a first visit. For an existing session, the ID is written back only through the extractor that supplied it, and only when that extractor is a cookie or a non-Authorization header. An ID that arrived through a read-only source (Authorization header, Query, Form, Param, or Custom) is never copied into a cookie or header, which prevents session fixation. When the middleware issues a new ID for a request that carried one, because `Regenerate()` or `Reset()` was called or because the supplied ID is not in the storage, the new ID goes back through the same cookie or header, or through every cookie and header extractor of the chain when the old ID came from a read-only source.
+
 ```go
 // This will set both cookie and header in response
 extractors.Chain(
     extractors.FromCookie("session_id"),
-    extractors.FromHeader("X-Session-ID")
+    extractors.FromHeader("X-Session-ID"),
 )
 
 // This will set only cookie in response
 extractors.Chain(
     extractors.FromCookie("session_id"),
-    extractors.FromQuery("session_id")   // Ignored for response
+    extractors.FromQuery("session_id"),  // Ignored for response
 )
 
 // This will set nothing in response (read-only mode)
 extractors.Chain(
     extractors.FromQuery("session_id"),
-    extractors.FromForm("session_id")
+    extractors.FromForm("session_id"),
 )
 ```
 
@@ -392,14 +398,16 @@ app.Use(session.New(session.Config{
 }))
 ```
 
+Return `extractors.ErrNotFound` when the request carries no session ID, so the visitor gets a new session. Any other error from an extractor is not treated as a new visitor: it goes to `ErrorHandler`, which answers `500` by default, or is returned by `store.Get`. This lets a custom or chain-level `Extract` that validates the ID refuse a forged one. A validating child inside a built-in `extractors.Chain` cannot: the chain keeps walking after an error, and a later child's value, or its `ErrNotFound`, replaces the refusal, so put the validation in the chain-level `Extract` or use the validating extractor alone. Such an `Extract` must return the ID unchanged, because the same value is written back and looked up in the storage.
+
 ## Configuration
 
 ### Storage Options
 
 ```go
 import (
-    "github.com/gofiber/storage/redis"
-    "github.com/gofiber/storage/postgres"
+    "github.com/gofiber/storage/redis/v3"
+    "github.com/gofiber/storage/postgres/v3"
 )
 
 // Redis (recommended for production)
@@ -424,12 +432,15 @@ app.Use(session.New(session.Config{
 }))
 ```
 
+A session is stored under `session:<session ID>`, so a session ID sent by a client cannot name an entry another middleware keeps in the same `Storage`. `store.GetByID` and `store.Delete` take the bare session ID. `store.Reset` clears the whole `Storage`, the entries of other middleware included. Sessions stored by an earlier version under the bare ID are not found after the upgrade, so users sign in again; those entries expire on their own in an external `Storage`.
+
 ### Production Security Settings
 
 ```go
 import (
     "log"
     "time"
+    "github.com/gofiber/fiber/v3"
     "github.com/gofiber/utils/v2"
     "github.com/gofiber/fiber/v3/extractors"
 )
@@ -449,7 +460,7 @@ app.Use(session.New(session.Config{
 
     // Cookie Settings
     CookiePath:        "/",
-    CookieDomain:      "example.com",
+    // CookieDomain stays empty: browsers reject a __Host- cookie that sets a Domain
     CookieSessionOnly: false,   // Persist across browser restarts
 
     // Session ID
@@ -459,9 +470,17 @@ app.Use(session.New(session.Config{
     // Error Handling
     ErrorHandler: func(c fiber.Ctx, err error) {
         log.Printf("Session error: %v", err)
+
+        // Write the response: when the session cannot be loaded, the request is
+        // not passed on, so nothing else answers it.
+        if sendErr := c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Session error"}); sendErr != nil {
+            log.Printf("Failed to send error response: %v", sendErr)
+        }
     },
 }))
 ```
+
+A custom `ErrorHandler` has to write the response itself. When the session cannot be loaded from the storage, the request is not passed on, so a handler that only logs answers with an empty `200`. When the session cannot be saved, the route handler has already run: the status and body that `ErrorHandler` writes replace its own, while its headers stay, and a handler that only logs leaves that response, usually a success, for a session the storage did not keep.
 
 ### Custom Types
 
@@ -471,7 +490,7 @@ Session data supports basic Go types by default:
 - `uint`, `uint8`, `uint16`, `uint32`, `uint64`
 - `bool`, `float32`, `float64`
 - `[]byte`, `complex64`, `complex128`
-- `interface{}`
+- `any`
 
 For custom types (structs, maps, slices), you must register them for encoding/decoding:
 
@@ -533,6 +552,8 @@ if ok {
 - Registration must happen during application startup
 - All instances of the application must register the same types
 - Types are encoded using Go's `gob` package
+- `time.Time` is a struct, so it needs `store.RegisterType(time.Time{})` as well. The store registers it by itself only when `AbsoluteTimeout` is greater than zero. Saving a session that holds an unregistered `time.Time` fails, and the middleware answers with its `ErrorHandler` (`500` by default). Store `time.Now().Unix()` when a plain timestamp is enough
+- Reading a struct back out with `Get` makes the save re-encode, even for an all-scalar struct like `User`, because every struct is treated as possibly sharing memory with the session. A request that only reads scalars or `time.Time` values writes the stored bytes back unchanged
 
 ## Migration Guide
 
@@ -609,6 +630,18 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ## API Reference
 
+### Constructors and Helpers
+
+```go
+func New(config ...Config) fiber.Handler
+func NewWithStore(config ...Config) (fiber.Handler, *Store)
+func NewStore(config ...Config) *Store
+func FromContext(ctx any) *Middleware
+func DefaultErrorHandler(c fiber.Ctx, err error)
+```
+
+`NewWithStore` returns the middleware together with the `Store` it uses, for example to call `RegisterType`. `FromContext` returns `nil` when the request has no session middleware.
+
 ### Middleware Methods (Recommended)
 
 ```go
@@ -625,11 +658,26 @@ sess.ID() string
 sess.Fresh() bool
 sess.Regenerate() error  // Change ID, keep data
 sess.Reset() error       // Change ID, clear data
-sess.Destroy() error     // Keep ID, clear data
+sess.Destroy() error     // Delete from storage, expire the cookie
+
+// Context-aware variants propagate cancellation/deadlines to storage I/O.
+// Pass a context.Context to control timeouts; a nil context is treated as
+// context.Background().
+sess.RegenerateWithContext(ctx context.Context) error
+sess.ResetWithContext(ctx context.Context) error
+sess.DestroyWithContext(ctx context.Context) error
 
 // Store access
 sess.Store() *session.Store
 ```
+
+`FromContext` accepts a `fiber.CustomCtx`, `fiber.Ctx`, a `*fasthttp.RequestCtx`, or a `context.Context`.
+
+The returned `*session.Middleware` is only valid while the request is being handled. A context you kept from `c.Context()` (with `PassLocalsToContext` enabled) stops resolving it when the request ends: `FromContext` returns `nil` for that context from then on, so a goroutine that outlives the handler cannot reach the session, and never another request's. Do not hand the pointer itself to such a goroutine. Pass it the session ID and use the [Store Pattern](#store-pattern-advanced) instead.
+
+A handler the [Timeout](./timeout.md) middleware gave up on keeps its `*session.Middleware` and its session until it returns, and no other request is handed them. The session of such a request is not saved: the timeout response is already fixed and cannot carry a cookie, and the handler may still be changing the data.
+
+A session that was only read is written back to storage without being re-encoded. `Get` and `Keys` give that up when the value or key they return could share memory with the session (a map, slice, array, pointer or struct; scalars and `time.Time` are safe), because the caller could then change it in place without calling `Set`. Such an edit counts as the request's own change, as a `Set` does: its whole session then wins as described under [Session Security](#session-security), while a request that only read yields to a change another request stored meanwhile. Calling `Set` with the edited value says so outright and spares the save a decode of the snapshot.
 
 ### Store Methods
 
@@ -643,8 +691,22 @@ store.Reset(ctx context.Context) error
 store.Delete(ctx context.Context, sessionID string) error
 
 // Type registration
-store.RegisterType(interface{})
+store.RegisterType(User{})
 ```
+
+### Errors
+
+```go
+var (
+    ErrEmptySessionID                   = errors.New("session ID cannot be empty")
+    ErrSessionAlreadyLoadedByMiddleware = errors.New("session already loaded by middleware")
+    ErrSessionIDNotFoundInStore         = errors.New("session ID not found in session store")
+)
+```
+
+- `store.Get(c)` returns `ErrSessionAlreadyLoadedByMiddleware` when the session middleware already loaded the session for the request. Use `session.FromContext(c)` there.
+- `store.GetByID` and `store.Delete` return `ErrEmptySessionID` for an empty session ID.
+- `store.GetByID` returns `ErrSessionIDNotFoundInStore` when the storage has no such session, or when the session has outlived its `AbsoluteTimeout` (it is deleted).
 
 ### Session Methods (Store Pattern)
 
@@ -652,11 +714,37 @@ store.RegisterType(interface{})
 sess, err := store.Get(c)
 defer sess.Release() // Required!
 
-// Same methods as middleware, plus:
+// Same methods as middleware (except Store()), plus:
 sess.Save() error              // Manual save required
 sess.SetIdleTimeout(duration)  // Per-session timeout
 sess.Release()                 // Manual cleanup required
+
+// Context-aware variants propagate cancellation/deadlines to storage I/O.
+// A nil context is treated as context.Background().
+sess.DestroyWithContext(ctx context.Context) error
+sess.RegenerateWithContext(ctx context.Context) error
+sess.ResetWithContext(ctx context.Context) error
+sess.SaveWithContext(ctx context.Context) error
 ```
+
+### Session with Context (timeouts/cancellation)
+
+The `*WithContext` variants let you propagate a `context.Context` to the underlying storage call so that slow or unresponsive backends can be bounded by a deadline or canceled. This mirrors the `Storage` and `SharedState` `WithContext` convention.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+defer cancel()
+
+// Persist the session, bounding the storage write by the deadline.
+if err := sess.SaveWithContext(ctx); err != nil {
+    // deadline exceeded, cancellation, or storage error
+}
+
+// Destroy is also covered:
+// if err := sess.DestroyWithContext(ctx); err != nil { ... }
+```
+
+A `nil` context is treated as `context.Background()`, so `sess.SaveWithContext(nil)` is equivalent to `sess.Save()` when no request context is available.
 
 ### Extractor Functions
 
@@ -664,9 +752,11 @@ sess.Release()                 // Manual cleanup required
 // Built-in extractors (import "github.com/gofiber/fiber/v3/extractors")
 extractors.FromCookie(key string) extractors.Extractor
 extractors.FromHeader(key string) extractors.Extractor
+extractors.FromAuthHeader(authScheme string) extractors.Extractor
 extractors.FromQuery(key string) extractors.Extractor
 extractors.FromForm(key string) extractors.Extractor
 extractors.FromParam(key string) extractors.Extractor
+extractors.FromCustom(key string, fn func(fiber.Ctx) (string, error)) extractors.Extractor
 
 // Chaining
 extractors.Chain(extractors ...extractors.Extractor) extractors.Extractor
@@ -684,12 +774,25 @@ extractors.Chain(extractors ...extractors.Extractor) extractors.Extractor
 | `AbsoluteTimeout`   | `time.Duration`             | Maximum session duration    | `0` (unlimited)                            |
 | `CookieSecure`      | `bool`                      | HTTPS only                  | `false`                                    |
 | `CookieHTTPOnly`    | `bool`                      | No JavaScript access        | `false`                                    |
-| `CookieSameSite`    | `string`                    | SameSite attribute          | `"Lax"`                                    |
+| `CookieSameSite`    | `string`                    | SameSite mode: `Disabled`, `Lax`, `Strict`, or `None` | `"Lax"`                    |
 | `CookiePath`        | `string`                    | Cookie path                 | `""`                                       |
 | `CookieDomain`      | `string`                    | Cookie domain               | `""`                                       |
 | `CookieSessionOnly` | `bool`                      | Session cookie              | `false`                                    |
 | `Next`              | `func(fiber.Ctx) bool`      | Skip middleware when returns true | `nil`                                  |
-| `ErrorHandler`      | `func(fiber.Ctx, error)`    | Error callback              | `DefaultErrorHandler`                      |
+| `ErrorHandler`      | `func(fiber.Ctx, error)`    | Called when the session cannot be loaded from the storage, in which case the request is not passed on, or cannot be saved after the handler returns. A custom handler has to write the response: one that only logs answers an empty `200` after a load failure and leaves the route handler's response in place after a save failure. The default logs the error and responds with `500 Internal Server Error` | `DefaultErrorHandler`                      |
+
+### Default Config
+
+```go
+var ConfigDefault = Config{
+    IdleTimeout:    30 * time.Minute,
+    KeyGenerator:   utils.SecureToken,
+    Extractor:      extractors.FromCookie("session_id"),
+    CookieSameSite: fiber.CookieSameSiteLaxMode,
+}
+```
+
+An unset `IdleTimeout`, `Extractor`, `KeyGenerator`, or `CookieSameSite` is filled from `ConfigDefault`. A `Storage` that is `nil` becomes an in-memory store when the store is created.
 
 ## Examples
 
@@ -701,7 +804,7 @@ import (
     "github.com/gofiber/fiber/v3"
     "github.com/gofiber/fiber/v3/middleware/session"
     "github.com/gofiber/fiber/v3/extractors"
-    "github.com/gofiber/storage/redis"
+    "github.com/gofiber/storage/redis/v3"
 )
 
 func main() {
@@ -785,7 +888,7 @@ import (
     "github.com/gofiber/fiber/v3"
     "github.com/gofiber/fiber/v3/middleware/session"
     "github.com/gofiber/fiber/v3/extractors"
-    "github.com/gofiber/storage/redis"
+    "github.com/gofiber/storage/redis/v3"
 )
 
 func main() {
@@ -806,7 +909,7 @@ func main() {
         count, _ := sess.Get("api_calls").(int)
         count++
         sess.Set("api_calls", count)
-        sess.Set("last_call", time.Now())
+        sess.Set("last_call", time.Now().Unix())
 
         return c.JSON(fiber.Map{
             "data":  "some data",

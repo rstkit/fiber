@@ -5,13 +5,43 @@ import (
 	"fmt"
 	"net/url"
 	"slices"
-	"strings"
+	"sync"
 	"time"
+
+	"github.com/gofiber/utils/v2"
+	utilsstrings "github.com/gofiber/utils/v2/strings"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/extractors"
-	"github.com/gofiber/utils/v2"
+	"github.com/gofiber/fiber/v3/internal/headerlookup"
+	originpkg "github.com/gofiber/fiber/v3/internal/origin"
+	"github.com/gofiber/fiber/v3/internal/redact"
+	"github.com/gofiber/fiber/v3/internal/schemehost"
+	"github.com/gofiber/fiber/v3/middleware/logger"
 )
+
+// varyCookie is hoisted so the "..." argument list is not a slice the compiler
+// has to heap-allocate on every response; see the note on cors.varyOrigin.
+// Because it is shared by every response, it only ever reaches Vary through
+// vary below.
+var varyCookie = []string{fiber.HeaderCookie}
+
+// vary adds fields to the Vary response header. varyCookie is package-level so
+// the call does not allocate, which also means a custom Ctx that rewrote its
+// variadic argument in place would corrupt it for every later response and
+// race with the requests running alongside. DefaultCtx only reads what Vary is
+// given, so it gets the shared slice; anything else gets a copy of its own.
+func vary(c fiber.Ctx, fields []string) {
+	if dc, ok := c.(*fiber.DefaultCtx); ok {
+		dc.Vary(fields...)
+		return
+	}
+	c.Vary(slices.Clone(fields)...)
+}
+
+// csrfSchemes is the scheme policy for CSRF: only http and https, since a
+// non-web scheme has no business authorizing a state-changing request.
+const csrfSchemes = originpkg.WebSchemesOnly
 
 var (
 	ErrTokenNotFound    = errors.New("csrf: token not found")
@@ -26,6 +56,8 @@ var (
 	dummyValue          = []byte{'+'}                                  // dummyValue is a placeholder value stored in token storage. The actual token validation relies on the key, not this value.
 
 )
+
+var registerLogContextTagsOnce sync.Once
 
 // Handler for CSRF middleware
 type Handler struct {
@@ -46,17 +78,14 @@ const (
 
 // New creates a new middleware handler
 func New(config ...Config) fiber.Handler {
+	registerLogContextTagsOnce.Do(registerLogContextTags)
+
 	// Set default config
 	cfg := configDefault(config...)
 
 	redactKeys := !cfg.DisableValueRedaction
 
-	maskValue := func(value string) string {
-		if redactKeys {
-			return redactedKey
-		}
-		return value
-	}
+	maskValue := redact.Masker(redactKeys)
 
 	// Create manager to simplify storage operations ( see *_manager.go )
 	var sessionManager *sessionManager
@@ -67,29 +96,7 @@ func New(config ...Config) fiber.Handler {
 		storageManager = newStorageManager(cfg.Storage, redactKeys)
 	}
 
-	// Pre-parse trusted origins
-	trustedOrigins := []string{}
-	trustedSubOrigins := []subdomain{}
-
-	for _, origin := range cfg.TrustedOrigins {
-		trimmedOrigin := utils.TrimSpace(origin)
-		if i := strings.Index(trimmedOrigin, "://*."); i != -1 {
-			withoutWildcard := trimmedOrigin[:i+len("://")] + trimmedOrigin[i+len("://*."):]
-			isValid, normalizedOrigin := normalizeOrigin(withoutWildcard)
-			if !isValid {
-				panic("[CSRF] Invalid origin format in configuration:" + maskValue(origin))
-			}
-			schemeSep := strings.Index(normalizedOrigin, "://") + len("://")
-			sd := subdomain{prefix: normalizedOrigin[:schemeSep], suffix: normalizedOrigin[schemeSep:]}
-			trustedSubOrigins = append(trustedSubOrigins, sd)
-		} else {
-			isValid, normalizedOrigin := normalizeOrigin(trimmedOrigin)
-			if !isValid {
-				panic("[CSRF] Invalid origin format in configuration:" + maskValue(origin))
-			}
-			trustedOrigins = append(trustedOrigins, normalizedOrigin)
-		}
-	}
+	trusted := parseTrustedOrigins(cfg.TrustedOrigins, maskValue)
 
 	// Create the handler outside of the returned function
 	handler := &Handler{
@@ -106,13 +113,13 @@ func New(config ...Config) fiber.Handler {
 		}
 
 		// Store the CSRF handler in the context
-		c.Locals(handlerKey, handler)
+		fiber.StoreInContext(c, handlerKey, handler)
 
 		var token string
 
 		// Action depends on the HTTP method
 		switch c.Method() {
-		case fiber.MethodGet, fiber.MethodHead, fiber.MethodOptions, fiber.MethodTrace:
+		case fiber.MethodGet, fiber.MethodHead, fiber.MethodOptions, fiber.MethodTrace, fiber.MethodQuery:
 			cookieToken := c.Cookies(cfg.CookieName)
 
 			if cookieToken != "" {
@@ -128,18 +135,20 @@ func New(config ...Config) fiber.Handler {
 		default:
 			// Assume that anything not defined as 'safe' by RFC7231 needs protection
 
-			// Evaluate Sec-Fetch-Site to reject cross-site requests earlier when available.
+			// Reject a Sec-Fetch-Site the browser would never have sent. It does not
+			// decide cross-site on its own — only originMatchesHost knows which
+			// origins are trusted.
 			if err := validateSecFetchSite(c); err != nil {
 				return cfg.ErrorHandler(c, err)
 			}
 
 			// Enforce an origin check for unsafe requests.
-			err := originMatchesHost(c, trustedOrigins, trustedSubOrigins)
+			err := originMatchesHost(c, trusted)
 
 			// If there's no origin, enforce a referer check for HTTPS connections.
 			if errors.Is(err, errOriginNotFound) {
 				if c.Scheme() == schemeHTTPS {
-					err = refererMatchesHost(c, trustedOrigins, trustedSubOrigins)
+					err = refererMatchesHost(c, trusted)
 				} else {
 					// If it's not HTTPS, clear the error to allow the request to proceed.
 					err = nil
@@ -201,42 +210,54 @@ func New(config ...Config) fiber.Handler {
 		}
 
 		// Create or extend the token in the storage
-		if err := createOrExtendTokenInStorage(c, token, &cfg, sessionManager, storageManager); err != nil {
+		expires, err := createOrExtendTokenInStorage(c, token, &cfg, sessionManager, storageManager)
+		if err != nil {
 			return cfg.ErrorHandler(c, err)
 		}
 
 		// Update the CSRF cookie
-		updateCSRFCookie(c, &cfg, token)
+		setCSRFCookie(c, &cfg, token, expires)
 
 		// Tell the browser that a new header value is generated
-		c.Vary(fiber.HeaderCookie)
+		vary(c, varyCookie)
 
 		// Store the token in the context
-		c.Locals(tokenKey, token)
+		fiber.StoreInContext(c, tokenKey, token)
 
 		// Continue stack
 		return c.Next()
 	}
 }
 
-// TokenFromContext returns the token found in the context
-// returns an empty string if the token does not exist
-func TokenFromContext(c fiber.Ctx) string {
-	token, ok := c.Locals(tokenKey).(string)
-	if !ok {
-		return ""
-	}
-	return token
+func registerLogContextTags() {
+	logger.RegisterContextTag("csrf-token", func(ctx any) string {
+		// redact.Prefix matches the masking shape used by keyauth and session
+		// (4-byte clear prefix + "****"), so log consumers see a uniform
+		// redaction format across the framework's security-sensitive tags.
+		return redact.Prefix(TokenFromContext(ctx))
+	})
 }
 
-// HandlerFromContext returns the Handler found in the context
-// returns nil if the handler does not exist
-func HandlerFromContext(c fiber.Ctx) *Handler {
-	handler, ok := c.Locals(handlerKey).(*Handler)
-	if !ok {
-		return nil
+// TokenFromContext returns the token found in the context.
+// It accepts fiber.CustomCtx, fiber.Ctx, *fasthttp.RequestCtx, and context.Context.
+// It returns an empty string if the token does not exist.
+func TokenFromContext(ctx any) string {
+	if token, ok := fiber.ValueFromContext[string](ctx, tokenKey); ok {
+		return token
 	}
-	return handler
+
+	return ""
+}
+
+// HandlerFromContext returns the Handler found in the context.
+// It accepts fiber.CustomCtx, fiber.Ctx, *fasthttp.RequestCtx, and context.Context.
+// It returns nil if the handler does not exist.
+func HandlerFromContext(ctx any) *Handler {
+	if handler, ok := fiber.ValueFromContext[*Handler](ctx, handlerKey); ok {
+		return handler
+	}
+
+	return nil
 }
 
 // getRawFromStorage returns the raw value from the storage for the given token
@@ -252,16 +273,15 @@ func getRawFromStorage(c fiber.Ctx, token string, cfg *Config, sessionManager *s
 	return raw, nil
 }
 
-// createOrExtendTokenInStorage creates or extends the token in the storage
-func createOrExtendTokenInStorage(c fiber.Ctx, token string, cfg *Config, sessionManager *sessionManager, storageManager *storageManager) error {
+// createOrExtendTokenInStorage creates or extends the token in the storage and returns when it expires.
+func createOrExtendTokenInStorage(c fiber.Ctx, token string, cfg *Config, sessionManager *sessionManager, storageManager *storageManager) (time.Time, error) {
 	if cfg.Session != nil {
-		sessionManager.setRaw(c, token, dummyValue, cfg.IdleTimeout)
-		return nil
+		return sessionManager.setRaw(c, token, dummyValue, cfg.IdleTimeout), nil
 	}
 	if err := storageManager.setRaw(c, token, dummyValue, cfg.IdleTimeout); err != nil {
-		return fmt.Errorf("csrf: failed to store token in storage: %w", err)
+		return time.Time{}, fmt.Errorf("csrf: failed to store token in storage: %w", err)
 	}
-	return nil
+	return time.Now().Add(cfg.IdleTimeout), nil
 }
 
 func deleteTokenFromStorage(c fiber.Ctx, token string, cfg *Config, sessionManager *sessionManager, storageManager *storageManager) error {
@@ -275,17 +295,13 @@ func deleteTokenFromStorage(c fiber.Ctx, token string, cfg *Config, sessionManag
 	return nil
 }
 
-// Update CSRF cookie
-// if expireCookie is true, the cookie will expire immediately
-func updateCSRFCookie(c fiber.Ctx, cfg *Config, token string) {
-	setCSRFCookie(c, cfg, token, cfg.IdleTimeout)
-}
-
+// expireCSRFCookie has the browser drop the cookie at once.
 func expireCSRFCookie(c fiber.Ctx, cfg *Config) {
-	setCSRFCookie(c, cfg, "", -time.Hour)
+	setCSRFCookie(c, cfg, "", time.Now().Add(-time.Hour))
 }
 
-func setCSRFCookie(c fiber.Ctx, cfg *Config, token string, expiry time.Duration) {
+// setCSRFCookie sends token in the cookie, which expires with the stored token.
+func setCSRFCookie(c fiber.Ctx, cfg *Config, token string, expires time.Time) {
 	cookie := &fiber.Cookie{
 		Name:        cfg.CookieName,
 		Value:       token,
@@ -295,7 +311,7 @@ func setCSRFCookie(c fiber.Ctx, cfg *Config, token string, expiry time.Duration)
 		HTTPOnly:    cfg.CookieHTTPOnly,
 		SameSite:    cfg.CookieSameSite,
 		SessionOnly: cfg.CookieSessionOnly,
-		Expires:     time.Now().Add(expiry),
+		Expires:     expires,
 	}
 
 	// Set the CSRF cookie to the response
@@ -319,27 +335,56 @@ func (handler *Handler) DeleteToken(c fiber.Ctx) error {
 	return nil
 }
 
+// validateSecFetchSite rejects a Sec-Fetch-Site carrying anything but the four
+// values the Fetch standard defines. Not "cross-site": a browser sends that for
+// a legitimate request to a TrustedOrigins entry. What is left, no browser sends.
 func validateSecFetchSite(c fiber.Ctx) error {
-	secFetchSite := utils.Trim(c.Get(fiber.HeaderSecFetchSite), ' ')
+	raw, ok := headerlookup.Value(c, fiber.HeaderSecFetchSite)
+	if !ok {
+		// More than one line: refused rather than read, and refused here rather
+		// than skipped as an absent header would be.
+		return ErrFetchSiteInvalid
+	}
+	secFetchSite := utils.Trim(raw, ' ')
 
 	if secFetchSite == "" {
 		return nil
 	}
 
-	switch utils.ToLower(secFetchSite) {
-	case "same-origin", "none", "cross-site", "same-site":
+	// Compare case-insensitively without lowering: the four valid tokens all
+	// have distinct lengths, so at most one EqualFold does a real comparison.
+	switch {
+	case utils.EqualFold(secFetchSite, "same-origin"),
+		utils.EqualFold(secFetchSite, "none"),
+		utils.EqualFold(secFetchSite, "cross-site"),
+		utils.EqualFold(secFetchSite, "same-site"):
 		return nil
 	default:
 		return ErrFetchSiteInvalid
 	}
 }
 
+// parseTrustedOrigins panics on an entry that is not a valid origin.
+func parseTrustedOrigins(origins []string, mask func(string) string) originpkg.AllowList {
+	trusted, invalid, ok := originpkg.ParseAllowList(origins, csrfSchemes)
+	if !ok {
+		panic("[CSRF] Invalid origin format in configuration:" + mask(invalid))
+	}
+	return trusted
+}
+
 // originMatchesHost checks that the origin header matches the host header
 // returns an error if the origin header is not present or is invalid
 // returns nil if the origin header is valid
-func originMatchesHost(c fiber.Ctx, trustedOrigins []string, trustedSubOrigins []subdomain) error {
-	origin := utils.ToLower(c.Get(fiber.HeaderOrigin))
-	if origin == "" || origin == "null" { // "null" is set by some browsers when the origin is a secure context https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Origin#description
+func originMatchesHost(c fiber.Ctx, trusted originpkg.AllowList) error {
+	origin, ok := headerlookup.Value(c, fiber.HeaderOrigin)
+	if !ok {
+		// Not errOriginNotFound: an absent Origin is skipped on a plaintext
+		// request, and a malformed message must not buy that.
+		return ErrOriginInvalid
+	}
+	// "null" is set by some browsers when the origin is a secure context https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Origin#description
+	if origin == "" || utils.EqualFold(origin, "null") {
 		return errOriginNotFound
 	}
 
@@ -348,18 +393,15 @@ func originMatchesHost(c fiber.Ctx, trustedOrigins []string, trustedSubOrigins [
 		return ErrOriginInvalid
 	}
 
-	if schemeAndHostMatch(originURL.Scheme, originURL.Host, c.Scheme(), c.Host()) {
+	// Match compares case-insensitively, so the dominant same-origin case
+	// needs no lowered copy of the header.
+	if schemehost.Match(originURL.Scheme, originURL.Host, c.Scheme(), c.Host()) {
 		return nil
 	}
 
-	if slices.Contains(trustedOrigins, origin) {
+	// The trusted-origin fallbacks compare against pre-lowered config values.
+	if trusted.Contains(utilsstrings.ToLower(origin)) {
 		return nil
-	}
-
-	for _, trustedSubOrigin := range trustedSubOrigins {
-		if trustedSubOrigin.match(origin) {
-			return nil
-		}
 	}
 
 	return ErrOriginNoMatch
@@ -368,8 +410,11 @@ func originMatchesHost(c fiber.Ctx, trustedOrigins []string, trustedSubOrigins [
 // refererMatchesHost checks that the referer header matches the host header
 // returns an error if the referer header is not present or is invalid
 // returns nil if the referer header is valid
-func refererMatchesHost(c fiber.Ctx, trustedOrigins []string, trustedSubOrigins []subdomain) error {
-	referer := utils.ToLower(c.Get(fiber.HeaderReferer))
+func refererMatchesHost(c fiber.Ctx, trusted originpkg.AllowList) error {
+	referer, ok := headerlookup.Value(c, fiber.HeaderReferer)
+	if !ok {
+		return ErrRefererInvalid
+	}
 	if referer == "" {
 		return ErrRefererNotFound
 	}
@@ -379,20 +424,17 @@ func refererMatchesHost(c fiber.Ctx, trustedOrigins []string, trustedSubOrigins 
 		return ErrRefererInvalid
 	}
 
-	if schemeAndHostMatch(refererURL.Scheme, refererURL.Host, c.Scheme(), c.Host()) {
+	// Match compares case-insensitively, so the dominant same-origin case
+	// needs no lowered copy of the header (which would copy the whole URL,
+	// path and query included).
+	if schemehost.Match(refererURL.Scheme, refererURL.Host, c.Scheme(), c.Host()) {
 		return nil
 	}
 
-	referer = refererURL.String()
-
-	if slices.Contains(trustedOrigins, referer) {
+	// The trusted-origin fallbacks compare against pre-lowered config values.
+	// The Referer is a full URL; only its scheme and host are its origin.
+	if trusted.Contains(originpkg.FromURL(refererURL)) {
 		return nil
-	}
-
-	for _, trustedSubOrigin := range trustedSubOrigins {
-		if trustedSubOrigin.match(referer) {
-			return nil
-		}
 	}
 
 	return ErrRefererNoMatch

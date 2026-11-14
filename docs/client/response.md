@@ -6,6 +6,8 @@ description: >-
 sidebar_position: 3
 ---
 
+import MethodIndex from '@site/src/components/method-index';
+
 The `Response` struct in Fiber's HTTP client represents the server's reply and exposes:
 
 - **Status Code**: The HTTP status code returned by the server (e.g., `200 OK`, `404 Not Found`).
@@ -17,12 +19,21 @@ It makes it easy to inspect and handle data returned by the server.
 
 ```go
 type Response struct {
-    client      *Client
-    request     *Request
-    cookie      []*fasthttp.Cookie
+    client  *Client
+    request *Request
+
     RawResponse *fasthttp.Response
+    cookie      []*fasthttp.Cookie
+
+    respondedHost []byte
+    respondedPath []byte
+    requestOwned  bool
 }
 ```
+
+Use the index to jump straight to any response method; filter by name:
+
+<MethodIndex itemNoun="methods" placeholder="Filter methods, e.g. json" flat />
 
 ## AcquireResponse
 
@@ -58,7 +69,7 @@ func (r *Response) StatusCode() int
 
 ## Protocol
 
-**Protocol** returns the HTTP protocol used (e.g., `HTTP/1.1`, `HTTP/2`) for the response.
+**Protocol** returns the HTTP protocol used (e.g., `HTTP/1.1`) for the response. The client is built on fasthttp, which speaks HTTP/1.x only.
 
 ```go title="Signature"
 func (r *Response) Protocol() string
@@ -86,7 +97,7 @@ HTTP/1.1
 
 ## Header
 
-**Header** retrieves the value of a specific response header by key. If multiple values exist for the same header, this returns the first one.
+**Header** retrieves the value of a specific response header by key. If multiple values exist for the same header, this returns the first one. The returned string is a copy, so it stays valid after the response is released.
 
 ```go title="Signature"
 func (r *Response) Header(key string) string
@@ -153,7 +164,7 @@ Access-Control-Allow-Credentials => true
 
 ## Cookies
 
-**Cookies** returns a slice of all cookies set by the server in this response. The slice is only valid until the response is released.
+**Cookies** returns a slice of all cookies set by the server in this response. The slice is only valid until the response is released. An attribute the parser cannot read — a `Max-Age` that is not an integer, an `Expires` in an unrecognized format — is ignored on its own (RFC 6265 §5.2); the cookie keeps its name, its value and every other attribute rather than being dropped.
 
 ```go title="Signature"
 func (r *Response) Cookies() []*fasthttp.Cookie
@@ -276,7 +287,7 @@ func (r *Response) String() string
 
 ## JSON
 
-**JSON** unmarshal the response body into the provided variable `v` using JSON. `v` should be a pointer to a struct or a type compatible with JSON unmarshal.
+**JSON** unmarshal the response body into the provided variable `v` using JSON. `v` should be a pointer to a struct or a type compatible with JSON unmarshal. It uses the client's JSON unmarshaler, `encoding/json` unless replaced with [SetJSONUnmarshal](./rest.md#setjsonunmarshal), and returns `ErrClientNil` for a response that has no client, such as one from `AcquireResponse`. `XML` and `CBOR` behave the same way.
 
 ```go title="Signature"
 func (r *Response) JSON(v any) error
@@ -317,7 +328,7 @@ fmt.Printf("%+v\n", out)
 
 ## XML
 
-**XML** unmarshal the response body into the provided variable `v` using XML decoding.
+**XML** unmarshal the response body into the provided variable `v` using XML decoding, with the client's XML unmarshaler ([SetXMLUnmarshal](./rest.md#setxmlunmarshal)).
 
 ```go title="Signature"
 func (r *Response) XML(v any) error
@@ -325,7 +336,7 @@ func (r *Response) XML(v any) error
 
 ## CBOR
 
-**CBOR** unmarshal the response body into `v` using CBOR decoding.
+**CBOR** unmarshal the response body into `v` using CBOR decoding, with the client's CBOR unmarshaler ([SetCBORUnmarshal](./rest.md#setcborunmarshal)).
 
 ```go title="Signature"
 func (r *Response) CBOR(v any) error
@@ -333,7 +344,7 @@ func (r *Response) CBOR(v any) error
 
 ## Save
 
-**Save** writes the response body to a file or an `io.Writer`. If `v` is a string, it interprets it as a file path, creates the file (and directories if needed), and writes the response to it. If `v` is an `io.Writer`, it writes directly to it.
+**Save** writes the response body to a file or an `io.Writer`. If `v` is a string, it interprets it as a file path, creates the file (and directories if needed), and writes the response to it. If `v` is an `io.Writer`, it writes directly to it and, when the copy succeeds, closes it if it also implements `io.Closer`, as an `*os.File` does. Any other type of `v` returns `ErrNotSupportSaveMethod`. With response streaming enabled, the body is copied from the stream, so it cannot be read again afterward.
 
 ```go title="Signature"
 func (r *Response) Save(v any) error
@@ -349,10 +360,10 @@ func (r *Response) Reset()
 
 ## Close
 
-**Close** releases both the associated `Request` and `Response` objects back to their pools.
+**Close** releases the `Response` back to its pool, along with the `Request` when the client created it for this call (`Client.Get` and the other REST helpers). A `Request` you acquired yourself, with `AcquireRequest` or `Client.R()`, stays yours to release with `ReleaseRequest`.
 
 :::warning
-After calling `Close`, any attempt to use the request or response may result in data races or undefined behavior. Ensure all processing is complete before closing.
+After calling `Close`, any attempt to use the response, or a request it released, may result in data races or undefined behavior. Ensure all processing is complete before closing.
 :::
 
 ```go title="Signature"

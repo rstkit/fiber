@@ -6,9 +6,21 @@ sidebar_position: 5
 
 ## Validator package
 
-Fiber's [Bind](../api/bind.md#validation) function binds request data to a struct and validates it.
+Fiber does not bundle a validation library. Instead, [`Bind`](../api/bind.md#validation) accepts any validator you plug into `fiber.Config.StructValidator` and runs it automatically whenever request data is bound onto a struct. The core stays dependency-free, and validation becomes a one-time setup instead of per-handler boilerplate.
 
-```go title="Basic Example"
+The steps below use [go-playground/validator](https://github.com/go-playground/validator), the most common choice in the Go ecosystem, but any library works as long as you wrap it in the small adapter from step 2.
+
+### Step 1: Install a validator
+
+```bash
+go get github.com/go-playground/validator/v10
+```
+
+### Step 2: Wire it into the app config
+
+`StructValidator` expects a single `Validate(out any) error` method, so wrap the library in a tiny adapter and register it once:
+
+```go
 import "github.com/go-playground/validator/v10"
 
 type structValidator struct {
@@ -24,7 +36,17 @@ func (v *structValidator) Validate(out any) error {
 app := fiber.New(fiber.Config{
     StructValidator: &structValidator{validate: validator.New()},
 })
+```
 
+:::note
+`StructValidator` runs only for struct destinations (or pointers to structs). Binding into maps and other non-struct types skips validation.
+:::
+
+### Step 3: Bind and validate in one call
+
+Tag your structs with the validator's rules. Every bind method (`Body`, `Query`, `Form`, and the rest) now triggers validation and returns its errors alongside binding errors:
+
+```go
 type User struct {
     Name string `json:"name" form:"name" query:"name" validate:"required"`
     Age  int    `json:"age" form:"age" query:"age" validate:"gte=0,lte=100"`
@@ -32,17 +54,31 @@ type User struct {
 
 app.Post("/", func(c fiber.Ctx) error {
     user := new(User)
-    
-    // Works with all bind methods—Body, Query, Form, etc.
+
+    // Works with all bind methods: Body, Query, Form, ...
     if err := c.Bind().Body(user); err != nil { // validation errors are returned here
         return err
     }
-    
+
     return c.JSON(user)
 })
 ```
 
-```go title="Advanced Validation Example"
+Returned as-is, a validation error surfaces through Fiber's [error handling](./error-handling.md), so you can also shape it globally in a custom error handler. It is not wrapped in a [`fiber.BindError`](../api/bind.md#binderror), which is reserved for binding failures, and a plain `error` carries no status, so the default error handler answers it with `500 Internal Server Error`. Step 4 shows how to answer with a client error instead.
+
+:::note
+Validation runs only after binding succeeds, on the value you passed to the bind method. When parsing fails, the validator is not called. `Bind().All` validates once, on the struct merged from all sources.
+
+To bypass the validator for part of a request, use [`SkipValidation`](../api/bind.md#skipvalidation). The setting stays in effect for the rest of the request until you turn validation back on with `SkipValidation(false)`.
+
+[`WithAutoHandling`](../api/bind.md#withautohandling) converts a validation error into `400 Bad Request` only for `Bind().All`. The other bind methods return the validator's error unchanged.
+:::
+
+### Step 4: Shape the error response
+
+For field-level feedback, unwrap `validator.ValidationErrors` and answer with a structured body instead of the default text:
+
+```go
 type User struct {
     Name     string `json:"name" validate:"required,min=3,max=32"`
     Email    string `json:"email" validate:"required,email"`
@@ -51,38 +87,35 @@ type User struct {
     Website  string `json:"website" validate:"url"`
 }
 
-// Custom validation error messages
-type UserWithCustomMessages struct {
-    Name     string `json:"name" validate:"required,min=3,max=32" message:"Name is required and must be between 3 and 32 characters"`
-    Email    string `json:"email" validate:"required,email" message:"Valid email is required"`
-    Age      int    `json:"age" validate:"gte=0,lte=100" message:"Age must be between 0 and 100"`
-}
-
 app.Post("/user", func(c fiber.Ctx) error {
     user := new(User)
-    
+
     if err := c.Bind().Body(user); err != nil {
-        // Handle validation errors
-        if validationErrors, ok := err.(validator.ValidationErrors); ok {
+        var validationErrors validator.ValidationErrors
+        if errors.As(err, &validationErrors) {
+            out := make([]fiber.Map, 0, len(validationErrors))
             for _, e := range validationErrors {
-                // e.Field() - field name
-                // e.Tag() - validation tag
-                // e.Value() - invalid value
-                // e.Param() - validation parameter
-                return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+                // e.Field() - field name, e.Tag() - failed rule,
+                // e.Param() - rule parameter, e.Value() - invalid value
+                out = append(out, fiber.Map{
                     "field": e.Field(),
-                    "error": e.Error(),
+                    "rule":  e.Tag(),
                 })
             }
+            return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"errors": out})
         }
         return err
     }
-    
+
     return c.JSON(user)
 })
 ```
 
-```go title="Custom Validator Example"
+### Step 5: Add your own rules
+
+Because the adapter is yours, you can layer custom checks on top of the tag rules:
+
+```go
 // Custom validator for password strength
 type PasswordValidator struct {
     validate *validator.Validate
@@ -92,7 +125,7 @@ func (v *PasswordValidator) Validate(out any) error {
     if err := v.validate.Struct(out); err != nil {
         return err
     }
-    
+
     // Custom password validation logic
     if user, ok := out.(*User); ok {
         if len(user.Password) < 8 {
@@ -100,7 +133,7 @@ func (v *PasswordValidator) Validate(out any) error {
         }
         // Add more password validation rules here
     }
-    
+
     return nil
 }
 

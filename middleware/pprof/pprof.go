@@ -46,6 +46,13 @@ func New(config ...Config) fiber.Handler {
 		if !found {
 			return c.Next()
 		}
+		// The remainder must be empty or start a new path segment. Without
+		// this check the bare prefix also matches sibling routes that merely
+		// begin with the same characters, e.g. /debug/pprofiler, which would
+		// then be redirected to the pprof index instead of reaching the app.
+		if path != "" && path[0] != '/' {
+			return c.Next()
+		}
 		// Switch on trimmed path against constant strings
 		switch path {
 		case "/":
@@ -73,7 +80,7 @@ func New(config ...Config) fiber.Handler {
 		default:
 			// pprof index only works with trailing slash
 			if strings.HasSuffix(path, "/") {
-				path = utils.TrimRight(path, '/')
+				path = prefix + utils.TrimRight(path, '/')
 			} else {
 				path = prefix + "/"
 			}

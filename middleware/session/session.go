@@ -10,19 +10,28 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/extractors"
+	internalcookie "github.com/gofiber/fiber/v3/internal/cookie"
 	"github.com/gofiber/utils/v2"
 	"github.com/valyala/fasthttp"
 )
 
 // Session represents a user session.
+// Session serializes access to its internal state with mutexes, but it is
+// request-scoped and must not be used after the request lifecycle ends.
 type Session struct {
-	ctx         fiber.Ctx     // fiber context
-	config      *Store        // store configuration
-	data        *data         // key value data
-	id          string        // session id
-	idleTimeout time.Duration // idleTimeout of this session
-	mu          sync.RWMutex  // Mutex to protect non-data fields
-	fresh       bool          // if new session
+	ctx         fiber.Ctx         // fiber context
+	config      *Store            // store configuration
+	data        *data             // key value data
+	rawData     []byte            // snapshot from the last decode, reused by Save while the data is unchanged
+	id          string            // session id
+	key         string            // storage key of id, built on first use
+	extractor   extractors.Result // provenance of the extractor that supplied the session ID
+	idleTimeout time.Duration     // idleTimeout of this session
+	loadGen     uint64            // idLock generation when the data was read from storage
+	mu          sync.RWMutex      // Mutex to protect non-data fields
+	isFresh     bool              // if new session
+	loaded      bool              // the data was read from storage under the current id
+	dropped     bool              // another request ended or rotated it: never stored or sent again
 }
 
 type absExpirationKeyType int
@@ -58,7 +67,7 @@ func acquireSession() *Session {
 	if s.data == nil {
 		s.data = acquireData()
 	}
-	s.fresh = true
+	s.isFresh = true
 	return s
 }
 
@@ -89,9 +98,14 @@ func (s *Session) Release() {
 func releaseSession(s *Session) {
 	s.mu.Lock()
 	s.id = ""
+	s.key = ""
 	s.idleTimeout = 0
 	s.ctx = nil
 	s.config = nil
+	s.extractor = extractors.Result{}
+	s.rawData = nil
+	s.loaded = false
+	s.dropped = false
 	if s.data != nil {
 		s.data.Reset()
 	}
@@ -110,7 +124,7 @@ func releaseSession(s *Session) {
 func (s *Session) Fresh() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.fresh
+	return s.isFresh
 }
 
 // ID returns the session ID
@@ -134,6 +148,12 @@ func (s *Session) ID() string {
 //
 // Returns:
 //   - any: The value associated with the key.
+//
+// Note: returning a value that can alias the session (map, slice, array,
+// pointer, struct) makes every later Save re-encode, since the caller may
+// mutate it in place without calling Set. Such an edit counts as the request's
+// own change, as a Set does, so its save stands over a change another request
+// stored meanwhile; a read alone yields to it.
 //
 // Usage:
 //
@@ -185,24 +205,41 @@ func (s *Session) Delete(key any) {
 //
 //	err := s.Destroy()
 func (s *Session) Destroy() error {
+	return s.DestroyWithContext(s.resolveContext())
+}
+
+// DestroyWithContext deletes the session from storage and expires the session cookie,
+// using the provided context for cancellation and timeout control.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the destruction fails.
+//
+// Usage:
+//
+//	err := s.DestroyWithContext(ctx)
+func (s *Session) DestroyWithContext(ctx context.Context) error {
+	ctx = backgroundIfNil(ctx)
+
 	if s.data == nil {
 		return nil
 	}
 
-	// Reset local data
-	s.data.Reset()
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Use external Storage if exist
-	var ctx context.Context = s.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := s.config.Storage.DeleteWithContext(ctx, s.id); err != nil {
+	if err := s.config.deleteKey(ctx, s.storageKey()); err != nil {
 		return err
 	}
+
+	// Reset local data only after the storage delete succeeded, so a
+	// canceled/failed delete leaves the session data intact.
+	s.data.Reset()
+	s.rawData = nil
+	s.loaded = false
 
 	// Expire session
 	s.delSession()
@@ -218,22 +255,59 @@ func (s *Session) Destroy() error {
 //
 //	err := s.Regenerate()
 func (s *Session) Regenerate() error {
+	return s.RegenerateWithContext(s.resolveContext())
+}
+
+// RegenerateWithContext generates a new session id and deletes the old one from storage,
+// using the provided context for cancellation and timeout control.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the regeneration fails.
+//
+// Usage:
+//
+//	err := s.RegenerateWithContext(ctx)
+func (s *Session) RegenerateWithContext(ctx context.Context) error {
+	ctx = backgroundIfNil(ctx)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Delete old id from storage
-	var ctx context.Context = s.ctx
-	if ctx == nil {
-		ctx = context.Background()
+	var (
+		stored []byte
+		ended  bool
+		err    error
+	)
+	if s.loaded {
+		stored, ended, err = s.config.deleteLoadedKey(ctx, s.storageKey(), s.loadGen)
+	} else {
+		err = s.config.deleteKey(ctx, s.storageKey())
 	}
-	if err := s.config.Storage.DeleteWithContext(ctx, s.id); err != nil {
+	if err != nil {
 		return err
 	}
+	// Another request ended or rotated it: still rotate, as another instance may write
+	// the old ID back, but store and send nothing.
+	if ended {
+		s.dropped = true
+	}
+	// Another request changed it since the load and this one changed nothing, in place
+	// included: the rotated session carries that change, not the snapshot this request loaded.
+	if stored != nil && s.overtakenBy(stored) {
+		// Rotated even when the decode fails: the old key is already gone, so the save
+		// stores this request's snapshot, which a failed decode leaves as it was, under
+		// the new ID rather than nothing.
+		err = s.decodeSessionData(stored)
+	}
 
-	// Generate a new session, and set session.fresh to true
+	// Generate a new session, and set session.isFresh to true
 	s.refresh()
 
-	return nil
+	return err
 }
 
 // Reset generates a new session id, deletes the old one from storage, and resets the associated data.
@@ -245,39 +319,67 @@ func (s *Session) Regenerate() error {
 //
 //	err := s.Reset()
 func (s *Session) Reset() error {
-	// Reset local data
-	if s.data != nil {
-		s.data.Reset()
-	}
+	return s.ResetWithContext(s.resolveContext())
+}
+
+// ResetWithContext generates a new session id, deletes the old one from storage, and resets the associated data,
+// using the provided context for cancellation and timeout control.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the reset fails.
+//
+// Usage:
+//
+//	err := s.ResetWithContext(ctx)
+func (s *Session) ResetWithContext(ctx context.Context) error {
+	ctx = backgroundIfNil(ctx)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Reset expiration
-	s.idleTimeout = 0
-
 	// Delete old id from storage
-	var ctx context.Context = s.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := s.config.Storage.DeleteWithContext(ctx, s.id); err != nil {
+	if err := s.config.deleteKey(ctx, s.storageKey()); err != nil {
 		return err
 	}
+
+	// Reset local state only after the storage delete succeeded, so a
+	// canceled/failed delete leaves the session data intact.
+	if s.data != nil {
+		s.data.Reset()
+		s.rawData = nil
+		// Reset wiped the absolute expiration, so the rotated session must be armed again.
+		if s.config != nil && s.config.AbsoluteTimeout > 0 {
+			s.setAbsExpiration(time.Now().Add(s.config.AbsoluteTimeout))
+		}
+	}
+	s.idleTimeout = 0
 
 	// Expire session
 	s.delSession()
 
-	// Generate a new session, and set session.fresh to true
+	// Generate a new session, and set session.isFresh to true
 	s.refresh()
 
 	return nil
 }
 
-// refresh generates a new session, and sets session.fresh to be true.
+// refresh generates a new session, and sets session.isFresh to be true.
 func (s *Session) refresh() {
 	s.id = s.config.KeyGenerator()
-	s.fresh = true
+	s.key = ""
+	s.isFresh = true
+	s.loaded = false
+}
+
+// storageKey returns the key the session is stored under; the caller holds s.mu.
+func (s *Session) storageKey() string {
+	if s.key == "" {
+		s.key = storageKeyPrefix + s.id
+	}
+	return s.key
 }
 
 // Save saves the session data and updates the cookie
@@ -292,8 +394,29 @@ func (s *Session) refresh() {
 //
 //	err := s.Save()
 func (s *Session) Save() error {
+	return s.SaveWithContext(s.resolveContext())
+}
+
+// SaveWithContext saves the session data and updates the cookie,
+// using the provided context for cancellation and timeout control.
+//
+// Note: If the session is being used in the handler, calling SaveWithContext will have
+// no effect and the session will automatically be saved when the handler returns.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the save operation fails.
+//
+// Usage:
+//
+//	err := s.SaveWithContext(ctx)
+func (s *Session) SaveWithContext(ctx context.Context) error {
+	ctx = backgroundIfNil(ctx)
+
 	if s.ctx == nil {
-		return s.saveSession()
+		return s.saveSessionWithContext(ctx)
 	}
 
 	// If the session is being used in the handler, it should not be saved
@@ -304,11 +427,11 @@ func (s *Session) Save() error {
 		}
 	}
 
-	return s.saveSession()
+	return s.saveSessionWithContext(ctx)
 }
 
-// saveSession encodes session data to saves it to storage.
-func (s *Session) saveSession() error {
+// saveSessionWithContext encodes session data and saves it to storage using the provided context.
+func (s *Session) saveSessionWithContext(ctx context.Context) error {
 	if s.data == nil {
 		return nil
 	}
@@ -316,34 +439,102 @@ func (s *Session) saveSession() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.dropped {
+		return nil
+	}
+
 	// Set idleTimeout if not already set
 	if s.idleTimeout <= 0 {
 		s.idleTimeout = s.config.IdleTimeout
 	}
 
+	// Unchanged since the decode: write the snapshot back so the idle timeout still
+	// slides. Lock-free is enough; the flags are set before what they report.
+	data := s.rawData
+	// Set, Delete or Reset changed the session. A read of a value the caller may change
+	// in place only makes the snapshot stale: the data is encoded again, and whether it
+	// changed is asked only once another request's change is there to yield to.
+	mutated := s.data.mutated.Load()
+	changed := data == nil || mutated || s.data.dirty.Load()
+	if changed {
+		s.data.RLock()
+		encoded, err := s.encodeSessionData()
+		s.data.RUnlock()
+		if err != nil {
+			return fmt.Errorf("failed to encode data: %w", err)
+		}
+		data = encoded
+	}
+
+	key := s.storageKey()
+	if s.loaded {
+		l := lockFor(key)
+		if changed {
+			// Held alone, so no write-back of an older snapshot lands after this change.
+			l.mu.Lock()
+			defer l.mu.Unlock()
+		} else {
+			l.mu.RLock()
+			defer l.mu.RUnlock()
+		}
+		raw, moved, err := s.config.storedSince(ctx, key, s.loadGen)
+		if err != nil {
+			return err
+		}
+		if moved {
+			if raw == nil {
+				return nil // ended by another request: neither store it nor send its cookie again
+			}
+			if s.overtakenBy(raw) {
+				s.setSession()
+				return nil // changed by another request: a snapshot this one did not change must not undo that
+			}
+		}
+		if changed {
+			defer l.gen.Add(1) // before the unlock: the shard changed, which a save that stored nothing leaves as it was
+		}
+	}
+
 	// Update client cookie
 	s.setSession()
+	return s.config.Storage.SetWithContext(ctx, key, data, s.idleTimeout)
+}
 
-	// Encode session data
+// overtakenBy reports whether raw, what the storage holds now, is a change another request
+// stored since the load that this one must not undo: one that neither called Set, Delete or
+// Reset nor changed a value Get returned in place. Such an edit counts as the request's own
+// change, as a Set does; it is told from a read by decoding the snapshot again, which only the
+// rare save that a concurrent change reaches pays for.
+func (s *Session) overtakenBy(raw []byte) bool {
+	if s.data.mutated.Load() || bytes.Equal(raw, s.rawData) {
+		return false
+	}
+	return !s.data.dirty.Load() || !s.editedInPlace()
+}
+
+// editedInPlace reports whether the data differs from the snapshot it was decoded from, as it
+// does once a value Get returned was changed in place. gob writes a map in no fixed order, so the
+// snapshot is decoded again and compared as data rather than as bytes, a NaN being the same as a
+// NaN (see sameData); one that no longer decodes counts as edited, which keeps the request's data.
+func (s *Session) editedInPlace() bool {
+	var snapshot map[any]any
+	if err := gob.NewDecoder(bytes.NewReader(s.rawData)).Decode(&snapshot); err != nil {
+		return true
+	}
 	s.data.RLock()
-	encodedBytes, err := s.encodeSessionData()
-	s.data.RUnlock()
-	if err != nil {
-		return fmt.Errorf("failed to encode data: %w", err)
+	defer s.data.RUnlock()
+	if len(snapshot) == 0 && len(s.data.Data) == 0 {
+		return false
 	}
-
-	// Pass copied bytes with session id to provider
-	var ctx context.Context = s.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return s.config.Storage.SetWithContext(ctx, s.id, encodedBytes, s.idleTimeout)
+	return !sameData(snapshot, s.data.Data)
 }
 
 // Keys retrieves all keys in the current session.
 //
 // Returns:
 //   - []any: A slice of all keys in the session.
+//
+// Note: a key that can alias the session has the same effect as in Get.
 //
 // Usage:
 //
@@ -375,26 +566,52 @@ func (s *Session) getExtractorInfo() []extractors.Extractor {
 		return []extractors.Extractor{{Source: extractors.SourceCookie, Key: "session_id"}} // Safe default
 	}
 
-	extractor := s.config.Extractor
-	var relevantExtractors []extractors.Extractor
-
-	// If it's a chained extractor, collect all cookie/header extractors
-	if len(extractor.Chain) > 0 {
-		for _, chainExtractor := range extractor.Chain {
-			if chainExtractor.Source == extractors.SourceCookie || chainExtractor.Source == extractors.SourceHeader {
-				relevantExtractors = append(relevantExtractors, chainExtractor)
+	// Prefer the extractor that actually supplied the incoming session ID.
+	//
+	// Gated on Value, not Key: Key is the sink's name, and a keyless extractor
+	// — a hand-rolled child, or FromCustom("") — would otherwise skip this
+	// guard entirely and let a read-only ID reach the sinks below.
+	if s.extractor.Value != "" {
+		// Only observed provenance names a sink. A chain whose own Extract
+		// answered without a child winning reports its first child's declared
+		// metadata, which says nothing about where the value came from.
+		// Key must name a sink for it to be writable at all.
+		if s.extractor.Resolved && s.extractor.Key != "" {
+			switch s.extractor.Source {
+			case extractors.SourceCookie, extractors.SourceHeader:
+				// The ID came from a writable sink; write it back to the same place.
+				return []extractors.Extractor{{Key: s.extractor.Key, Source: s.extractor.Source}}
+			case extractors.SourceAuthHeader, extractors.SourceForm,
+				extractors.SourceQuery, extractors.SourceParam, extractors.SourceCustom:
+				// Read-only: fall through to the refusal below.
 			}
 		}
-	} else if extractor.Source == extractors.SourceCookie || extractor.Source == extractors.SourceHeader {
-		// Single extractor - only include if it's cookie or header
-		relevantExtractors = append(relevantExtractors, extractor)
+		// Read-only, or an origin we cannot attribute. For an existing session
+		// either would be an attacker-controlled ID, so it must not be promoted
+		// into cookies/headers (session fixation). A fresh session's ID is
+		// server-generated, so it may still fall through to the sinks below.
+		if !s.isFresh {
+			return nil
+		}
 	}
 
-	// If no cookie/header extractors found and the config has a store but no explicit cookie/header extractors,
-	// we should not default to cookie. This allows for read-only configurations (e.g., query/param/form/custom).
-	// Only add default cookie extractor if we have no extractors at all (nil config case is handled above)
+	// Walked rather than ranged over Chain: a nested chain reports its first
+	// child's metadata, so direct children alone hide every sink inside it, and
+	// a cookie one level down would never be written.
+	var sinks []extractors.Extractor
+	s.config.Extractor.Walk(func(candidate extractors.Extractor) bool {
+		// Only a leaf names a place to write, and a keyless one would name a
+		// cookie or header with no name at all.
+		if len(candidate.Chain) > 0 || candidate.Key == "" {
+			return true
+		}
+		if candidate.Source == extractors.SourceCookie || candidate.Source == extractors.SourceHeader {
+			sinks = append(sinks, candidate)
+		}
+		return true
+	})
 
-	return relevantExtractors
+	return sinks
 }
 
 func (s *Session) setSession() {
@@ -446,7 +663,7 @@ func (s *Session) delSession() {
 		switch ext.Source {
 		case extractors.SourceHeader:
 			s.ctx.Request().Header.Del(ext.Key)
-			s.ctx.Response().Header.Del(ext.Key)
+			s.ctx.Res().Del(ext.Key)
 		case extractors.SourceCookie:
 			s.ctx.Request().Header.DelCookie(ext.Key)
 			s.ctx.Response().Header.DelCookie(ext.Key)
@@ -470,22 +687,11 @@ func (s *Session) delSession() {
 
 // setCookieAttributes sets the cookie attributes based on the session config.
 func (s *Session) setCookieAttributes(fcookie *fasthttp.Cookie) {
-	// Set SameSite attribute
-	switch {
-	case utils.EqualFold(s.config.CookieSameSite, fiber.CookieSameSiteStrictMode):
-		fcookie.SetSameSite(fasthttp.CookieSameSiteStrictMode)
-	case utils.EqualFold(s.config.CookieSameSite, fiber.CookieSameSiteNoneMode):
-		fcookie.SetSameSite(fasthttp.CookieSameSiteNoneMode)
-	default:
-		fcookie.SetSameSite(fasthttp.CookieSameSiteLaxMode)
-	}
-
-	// The Secure attribute is required for SameSite=None
-	if fcookie.SameSite() == fasthttp.CookieSameSiteNoneMode {
-		fcookie.SetSecure(true)
-	} else {
-		fcookie.SetSecure(s.config.CookieSecure)
-	}
+	sameSite, _ := internalcookie.ParseSameSite(s.config.CookieSameSite)
+	fcookie.SetSameSite(sameSite.FastHTTPMode)
+	// The Secure attribute is required for SameSite=None; every other mode
+	// preserves the configured value.
+	fcookie.SetSecure(s.config.CookieSecure || sameSite.RequiresSecure)
 
 	fcookie.SetHTTPOnly(s.config.CookieHTTPOnly)
 }
@@ -502,14 +708,30 @@ func (s *Session) setCookieAttributes(fcookie *fasthttp.Cookie) {
 //
 //	err := s.decodeSessionData(rawData)
 func (s *Session) decodeSessionData(rawData []byte) error {
+	// Copied before decoding: the storage owns rawData and may reuse it after Get
+	// returns, so the decode and the snapshot Save writes back read the same bytes.
+	raw := utils.CopyBytes(rawData)
 	byteBuffer := byteBufferPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,errcheck // We store nothing else in the pool
 	defer byteBufferPool.Put(byteBuffer)
 	defer byteBuffer.Reset()
-	_, _ = byteBuffer.Write(rawData)
+	_, _ = byteBuffer.Write(raw)
 	decCache := gob.NewDecoder(byteBuffer)
-	if err := decCache.Decode(&s.data.Data); err != nil {
+	s.data.Lock()
+	defer s.data.Unlock()
+	// A decode replaces the data. gob merges into a map that holds keys, so one that does
+	// is decoded beside, which also leaves it as it was when the decode fails; the empty
+	// map of a session being loaded is decoded into in place.
+	decoded := s.data.Data
+	if len(decoded) > 0 {
+		decoded = make(map[any]any, len(decoded))
+	}
+	if err := decCache.Decode(&decoded); err != nil {
 		return fmt.Errorf("failed to decode session data: %w", err)
 	}
+	s.data.Data = decoded
+	s.rawData = raw
+	s.data.dirty.Store(false)
+	s.data.mutated.Store(false)
 	return nil
 }
 
@@ -578,4 +800,25 @@ func (s *Session) isAbsExpired() bool {
 //	s.setAbsExpiration(time.Now().Add(time.Hour))
 func (s *Session) setAbsExpiration(absExpiration time.Time) {
 	s.Set(absExpirationKey, absExpiration)
+}
+
+// backgroundIfNil returns ctx unchanged when it is non-nil, and
+// context.Background() otherwise. It normalizes a caller-supplied context for
+// the *WithContext methods so a nil context never reaches storage.
+func backgroundIfNil(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// resolveContext returns the session's stored fiber context if available,
+// otherwise returns context.Background().
+// fiber.Ctx implements context.Context directly, so no allocation is needed.
+// This is used as the default context for non-WithContext method variants.
+func (s *Session) resolveContext() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
 }

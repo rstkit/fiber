@@ -1,0 +1,235 @@
+---
+id: hostauthorization
+---
+
+# Host Authorization
+
+Host authorization middleware for [Fiber](https://github.com/gofiber/fiber) that validates the incoming `Host` header against a configurable allowlist. Protects against [DNS rebinding attacks](https://en.wikipedia.org/wiki/DNS_rebinding) where an attacker-controlled domain resolves to the application's internal IP, causing browsers to send requests with a malicious Host header.
+
+## Signatures
+
+```go
+func New(config ...Config) fiber.Handler
+```
+
+## Examples
+
+Import the middleware package:
+
+```go
+import (
+    "github.com/gofiber/fiber/v3"
+    "github.com/gofiber/fiber/v3/middleware/hostauthorization"
+)
+```
+
+Once your Fiber app is initialized, choose one of the following approaches:
+
+### Basic Usage
+
+```go
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHosts: []string{"api.myapp.com"},
+}))
+
+app.Get("/users", func(c fiber.Ctx) error {
+    return c.JSON(getUsers())
+})
+
+// Host: api.myapp.com → 200 OK
+// Host: evil.com      → 403 Forbidden
+```
+
+### Subdomain Wildcards
+
+A `*.` prefix matches any subdomain but **not** the bare domain itself:
+
+```go
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHosts: []string{"*.myapp.com"},
+}))
+
+// Host: api.myapp.com  → 200 OK
+// Host: www.myapp.com  → 200 OK
+// Host: myapp.com      → 403 Forbidden
+```
+
+To allow both the bare domain and all subdomains, include both:
+
+```go
+AllowedHosts: []string{"myapp.com", "*.myapp.com"},
+```
+
+### Internationalized Domain Names (IDN)
+
+Browsers always transmit the `Host` header in ASCII (Punycode) form, so IDN entries in `AllowedHosts` are converted to Punycode at startup. You can configure entries in either form — they are equivalent:
+
+```go
+AllowedHosts: []string{"münchen.example.com"}                 // Unicode
+AllowedHosts: []string{"xn--mnchen-3ya.example.com"}          // Punycode (what the browser sends)
+```
+
+Both match an incoming request whose Host header is `xn--mnchen-3ya.example.com`.
+
+### Skipping Health Checks
+
+Use `Next` to bypass host validation for specific paths:
+
+```go
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHosts: []string{"myapp.com", "*.myapp.com"},
+    Next: func(c fiber.Ctx) bool {
+        return c.Path() == "/healthz"
+    },
+}))
+
+// Host: evil.com GET /healthz → 200 OK (skipped)
+// Host: evil.com GET /users   → 403 Forbidden
+```
+
+### Dynamic Validation
+
+Use `AllowedHostsFunc` for hosts that can't be known at startup:
+
+```go
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHostsFunc: func(host string) bool {
+        // Look up tenant domains from database, cache, etc.
+        return isRegisteredTenant(host)
+    },
+}))
+```
+
+`AllowedHostsFunc` is only called when static `AllowedHosts` don't match, so you can combine both:
+
+```go
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHosts: []string{"myapp.com", "*.myapp.com"},
+    AllowedHostsFunc: func(host string) bool {
+        return isRegisteredCustomDomain(host)
+    },
+}))
+```
+
+### Custom Error Response
+
+The default response is **403 Forbidden**. **421 Misdirected Request** ([RFC 9110 §15.5.20](https://www.rfc-editor.org/rfc/rfc9110#section-15.5.20)) is a semantically closer choice for "wrong host for this server" — CDNs like Cloudflare and Fastly use it for this case. Either is reasonable; pick one via `ErrorHandler`:
+
+```go
+// 403 with a JSON body
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHosts: []string{"myapp.com"},
+    ErrorHandler: func(c fiber.Ctx, err error) error {
+        return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+            "error": "unauthorized host",
+        })
+    },
+}))
+
+// 421 Misdirected Request — closer to the RFC-defined semantics
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHosts: []string{"myapp.com"},
+    ErrorHandler: func(c fiber.Ctx, _ error) error {
+        return c.SendStatus(fiber.StatusMisdirectedRequest) // 421
+    },
+}))
+```
+
+### Combined with Domain() Router
+
+`hostauthorization` acts as a security gate; [`Domain()`](https://docs.gofiber.io/api/app#domain) handles routing:
+
+```go
+// Security layer — reject anything not from our hosts
+app.Use(hostauthorization.New(hostauthorization.Config{
+    AllowedHosts: []string{"myapp.com", "*.myapp.com"},
+    Next: func(c fiber.Ctx) bool {
+        return c.Path() == "/healthz"
+    },
+}))
+
+// Routing layer — direct allowed hosts to the right handlers
+app.Domain("api.myapp.com").Get("/users", listUsers)
+app.Domain(":tenant.myapp.com").Get("/dashboard", tenantDashboard)
+app.Get("/healthz", healthCheck)
+```
+
+## Config
+
+| Property         | Type                          | Description                                                                                       | Default |
+|:-----------------|:------------------------------|:--------------------------------------------------------------------------------------------------|:--------|
+| Next             | `func(fiber.Ctx) bool`        | Defines a function to skip this middleware when returned true.                                     | `nil`   |
+| AllowedHosts     | `[]string`                    | List of permitted hosts. Supports exact match and subdomain wildcard (`*.example.com`).            | `nil`   |
+| AllowedHostsFunc | `func(string) bool`           | Dynamic validator called only when no static AllowedHosts rule matches. Receives the normalized hostname: port stripped, trailing dot removed, IPv6 brackets removed, lowercased, IDN converted to Punycode, IPv6 written in its canonical form, an IPv4-mapped address as IPv4. The string is only valid during the call; copy it to keep it.  | `nil`   |
+| ErrorHandler     | `fiber.ErrorHandler`          | Called when a request is rejected. Receives `ErrForbiddenHost` as the error.                      | 403     |
+
+Either `AllowedHosts` or `AllowedHostsFunc` (or both) must be provided. The middleware panics at startup if neither is set.
+
+## Default Config
+
+```go
+var ConfigDefault = Config{}
+```
+
+There is no useful default — you must provide at least `AllowedHosts` or `AllowedHostsFunc`.
+
+## Host Matching
+
+The middleware matches hosts in this order:
+
+1. **Exact match** — case-insensitive, port and trailing dot stripped, IDN labels in Punycode form
+2. **Subdomain wildcard** — `"*.myapp.com"` matches `api.myapp.com` but not `myapp.com`
+3. **AllowedHostsFunc** — called only if no static rule matched
+
+The first match wins. If nothing matches, `ErrorHandler` is called.
+
+## Host Normalization
+
+Before matching, the host of each request is normalized, and the `AllowedHosts` entries are normalized once at startup:
+
+- Port is stripped (`example.com:8080` → `example.com`)
+- Trailing dot removed (`example.com.` → `example.com`)
+- IPv6 brackets removed (`[::1]` → `::1`)
+- IPv6 addresses written in their RFC 5952 Section 4 form (`[0:0:0:0:0:0:0:1]` → `::1`, `[2001:0db8::0001]` → `2001:db8::1`), so every spelling of one IPv6 address matches. `AllowedHostsFunc` receives this canonical form. An embedded IPv4 part is written in hex (`[64:ff9b::192.0.2.33]` → `64:ff9b::c000:221`), not in the mixed notation RFC 5952 Section 5 recommends
+- An IPv4-mapped address is the IPv4 address it maps (`[::ffff:7f00:1]` → `127.0.0.1`), so it matches an IPv4 entry such as `127.0.0.1` and follows the same rules as that IPv4 host. This applies to entries too: `[::ffff:10.0.0.5]` in `AllowedHosts` admits `10.0.0.5`
+- An IPv6 literal that is not IPv4-mapped never matches a `*.` subdomain rule (an IPv4-mapped one is the IPv4 host and is matched like it)
+- Lowercased
+- IDN labels converted to ASCII/Punycode (`münchen.example.com` → `xn--mnchen-3ya.example.com`)
+- RFC 1035 length limits enforced at startup: ≤253 chars total, ≤63 chars per label (panic on violation)
+
+An entry in the leading-dot form some other tools use (`.myapp.com`) also panics at startup; write `*.myapp.com` instead. So does any other entry no request could match: a URL (`https://myapp.com`, `http://localhost:3000`), a `%` such as a zoned `[fe80::1%25eth0]`, a port that is not numeric (`allowed.com:http`, `example.com:`), brackets around anything but an IPv6 address (`[allowed.com]`, `[127.0.0.1]:80`, `[allowed.com:443]`), another colon that is not part of an IPv6 address (`[2001:db8::g]`, `a:b:c`), and a `*.` entry holding an IP address (`*.127.0.0.1`, `*.[::1]`, `*.[::ffff:1.2.3.4]`).
+
+A request host that is not a well-formed authority is rejected with `ErrorHandler` before matching, so `AllowedHostsFunc` never sees it. That covers an empty or missing `Host`, userinfo in `X-Forwarded-Host` (`allowed.com:443@attacker.example`), a port that is empty, not numeric or above 65535, malformed IPv6 brackets, brackets around anything but an IPv6 address (`[allowed.com:443]`) or an IPv6 literal without brackets, a zoned IPv6 address (`fe80::1%eth0`), and a hostname with an empty label (`a..b`), a label that starts or ends with a hyphen or is longer than 63 characters, a name longer than 253 bytes (measured before an IDN is converted to Punycode), or any character besides letters, digits, hyphens and dots (underscores included).
+
+fasthttp answers some of these requests itself, before routing: an HTTP/1.1 request with a missing or empty `Host`, and any request whose `Host` it cannot parse (for example a space or `/` in the name, a port that is not numeric, unbalanced IPv6 brackets, an IPv6 literal without brackets, an invalid IPv6 address in brackets that hold no `%25`, or a zone not written as `%25`), gets `400 Bad Request`. Fiber still runs the `Use` middleware for such a request, so `ErrorHandler` is called, but the app's `ErrorHandler` then writes the final response over it: with the default one the client receives the `400`. The `ErrorHandler` response reaches the client for an HTTP/1.0 request without `Host`, for a `Host` that fasthttp accepts and the middleware rejects (`a..b`, an empty port, a port above 65535, an underscore, or any bracketed host holding `%25`, such as `[fe80::1%25eth0]` or `[allowed.com:443%25z]`, since fasthttp does not check those) and for a malformed `X-Forwarded-Host`.
+
+fasthttp removes userinfo from the `Host` header itself, everything up to the last `@`, before the middleware reads it. For that header the middleware matches only what follows the `@`: `Host: allowed.com:443@attacker.example` is checked as `attacker.example`, and `Host: attacker.example@allowed.com` as `allowed.com`.
+
+## Filtering by Client IP
+
+This middleware filters by the `Host` *header*, not by the client's source IP. [`TrustProxy` / `TrustProxyConfig`](https://docs.gofiber.io/whats_new#trusted-proxies) do not filter clients either: they only decide which peers may supply forwarded headers such as `X-Forwarded-For` and `X-Forwarded-Host`. To restrict access by client IP, check `c.IP()` in your own middleware or filter in the proxy or firewall.
+
+## Proxy Support
+
+The middleware reads the host with `c.Host()`, which uses the first non-empty value of `X-Forwarded-Host` when [`TrustProxy`](https://docs.gofiber.io/api/fiber#trustproxy) is enabled and the request comes from a proxy listed in `TrustProxyConfig`. When `TrustProxy` is disabled (the default), `X-Forwarded-Host` is ignored and the raw `Host` header is used. Either value goes through the same validation, so a malformed `X-Forwarded-Host` is rejected too.
+
+fasthttp itself is HTTP/1.x only. HTTP/2 support requires an external library (e.g. `fasthttp2`) plugged in via `Server.NextProto`. Those libraries are responsible for mapping the HTTP/2 `:authority` pseudo-header to a Host value before the request reaches Fiber handlers, so the middleware should work transparently once H2 is wired up — but this is the H2 library's responsibility, not fasthttp's or this middleware's.
+
+## RFC Compliance
+
+- **RFC 9110 Section 7.2** — Host and port are separate components; port is stripped before matching
+- **RFC 9110 Section 17.1** — Origin servers should reject misdirected requests
+- **RFC 9112 Section 3.2** — An HTTP/1.1 request without a Host header is answered with `400 Bad Request`; fasthttp does this before the middleware's response is sent
+- **RFC 1035** — `AllowedHosts` entries are validated against the 253-char total / 63-char per-label limits
+- Returns **403 Forbidden** (not 400) for a host that is not allowed, because the request is syntactically valid but semantically unauthorized. The same `403` is the default for an HTTP/1.0 request without `Host` and for a malformed host that fasthttp accepts. An HTTP/1.1 request with a missing or empty `Host`, or with a `Host` fasthttp cannot parse, gets `400 Bad Request` from fasthttp before routing, which is what RFC 9112 Section 3.2 asks for. The middleware's `ErrorHandler` runs for it, but the app's `ErrorHandler` decides the final response (see [Host Normalization](#host-normalization))
+
+:::note
+**RFC 9110 §15.5.20** defines **421 Misdirected Request** as a semantically closer response for host mismatches ("the request was directed at a server unable or unwilling to produce an authoritative response for the target URI"). CDNs like Cloudflare and Fastly use 421 for this case. To use 421 instead of 403, set a custom `ErrorHandler`:
+
+```go
+ErrorHandler: func(c fiber.Ctx, err error) error {
+    return c.SendStatus(fiber.StatusMisdirectedRequest) // 421
+},
+```
+
+:::

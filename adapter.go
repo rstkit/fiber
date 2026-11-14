@@ -1,12 +1,16 @@
 package fiber
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
 
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
+
+	"github.com/gofiber/fiber/v3/internal/bodystream"
+	"github.com/gofiber/fiber/v3/internal/wiretarget"
 )
 
 // toFiberHandler converts a supported handler type to a Fiber handler.
@@ -71,9 +75,15 @@ func adaptExpressHandler(handler any) (Handler, bool) {
 			return nil, false
 		}
 		return func(c Ctx) error {
-			return h(c.Req(), c.Res(), func() error {
-				return c.Next()
+			var nextErr error
+			err := h(c.Req(), c.Res(), func() error {
+				nextErr = c.Next()
+				return nextErr
 			})
+			if err != nil {
+				return err
+			}
+			return nextErr
 		}, true
 	case func(Req, Res, func() error): // (6) Express-style handler with error-returning next callback
 		if h == nil {
@@ -250,8 +260,22 @@ func wrapHTTPHandler(handler http.Handler) Handler {
 
 	adapted := fasthttpadaptor.NewFastHTTPHandler(handler)
 
+	// Same routed-path handling as adaptor.HTTPHandler: net/http decodes and cleans the raw line its own way.
 	return func(c Ctx) error {
-		adapted(c.RequestCtx())
+		// fasthttpadaptor reads a streamed body whatever its size.
+		if err := bodystream.Buffer(c.Request(), c.App().config.BodyLimit); err != nil {
+			var fe *Error
+			switch {
+			case errors.Is(err, fasthttp.ErrBodyTooLarge):
+				return ErrRequestEntityTooLarge
+			case errors.As(err, &fe): // a stream that fails with a status keeps it
+				return fe
+			}
+			return ErrBadRequest
+		}
+		if !wiretarget.Serve(c, adapted) {
+			return ErrNotFound
+		}
 		return nil
 	}
 }
